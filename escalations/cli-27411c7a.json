@@ -1,0 +1,17 @@
+{
+  "thread_id": "cli-27411c7a",
+  "cerrado_en": "2026-08-21T22:38:16.712062+00:00",
+  "clasificacion": {
+    "sentiment": "negativo",
+    "urgency": "alta",
+    "intent": "agendar_asesoria",
+    "category": "pension_alimentos"
+  },
+  "resumen_ejecutiva": "El cliente enfrenta una demanda por pensión alimentaria. La categoría legal es derecho familiar. La urgencia es alta, ya que necesita una solución rápida. El cliente muestra preocupación emocional por la situación. Se acordó que se le proporcionará asesoría legal y se programará una reunión para revisar su caso en detalle.",
+  "transcript": [
+    {
+      "rol": "human",
+      "contenido": "hola me demandaron por pension, que puedo hacer?"
+    }
+  ]
+}

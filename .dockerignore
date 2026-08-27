@@ -1,0 +1,17 @@
+.env
+.env.*
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.git/
+.gitignore
+checkpoints.sqlite
+chroma_db/
+*.log
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

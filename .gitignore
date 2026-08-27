@@ -1,0 +1,31 @@
+# Secrets y variables de entorno
+.env
+.env.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+
+# Bases de datos locales
+*.sqlite3
+*.db
+checkpoints.sqlite
+
+# Chroma DB / índices locales
+chroma_db/
+
+# Configuraciones de IDEs
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db
