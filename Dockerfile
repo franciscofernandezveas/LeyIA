@@ -5,7 +5,7 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Instala dependencias del sistema que a veces requieren librerías de Python
+# Dependencias del sistema para evitar errores de compilación
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     build-essential \
