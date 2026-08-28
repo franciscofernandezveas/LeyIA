@@ -7,7 +7,6 @@ __pycache__/
 *.pyo
 *.pyd
 .git/
-.gitignore
 checkpoints.sqlite
 chroma_db/
 *.log

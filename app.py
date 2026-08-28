@@ -259,7 +259,7 @@ def render_sidebar() -> None:
 # ---------------------------------------------------------------------------
 init_state()
 
-st.title("⚖️ LeyIA — Agente Manzzo y Cía")
+st.title(" LeyIA —  Manzzo y Cía")
 
 
 render_sidebar()
