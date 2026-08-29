@@ -20,7 +20,9 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Copia el proyecto
 COPY . .
 
-ENV PORT=8501
-EXPOSE 8501
+# Puerto dinámico asignado por Railway
+ENV PORT=8000
+EXPOSE 8000
 
-CMD ["sh", "-c", "streamlit run app.py --server.port=${PORT} --server.address=0.0.0.0 --server.headless=true"]
+# Inicia la API FastAPI
+CMD ["sh", "-c", "uvicorn api:app --host 0.0.0.0 --port ${PORT}"]
