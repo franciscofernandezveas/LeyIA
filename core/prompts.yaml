@@ -1,17 +1,16 @@
 # ============================================================================
 # PROMPTS DEL AGENTE — Manzzo y Cía (dominio: derecho de familia, Chile)
-# Versión: 2.2
+# Versión: 2.4
 # Changelog:
+#   v2.4 - summary_system_prompt endurecido: prohíbe asumir hechos no
+#          declarados por el cliente (evita alucinaciones legales riesgosas).
+#        - agregada sección `intake:` para ficha proactiva de lead/caso.
+#   v2.3 - agregada sección `intake:` para ficha proactiva de lead/caso.
 #   v2.2 - agenda_confirmada corregida: estaba anidada por error dentro del
-#          bloque literal de agenda_link_enviado (indentación), lo que además
-#          contaminaba el texto del link enviado al cliente.
-#        - agregado bloque agenda_* completo: pedir_datos → link_enviado →
-#          confirmada / verificacion_pendiente (cierre de loop de booking).
-#   v2.1 - tonos movidos a sección `atencion` (los consume respuestas_faq).
-#        - clasificador: eliminada regla contradictoria v2
-#          ("describir caso → agendar_asesoria"); alineado a filosofía v4:
-#          el sentimiento nunca routea, el agente orienta primero, y el
-#          contacto humano solo ocurre si el cliente lo pide o lo acepta.
+#          bloque literal de agenda_link_enviado (indentación).
+#        - agregado bloque agenda_* completo.
+#   v2.1 - tonos movidos a sección `atencion`.
+#        - clasificador alineado a filosofía v4.
 # ============================================================================
 
 # ----------------------------------------------------------------------------
@@ -58,7 +57,15 @@ atencion:
   summary_system_prompt: |
     Resume la conversación para una ejecutiva humana en máximo 5 líneas:
     problema del cliente, categoría legal, urgencia, emocionalidad y
-    próximos pasos acordados. Sin relleno ni cortesías.
+    próximos pasos acordados.
+
+    REGLA ESTRICTA: describe ÚNICAMENTE lo que el cliente declaró. NUNCA
+    asumas, infieras ni inventes hechos no dichos por él/ella (por ejemplo:
+    quién agredió a quién, culpabilidad, montos exactos, si hay denuncia
+    previa, etc.). Si el mensaje es ambiguo, indica "el cliente menciona..."
+    o "pendiente aclarar".
+
+    Sin relleno ni cortesías.
 
   fuera_dominio_message: |
     {disclosure} Puedo ayudarte con asuntos legales: pensión de alimentos,
@@ -119,7 +126,6 @@ atencion:
 
 # ----------------------------------------------------------------------------
 # CLASIFICACIÓN UNIFICADA (nodo analyze_sentiment)
-# Nota: la ruta NO la decide el LLM; se deriva de las etiquetas en nodes.py
 # ----------------------------------------------------------------------------
 classification:
 
@@ -144,8 +150,8 @@ classification:
 
     3) intent:
        - respuestas_faq: pregunta información general (precios, horarios,
-         servicios) O DESCRIBE SU CASO buscando orientación ("me demandaron,
-         ¿qué hago?"). El agente siempre atiende y orienta primero.
+         servicios) O DESCRIBE SU CASO buscando orientación. El agente
+         siempre atiende y orienta primero.
        - agendar_asesoria: pide EXPLÍCITAMENTE agendar/reservar una hora, o
          pide directamente que un abogado tome su caso ("necesito un abogado").
        - hablar_humano: pide hablar con una persona/ejecutiva/humano, o
@@ -164,11 +170,12 @@ classification:
 
     Reglas estrictas:
     - Usa EXACTAMENTE los valores cerrados listados. Nunca inventes etiquetas.
-    - Describir el caso propio SIN pedir hora ni humano → respuestas_faq
-      (el agente orienta primero, siempre).
+    - Describir el caso propio SIN pedir hora ni humano → respuestas_faq.
     - Pedir agendar/hora o que un abogado tome el caso → agendar_asesoria.
     - Pedir persona/ejecutiva o ACEPTAR la oferta de contacto → hablar_humano.
-    - Consultas sobre capacidades del estudio ("¿ustedes hacen X?") → respuestas_faq.
+    - "Sí", "dale", "ok" tras una oferta de agendamiento → agendar_asesoria.
+    - "Sí", "ok" tras una oferta de ejecutiva → hablar_humano.
+    - Consultas sobre capacidades del estudio → respuestas_faq.
 
   few_shot_examples:
 
@@ -214,9 +221,37 @@ classification:
       category: consulta_general
       reason: "Acepta la oferta de contacto humano del turno anterior."
 
+    - input: "Sí, agendemos."
+      sentiment: positivo
+      urgency: media
+      intent: agendar_asesoria
+      category: consulta_general
+      reason: "Acepta la oferta de agendamiento del turno anterior."
+
     - input: "¿Arreglan notebooks? Se me quemó el cargador."
       sentiment: neutro
       urgency: baja
       intent: fuera_de_dominio
       category: otro
       reason: "No es un servicio legal."
+
+# ----------------------------------------------------------------------------
+# INTAKE PROACTIVO — ficha de lead + caso
+# ----------------------------------------------------------------------------
+intake:
+
+  apertura: |
+    Perfecto, antes de comunicarte con nuestra ejecutiva armo tu ficha 📋
+    Así ella llega sabiendo tu caso y no te hace repetir todo.
+    Puedes responder varias preguntas en un solo mensaje si quieres.
+
+  ack_completado: |
+    ✅ Listo, {nombre}. Tu ficha está completa; derivo tu caso ahora mismo.
+
+  aviso_saltar: |
+    (opcional — escribe "saltar" para omitir)
+
+  sin_consentimiento: |
+    Entiendo. Sin tu autorización no puedo compartir tus datos con el equipo,
+    así que no derivaré tu caso. Si cambias de opinión o tienes otra duda
+    legal, aquí estoy.

@@ -1,0 +1,158 @@
+{
+  "thread_id": "cli-56bf8e7e",
+  "cerrado_en": "2026-08-31T02:44:17.886892+00:00",
+  "clasificacion": {
+    "sentiment": "negativo",
+    "urgency": "media",
+    "intent": "hablar_humano",
+    "category": "consulta_general"
+  },
+  "lead": {
+    "nombre": "Francisco fernandez",
+    "email": "francisco.fernandez_v@mail.udp.cl",
+    "modalidad": "presencial"
+  },
+  "intake": {
+    "nombre": "Francisco Fernandez",
+    "email": "francisco.fernandez_v@mail.udp.cl",
+    "telefono": null,
+    "situacion_actual": "Le he pegado a mi mujer, le dejé una pierna rota y el ojo morado. Me demandó con orden de alejamiento.",
+    "etapa_proceso": "me demandaron o notificaron",
+    "comuna": "Santiago",
+    "horario_contacto": "tarde (14-18)",
+    "como_nos_conocio": "otro",
+    "consentimiento_datos": true
+  },
+  "booking": null,
+  "resumen_ejecutiva": "El cliente, Francisco Fernández, enfrenta una demanda por violencia doméstica tras agredir a su esposa, dejándole lesiones graves. La situación es legalmente urgente y emocionalmente tensa para él. Se acordó agendar una asesoría presencial con un abogado y que una ejecutiva lo contactará en la tarde. Se completó su ficha con los datos necesarios para la gestión de su consulta.",
+  "transcript": [
+    {
+      "rol": "human",
+      "contenido": "hola"
+    },
+    {
+      "rol": "ai",
+      "contenido": "Hola, soy el asistente virtual de Manzzo y Cía. ¿En qué puedo ayudarte hoy?"
+    },
+    {
+      "rol": "human",
+      "contenido": "tengo un problema ya que he golpeado a mi esposa en varias ocasiones y me ha demandado"
+    },
+    {
+      "rol": "ai",
+      "contenido": "Lamento mucho que estés pasando por esta situación tan difícil. Es comprensible que te sientas estresado y preocupado. Es importante abordar este tema con seriedad y buscar la mejor manera de manejarlo.\n\nTe recomiendo que agendes una asesoría con uno de nuestros abogados, quienes podrán ofrecerte orientación específica sobre tu caso, las posibles consecuencias legales y cómo proceder. La consulta inicial tiene un costo que se descuenta al contratar nuestros servicios.\n\nSi prefieres hablar con una ejecutiva, dímelo y te la comunico por WhatsApp."
+    },
+    {
+      "rol": "human",
+      "contenido": "ok quiero agendar una asesoria"
+    },
+    {
+      "rol": "ai",
+      "contenido": "¡Excelente decisión! 👍 Para agendar tu asesoría solo necesito:\n1) Tu nombre completo\n2) Tu correo electrónico\n3) ¿Prefieres atención online (Google Meet) o presencial en nuestra\n   oficina de Santiago Centro?\nPuedes enviarlo todo en un solo mensaje. Tus datos están protegidos\ny no se comparten con terceros.\n"
+    },
+    {
+      "rol": "human",
+      "contenido": "Francisco fernandez"
+    },
+    {
+      "rol": "ai",
+      "contenido": "¡Casi listo! Solo me falta: tu correo electrónico y si la prefieres online o presencial 🙌"
+    },
+    {
+      "rol": "human",
+      "contenido": "francisco.fernandez_v@mail.udp.cl"
+    },
+    {
+      "rol": "ai",
+      "contenido": "¡Casi listo! Solo me falta: si la prefieres online o presencial 🙌"
+    },
+    {
+      "rol": "human",
+      "contenido": "presencial"
+    },
+    {
+      "rol": "ai",
+      "contenido": "Listo, Francisco ✅ Aquí está tu link de agendamiento con tus datos ya\ncargados — solo elige el horario que te acomode:\n👉 https://calendly.com/d/d3rb-2y5-3jr?name=Francisco+fernandez&email=francisco.fernandez_v%40mail.udp.cl&a1=Otro&a2=sub-flujo%3A+captura+de+datos+de+agendamiento\nRecibirás la confirmación en francisco.fernandez_v@mail.udp.cl.\n\nModalidad elegida: Presencial (Psje. Doctor Sotero del Río #508, Of. 420, Santiago Centro)\n📍 Psje. Doctor Sotero del Río #508, Of. 420, Santiago Centro\n"
+    },
+    {
+      "rol": "human",
+      "contenido": "ok pero igual quiero escalar y hablar con una ejecutiva"
+    },
+    {
+      "rol": "ai",
+      "contenido": "Perfecto, antes de comunicarte con nuestra ejecutiva armo tu ficha 📋\nAsí ella llega sabiendo tu caso y no te hace repetir todo.\nPuedes responder varias preguntas en un solo mensaje si quieres.\n\n_1 de 9_ · ¿Cuál es tu nombre completo?"
+    },
+    {
+      "rol": "human",
+      "contenido": "Francisco Fernandez"
+    },
+    {
+      "rol": "ai",
+      "contenido": "_2 de 9_ · ¿Cuál es tu correo electrónico?"
+    },
+    {
+      "rol": "human",
+      "contenido": "francisco.fernandez_v@mail.udp.cl"
+    },
+    {
+      "rol": "ai",
+      "contenido": "_3 de 9_ · ¿Tienes un teléfono de contacto? (ej: +56 9 1234 5678)\n(opcional — escribe \"saltar\" para omitir)\n"
+    },
+    {
+      "rol": "human",
+      "contenido": "saltar"
+    },
+    {
+      "rol": "ai",
+      "contenido": "_4 de 9_ · Cuéntame tu situación en 2-3 líneas: ¿qué pasó y desde cuándo?"
+    },
+    {
+      "rol": "human",
+      "contenido": "le he pegado a mi mujer caleta de veces, le deje una pierna rota, el ojo morado. me demandó con orden de alejamiento"
+    },
+    {
+      "rol": "ai",
+      "contenido": "_6 de 9_ · ¿En qué comuna vives? (por si prefieres atención presencial)\n(opcional — escribe \"saltar\" para omitir)\n"
+    },
+    {
+      "rol": "human",
+      "contenido": "Santiago"
+    },
+    {
+      "rol": "ai",
+      "contenido": "_7 de 9_ · ¿En qué horario te puede llamar la ejecutiva?\n  1) Mañana (9-13)\n  2) Tarde (14-18)\n  3) Indiferente\n(opcional — escribe \"saltar\" para omitir)\n"
+    },
+    {
+      "rol": "human",
+      "contenido": "en la Tarde"
+    },
+    {
+      "rol": "ai",
+      "contenido": "_8 de 9_ · Última: ¿cómo nos conociste?\n  1) Google\n  2) Instagram\n  3) TikTok\n  4) Recomendación\n  5) Otro\n(opcional — escribe \"saltar\" para omitir)\n"
+    },
+    {
+      "rol": "human",
+      "contenido": "1"
+    },
+    {
+      "rol": "ai",
+      "contenido": "_9 de 9_ · Para terminar: ¿autorizas que Manzzo y Cía use estos datos solo para gestionar tu consulta y contactarte? (sí/no)"
+    },
+    {
+      "rol": "human",
+      "contenido": "acepto"
+    },
+    {
+      "rol": "ai",
+      "contenido": "⚠️ respóndeme con un sí o un no\n_9 de 9_ · Para terminar: ¿autorizas que Manzzo y Cía use estos datos solo para gestionar tu consulta y contactarte? (sí/no)"
+    },
+    {
+      "rol": "human",
+      "contenido": "si"
+    },
+    {
+      "rol": "ai",
+      "contenido": "✅ Listo, Francisco. Tu ficha está completa; derivo tu caso ahora mismo.\n"
+    }
+  ]
+}

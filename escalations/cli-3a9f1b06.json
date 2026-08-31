@@ -1,0 +1,47 @@
+{
+  "thread_id": "cli-3a9f1b06",
+  "cerrado_en": "2026-08-31T02:05:52.581821+00:00",
+  "clasificacion": {
+    "sentiment": "negativo",
+    "urgency": "baja",
+    "intent": "hablar_humano",
+    "category": "consulta_general"
+  },
+  "lead": {
+    "nombre": null,
+    "email": null,
+    "modalidad": null
+  },
+  "booking": null,
+  "resumen_ejecutiva": "El cliente enfrenta problemas con la pensión de alimentos, lo que genera estrés emocional. La situación es legal y urgente, ya que podría enfrentar sanciones. Se acordó agendar una asesoría con un abogado, pero el cliente decidió no continuar con el proceso. No se establecieron próximos pasos.",
+  "transcript": [
+    {
+      "rol": "human",
+      "contenido": "hola"
+    },
+    {
+      "rol": "ai",
+      "contenido": "Hola, soy el asistente virtual de Manzzo y Cía. ¿En qué puedo ayudarte hoy?"
+    },
+    {
+      "rol": "human",
+      "contenido": "debo problemas de pension"
+    },
+    {
+      "rol": "ai",
+      "contenido": "Lamento que estés pasando por esta situación, es comprensible que te sientas estresado. Estoy aquí para ayudarte. \n\nSi tienes problemas con la pensión de alimentos, podemos evaluar tu situación y ver qué opciones legales tienes. Durante una consulta inicial, revisaremos tu situación económica y te orientaremos sobre cómo negociar un monto acorde a tus posibilidades.\n\nAdemás, si no puedes cumplir con el pago, es importante saber que podrías enfrentar medidas de apremio, como embargos o inscripciones en registros de deudores. En la consulta te explicaremos cómo evitar estas sanciones.\n\nTe recomiendo agendar una asesoría con uno de nuestros abogados para que te brinden la orientación necesaria. ¿Te gustaría que te ayude a programar una cita?"
+    },
+    {
+      "rol": "human",
+      "contenido": "ok"
+    },
+    {
+      "rol": "ai",
+      "contenido": "Perfecto. Para agendar la asesoría, por favor indícame tu nombre completo y un número de contacto, así como tu disponibilidad de días y horarios. Una vez que tenga esa información, procederé a coordinar la cita."
+    },
+    {
+      "rol": "human",
+      "contenido": "no quiero gracias"
+    }
+  ]
+}
