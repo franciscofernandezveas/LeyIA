@@ -1,12 +1,22 @@
 # main.py
 """CLI interactiva para probar el agente de soporte de Manzzo y Cía.
 
-Versión: v5 (integra nodo intake_lead para ficha proactiva de lead + caso).
+Versión: v6.1 (Google Calendar: agenda directa, sin Calendly).
+
+Cambios respecto a v6:
+  a) drenar_interrupts(): se elimina el parámetro muerto `mostrar_si_vacio`.
+  b) drenar_interrupts(): límite de rondas de reanudación — si el nodo que
+     procesa el resume falla siempre (ej. Calendar API caída), el operador
+     ya no queda atrapado en un loop infinito.
+  c) /cargar valida que el hilo exista en el checkpointer y avisa si no.
+  d) El chequeo de interrupts post-invoke se pasa como argumento a
+     drenar_interrupts() para no golpear dos veces el checkpointer.
 
 Roles que juegas en la terminal:
   1️⃣  CLIENTE  → escribes mensajes normalmente.
-  2️⃣  OPERADOR → si el grafo se interrumpe (HITL), decides aprobar el
-                 link de Calendly o redactar la respuesta de rechazo.
+  2️⃣  OPERADOR → si el grafo se interrumpe (HITL), decides aprobar la
+                 creación del evento en Google Calendar o redactar la
+                 respuesta de rechazo.
 
 Comandos:
   /nuevo            → crea un hilo nuevo (nueva conversación)
@@ -25,6 +35,12 @@ from graph.builder import agent_graph
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
 
 LINE = "─" * 64
+
+# Máximo de rondas de reanudación por llamada a drenar_interrupts().
+# Protege contra un nodo de resume que falle de forma permanente
+# (ej. Google Calendar API caída): sin esto, el operador quedaría
+# respondiendo el mismo HITL para siempre.
+MAX_RONDAS_RESUME = 5
 
 
 # ---------------------------------------------------------------------------
@@ -63,8 +79,10 @@ def _mostrar_respuesta(result: dict) -> None:
 def resolver_hitl(payload: dict) -> dict:
     """Muestra la solicitud pendiente y pide la decisión del operador.
 
-    El único HITL activo en v5 es la aprobación del link de agendamiento
+    El único HITL activo es la aprobación de agendamiento
     (solo cuando REQUIERE_APROBACION_AGENDAMIENTO = True en nodes.py).
+    En la configuración por defecto el evento se crea directo y este HITL
+    no se dispara.
     """
     print(f"\n{LINE}")
     print("⏸️  INTERVENCIÓN HUMANA REQUERIDA (eres el operador)")
@@ -78,7 +96,7 @@ def resolver_hitl(payload: dict) -> dict:
     tipo = payload.get("tipo")
 
     if tipo == TipoHITL.APROBACION_AGENDAMIENTO.value:
-        print("  [a] Aprobar y enviar link de Calendly")
+        print("  [a] Aprobar y crear evento en Google Calendar")
         print("  [r] Rechazar (puedes agregar una nota para el cliente)")
         op = input("operador> [a/r]: ").strip().lower()
 
@@ -96,20 +114,40 @@ def resolver_hitl(payload: dict) -> dict:
     return {"aprobado": False, "nota": "HITL no reconocido por el operador"}
 
 
-def drenar_interrupts(config: dict, *, mostrar_si_vacio: bool = False) -> dict | None:
+def drenar_interrupts(config: dict, pendientes: list | None = None) -> dict | None:
     """Resuelve todos los interrupts pendientes de un hilo.
+
+    Args:
+        config:     config del hilo (con thread_id).
+        pendientes: lista de interrupts ya consultada por el llamador, para
+                    ahorrar un round-trip al checkpointer. Si es None, se
+                    consulta aquí.
 
     Devuelve el último resultado del grafo tras cerrar los HITLs, o None
     si no había interrupts pendientes. Cada resultado intermedio ya se
-    imprime aquí (para que el operador vea la respuesta post-aprobación)."""
-    ultimo_resultado = None
-    vistos = False
+    imprime aquí (para que el operador vea la respuesta post-aprobación).
 
-    while True:
-        interrupts = _pending_interrupts(config)
-        if not interrupts:
+    Protección anti loop-infinito: si tras MAX_RONDAS_RESUME rondas de
+    reanudación sigue habiendo interrupts (un nodo de resume que falla
+    siempre), se aborta y el hilo queda en pausa para revisión manual.
+    """
+    ultimo_resultado = None
+    rondas = 0
+    interrupts = pendientes if pendientes is not None else _pending_interrupts(config)
+
+    while interrupts:
+        rondas += 1
+        if rondas > MAX_RONDAS_RESUME:
+            logging.warning(
+                "drenar_interrupts abortó tras %d rondas; quedan %d interrupt(s) sin resolver",
+                MAX_RONDAS_RESUME, len(interrupts),
+            )
+            print(
+                "⚠️  No se pudo resolver un HITL tras varios intentos. "
+                "El hilo queda en pausa — revisa logs y reintenta más tarde.\n"
+            )
             break
-        vistos = True
+
         for intr in interrupts:
             decision = resolver_hitl(intr.value)
             try:
@@ -118,12 +156,11 @@ def drenar_interrupts(config: dict, *, mostrar_si_vacio: bool = False) -> dict |
                 )
             except Exception as e:
                 logging.exception("Error al reanudar HITL: %s", e)
-                print("⚠️  No se pudo reanudar el HITL. Revisa logs.")
+                print("⚠️  No se pudo reanudar el HITL (sigue pendiente). Revisa logs.")
                 continue
             _mostrar_respuesta(ultimo_resultado)
 
-    if mostrar_si_vacio and not vistos:
-        return None
+        interrupts = _pending_interrupts(config)
 
     return ultimo_resultado
 
@@ -143,6 +180,7 @@ def main():
     print("    Usa /cargar <thread_id> para retomar una conversación.\n")
 
     # Si arrancamos con un thread que ya tenía un HITL pendiente, lo drenamos.
+    # (Con un UUID nuevo esto es un no-op, pero lo dejamos por robustez.)
     drenar_interrupts(config)
 
     while True:
@@ -170,17 +208,32 @@ def main():
             if len(partes) < 2:
                 print("⚠️  Uso: /cargar <thread_id>\n")
                 continue
-            thread_id = partes[1].strip()
-            config = make_config(thread_id)
+
+            candidato_id = partes[1].strip()
+            candidato_config = make_config(candidato_id)
+            st = _estado_hilo(candidato_config)
+
+            # Validación: typo o id inexistente → no cambiar de hilo a ciegas.
+            if not st:
+                print(
+                    f"⚠️  '{candidato_id}' no existe en el checkpointer. "
+                    "Si continúas, se creará como hilo nuevo al primer mensaje."
+                )
+                confirma = input("¿Cargar de todos modos? [s/N]: ").strip().lower()
+                if confirma != "s":
+                    print("   Cancelado. Sigues en tu hilo actual.\n")
+                    continue
+
+            thread_id = candidato_id
+            config = candidato_config
 
             print(f"🧵 Hilo cargado: {thread_id}")
-            st = _estado_hilo(config)
             if st.get("intake_activo"):
                 print("   ℹ️  Este hilo tiene una ficha de intake en curso.")
             elif st.get("recolectando_datos_agenda"):
                 print("   ℹ️  Este hilo estaba capturando datos de agendamiento.")
-            elif st.get("esperando_confirmacion_booking"):
-                print("   ℹ️  Este hilo estaba esperando confirmación de Calendly.")
+            elif st.get("esperando_eleccion_horario"):
+                print("   ℹ️  Este hilo estaba eligiendo un horario disponible.")
 
             drenar_interrupts(config)
             print()
@@ -197,7 +250,7 @@ def main():
         # 2. Enviar el mensaje del cliente.
         #    Nota: ya NO pasamos "query": query. receive_message lo deriva del
         #    último mensaje humano. thread_id sí se mantiene en el state porque
-        #    varios nodos lo usan (handoff, link, expediente).
+        #    varios nodos lo usan (handoff, expediente).
         # ------------------------------------------------------------------
         try:
             result = agent_graph.invoke(
@@ -213,13 +266,13 @@ def main():
             continue
 
         # ------------------------------------------------------------------
-        # 3. Si el último nodo disparó un HITL nuevo, lo resolvemos.
+        # 3. Si el último nodo disparó un HITL nuevo, lo resolvemos pasando la
+        #    lista ya consultada (ahorra un segundo get_state al checkpointer).
         #    Si no, mostramos la respuesta normal del grafo.
-        #    Importante: drenar_interrupts() ya imprime la respuesta post-HITL,
-        #    por lo que no volvemos a imprimir `result` en ese caso.
         # ------------------------------------------------------------------
-        if _pending_interrupts(config):
-            drenar_interrupts(config)
+        pendientes = _pending_interrupts(config)
+        if pendientes:
+            drenar_interrupts(config, pendientes=pendientes)
         else:
             _mostrar_respuesta(result)
         print()

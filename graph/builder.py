@@ -1,23 +1,20 @@
-"""graph/builder.py — ensambla y compila el StateGraph.
+"""graph/builder.py — Grafo padre con 3 sub-agentes especializados:
+booking, faq, intake. Solo hace routing de alto nivel.
 
-v2 — Integración del nodo de INTAKE:
-  - Nodo intake_lead registrado y mapeado (ROUTE_INTAKE).
-  - Edge condicional post-intake: ficha completa → handoff_humano en la
-    misma invocación; incompleta → END (espera el próximo turno).
+v4 — Tres subgrafos especializados:
+  - ROUTE_FAQ      → subgrafo graph/faq/   (respuestas desde RAG)
+  - ROUTE_AGENDAR  → subgrafo graph/booking/ (reservas)
+  - ROUTE_INTAKE   → subgrafo graph/intake/  (ficha proactiva)
+  - ROUTE_HANDOFF  → nodo transversal handoff_humano (resumen + escala)
+  - ROUTE_FUERA_DOMINIO → nodo transversal respuesta_fuera_dominio
 
-v1→v2 conserva:
-  FIX BUG-1: respuesta_fuera_dominio registrada y mapeada (antes crash).
+  El grafo padre NUNCA contiene la lógica de negocio de los sub-flujos:
+  solo enruta hacia el sub-agente correcto y, en el caso de intake,
+  decide post-ejecución si la ficha completó (handoff) o debe esperar
+  otro turno (END).
 
-Invariante estructural (exigida por test_toda_ruta_tiene_nodo):
-  todo valor de VALID_ROUTES debe existir como nodo registrado.
-
-Flujo resultante:
-
-  START → receive_message → analyze_sentiment ─┬─ respuestas_faq ────────→ END
-                                               ├─ respuesta_fuera_dominio → END
-                                               ├─ agendar_asesoria ──────→ END
-                                               └─ intake_lead ─┬─────────→ END
-                                                               └─→ handoff_humano → END
+  Invariante estructural: todo valor de VALID_ROUTES existe como nodo
+  registrado (test_toda_ruta_tiene_nodo sigue pasando).
 """
 from langgraph.graph import END, START, StateGraph
 
@@ -26,22 +23,29 @@ from core.contracts import (
     ROUTE_AGENDAR, ROUTE_FAQ, ROUTE_FUERA_DOMINIO, ROUTE_HANDOFF, ROUTE_INTAKE,
 )
 from core.persistence import checkpointer
-from graph.intake import despues_de_intake, intake_lead
+from graph.booking.builder import build_booking_graph
+from graph.faq.builder import build_faq_graph
+from graph.intake.builder import build_intake_graph
 from graph.nodes import (
-    agendar_asesoria, analyze_sentiment, handoff_humano, receive_message,
-    respuesta_fuera_dominio, respuestas_faq, route_query,
+    analyze_sentiment, handoff_humano, receive_message,
+    respuesta_fuera_dominio, route_query,
 )
 
 
 def build_graph() -> StateGraph:
     workflow = StateGraph(AgentState)
 
-    # Nodos
+    # Nodos transversales del padre
     workflow.add_node("receive_message", receive_message)
     workflow.add_node("analyze_sentiment", analyze_sentiment)
-    workflow.add_node(ROUTE_FAQ, respuestas_faq)
-    workflow.add_node(ROUTE_AGENDAR, agendar_asesoria)
-    workflow.add_node(ROUTE_INTAKE, intake_lead)
+
+    # Sub-agentes especializados (subgrafos compilados, sin checkpointer propio:
+    # heredan el del padre y persisten su ledger entre turnos).
+    workflow.add_node(ROUTE_FAQ, build_faq_graph())
+    workflow.add_node(ROUTE_AGENDAR, build_booking_graph())
+    workflow.add_node(ROUTE_INTAKE, build_intake_graph())
+
+    # Nodos transversales de cierre
     workflow.add_node(ROUTE_HANDOFF, handoff_humano)
     workflow.add_node(ROUTE_FUERA_DOMINIO, respuesta_fuera_dominio)
 
@@ -49,7 +53,7 @@ def build_graph() -> StateGraph:
     workflow.add_edge(START, "receive_message")
     workflow.add_edge("receive_message", "analyze_sentiment")
 
-    # Routing sobre la clasificación (las 5 rutas oficiales tienen destino)
+    # Router principal: decide qué sub-agente ejecuta este turno
     workflow.add_conditional_edges(
         "analyze_sentiment",
         route_query,
@@ -62,21 +66,20 @@ def build_graph() -> StateGraph:
         },
     )
 
-    # Terminales simples
-    workflow.add_edge(ROUTE_FAQ, END)
-    workflow.add_edge(ROUTE_AGENDAR, END)
-    workflow.add_edge(ROUTE_HANDOFF, END)
-    workflow.add_edge(ROUTE_FUERA_DOMINIO, END)
+    # Sub-agentes terminales: cierran el turno con su respuesta al cliente
+    for terminal in (ROUTE_FAQ, ROUTE_AGENDAR, ROUTE_HANDOFF, ROUTE_FUERA_DOMINIO):
+        workflow.add_edge(terminal, END)
 
-    # Intake: ficha completa → derivar de inmediato; incompleta → esperar turno
+    # Intake es el único sub-agente que puede necesitar una continuación
+    # inmediata: si la ficha se completó dentro del subgrafo, el padre
+    # deriva a handoff_humano en el mismo turno; si no, espera el próximo
+    # mensaje del cliente (END).
     workflow.add_conditional_edges(
         ROUTE_INTAKE,
-        despues_de_intake,
+        lambda state: ROUTE_HANDOFF if state.get("intake_completado") else END,
         {ROUTE_HANDOFF: ROUTE_HANDOFF, END: END},
     )
 
-    # El checkpointer habilita persistencia + interrupt/resume (HITL)
-    # y es lo que mantiene intake_idx/intake_respuestas entre turnos.
     return workflow.compile(checkpointer=checkpointer)
 
 

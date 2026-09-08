@@ -24,7 +24,7 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-SHEETDB_BASE_URL = "https://sheetdb.io/api/v1/oxl3h0nanwlhh"
+SHEETDB_BASE_URL = "https://sheetdb.io/api/v1/4tg2dne6m1miv"
 MAX_JSON_BACKUP_CHARS = 30_000  # margen seguro bajo límite de Google Sheets
 
 # Nombres EXACTOS de tus columnas en Google Sheets
@@ -144,7 +144,6 @@ def _build_payload(state: dict, canal: str | None = None) -> dict:
     }
 
     # JSON backup: serializar solo campos esenciales, no todo el state
-    # (incluir todo el state con messages puede superar el límite de celda)
     backup = {
         "thread_id": state.get("thread_id"),
         "clasificacion": {
@@ -180,7 +179,7 @@ def _buscar_por_thread_id(thread_id: str | None) -> dict | None:
     try:
         r = requests.get(url, params={COL["thread_id"]: thread_id}, timeout=10)
         if r.status_code == 404:
-            return None  # no existe (SheetDB a veces devuelve 404 si no hay coincidencias)
+            return None
         r.raise_for_status()
         rows = r.json()
         if rows and isinstance(rows, list) and len(rows) > 0:
@@ -196,12 +195,11 @@ def _buscar_por_thread_id(thread_id: str | None) -> dict | None:
 def crear_lead(state: dict, canal: str | None = None) -> dict:
     """Crea una nueva fila en la hoja. SheetDB espera {"data": [payload]}."""
     payload = _build_payload(state, canal)
-    body = {"data": [payload]}  # ← FORMATO CORRECTO DE SHEETDB
+    body = {"data": [payload]}
 
     try:
         r = requests.post(SHEETDB_BASE_URL, json=body, timeout=15)
         if r.status_code >= 400:
-            # Loguear el cuerpo de la respuesta para depurar
             logger.error("SheetDB POST error %s: %s", r.status_code, r.text)
         r.raise_for_status()
         logger.info("Lead creado en SheetDB: %s", state.get("thread_id"))
@@ -212,12 +210,44 @@ def crear_lead(state: dict, canal: str | None = None) -> dict:
 
 
 def actualizar_lead_por_thread_id(thread_id: str | None, data: dict) -> dict:
-    """Actualiza campos parciales de la fila cuyo 'Thread ID' coincida."""
+    """Actualiza campos parciales de la fila cuyo 'Thread ID' coincida.
+    
+    v2 — Upsert: si la fila no existe, se CREA con los datos parciales + campos
+    mínimos obligatorios. Esto arregla el caso de un lead que agenda directo
+    (booking) sin haber pasado primero por handoff/sync_lead.
+    """
     if not thread_id:
         raise ValueError("thread_id requerido para actualizar lead")
-    url = f"{SHEETDB_BASE_URL}/{_safe_url(COL['thread_id'])}/{_safe_url(thread_id)}"
 
-    body = {"data": data}  # SheetDB también espera {"data": {...}} para PATCH
+    existing = _buscar_por_thread_id(thread_id)
+
+    # La fila no existe → la creamos con los datos que traemos.
+    if existing is None:
+        logger.info("SheetDB: lead '%s' no existe → se crea fila con update_data", thread_id)
+        fila = {
+            COL["id_lead"]: thread_id,
+            COL["thread_id"]: thread_id,
+            COL["created_at"]: _now_iso(),
+            COL["closed_at"]: _now_iso(),
+            COL["source"]: _detectar_canal(thread_id),
+            COL["lead_status"]: data.get(COL["lead_status"], "nuevo"),
+            **data,
+        }
+        body = {"data": [fila]}
+        try:
+            r = requests.post(SHEETDB_BASE_URL, json=body, timeout=15)
+            if r.status_code >= 400:
+                logger.error("SheetDB POST (upsert) error %s: %s", r.status_code, r.text)
+            r.raise_for_status()
+            logger.info("Lead creado en SheetDB (upsert): %s", thread_id)
+            return {"ok": True, "action": "created_upsert", "response": r.json()}
+        except Exception as e:
+            logger.exception("Error creando lead en SheetDB (upsert): %s", e)
+            raise
+
+    # La fila existe → PATCH normal.
+    url = f"{SHEETDB_BASE_URL}/{_safe_url(COL['thread_id'])}/{_safe_url(thread_id)}"
+    body = {"data": data}
     try:
         r = requests.patch(url, json=body, timeout=15)
         if r.status_code >= 400:
@@ -251,17 +281,25 @@ def sync_lead(state: dict, canal: str | None = None) -> dict:
 # ACTUALIZACIONES PARCIALES
 # ---------------------------------------------------------------------------
 def actualizar_booking(state: dict) -> dict:
-    """Llamar cuando Calendly confirma una cita."""
+    """Llamar cuando se confirma una cita en Google Calendar."""
     thread_id = state.get("thread_id")
     if not thread_id:
         return {"ok": False, "error": "sin thread_id"}
 
     booking = state.get("booking") or {}
+    r = state.get("intake_respuestas") or {}
+
     data = {
         COL["agenda_link"]: state.get("agenda_link", ""),
         COL["booking_fecha"]: _format_booking(booking),
         COL["modalidad"]: state.get("lead_modalidad", ""),
         COL["lead_status"]: "agendado",
         COL["closed_at"]: _now_iso(),
+        # Campos mínimos del lead, por si la fila no existe aún:
+        COL["nombre"]: state.get("lead_nombre") or r.get("nombre", ""),
+        COL["email"]: state.get("lead_email") or r.get("email", ""),
+        COL["telefono"]: r.get("telefono") or _telefono_cliente(thread_id) or "",
+        COL["category"]: state.get("category", ""),
+        COL["intent"]: state.get("intent", ""),
     }
     return actualizar_lead_por_thread_id(thread_id, data)

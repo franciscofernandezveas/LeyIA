@@ -1,21 +1,34 @@
 """Contratos centrales: estado del grafo, thread_id y esquemas estructurados.
 
-v5 — Integración del nodo de INTAKE (ficha proactiva de lead + caso):
-     + ROUTE_INTAKE en el set oficial de rutas.
-     + Labels de intake (etapa del proceso / horario / canal de origen).
-     + IntakeExtract: esquema del extractor LLM (la validación queda en
-       los validadores deterministas de graph/intake.py).
-     + Estado: intake_activo / intake_idx / intake_respuestas /
-       intake_completado / intake_started_en.
-     ⚠️ consentimiento_datos NO está en IntakeExtract a propósito:
-        debe responderse directamente (cumplimiento Ley 21.719).
+v6.1 — Booking signal/estado extendidos:
+       + BookingSignalLabel incluye "tanda_repetida" (consultar_disponibilidad
+         detectó propuesta idéntica → duda mal clasificada como navegación).
+       + AgentState incluye agenda_dia_sin_cupos (etiqueta legible del día
+         pedido explícitamente que quedó sin cupo; lo muestra proponer_slots
+         antes de las alternativas).
+
+v6 — BOOKING migrado a subgrafo (graph/booking/):
+     + Estado: booking_stage / booking_decision / booking_match /
+       booking_match_candidatos / booking_signal / booking_franja /
+       booking_attempts (ledger del sub-flujo, persistido por checkpointer).
+     + Labels nuevos: FranjaLabel, BookingStageLabel, BookingSignalLabel.
+       Viven AQUÍ y no en graph/booking/contracts.py para respetar la
+       dirección de imports (core ← graph, jamás al revés: se evita la
+       circularidad, ya que booking/*.py importa AgentState de aquí).
+     − ELIMINADOS recolectando_datos_agenda / esperando_eleccion_horario:
+       el short-circuit de analyze_sentiment ahora es UN solo flag
+       (booking_stage: "captura" | "propuesta").
+     − ELIMINADO LeadExtract: la extracción del lead la hace el planner de
+       booking vía BookingDecision (graph/booking/contracts.py); la validez
+       del email sigue siendo EMAIL_RE determinista, aplicada allá.
+       ⚠️ Si algún test/script legado importa LeadExtract, debe migrarse.
 
 Changelog anterior:
-  v4 - State de agenda completo (link idempotente, TTLs, contador de
-       verificaciones); contrato HITL tipado (TipoHITL/HitlPayload);
-       EMAIL_RE; recursion_limit en make_config; eliminados
-       'escalated' / 'slots_propuestos' / 'esperando_slot'.
-  v3 - Intent 'hablar_humano'; LeadExtract; sub-flujo de agenda.
+  v5 - Integración del nodo de INTAKE (ficha proactiva + IntakeExtract).
+       ⚠️ consentimiento_datos NUNCA está en los esquemas LLM (Ley 21.719).
+  v4 - Contrato HITL tipado (TipoHITL/HitlPayload); EMAIL_RE;
+       recursion_limit en make_config.
+  v3 - Intent 'hablar_humano'; sub-flujo de agenda.
   v2 - Etiquetas cerradas (Literal/Pydantic), rutas oficiales, fallback.
 """
 import re
@@ -60,14 +73,15 @@ VALID_LABELS = {
 # --------------------------------------------------------------------------
 # 2) RUTAS OFICIALES DEL GRAFO (las emite compute_route en graph/nodes.py)
 #
-# Regla v5:
+# Regla v6:
 #   intent=fuera_de_dominio → respuesta_fuera_dominio
 #   intent=hablar_humano    → intake_lead (ficha) → handoff_humano
-#   intent=agendar_asesoria → agendar_asesoria (sub-flujo captura + link)
+#   intent=agendar_asesoria → SUBGRAFO de booking (graph/booking/) en ROUTE_AGENDAR
 #   resto                   → respuestas_faq (atención/orientación RAG)
 # ⚠️ El sentimiento NO routea: solo modula el tono de respuestas_faq.
 # ⚠️ Las 5 rutas DEBEN estar registradas como nodos en graph/builder.py
-#    (test de contrato: test_toda_ruta_tiene_nodo).
+#    (test de contrato: test_toda_ruta_tiene_nodo). ROUTE_AGENDAR es un
+#    subgrafo compilado registrado como nodo — el invariante no se toca.
 # --------------------------------------------------------------------------
 ROUTE_HANDOFF: str = "handoff_humano"
 ROUTE_AGENDAR: str = "agendar_asesoria"
@@ -80,9 +94,28 @@ VALID_ROUTES = {ROUTE_HANDOFF, ROUTE_AGENDAR, ROUTE_FAQ,
 
 
 # --------------------------------------------------------------------------
-# 3) SUB-FLUJO DE AGENDAMIENTO + CONTRATO HITL
+# 3) SUB-FLUJO DE BOOKING (graph/booking/) + CONTRATO HITL
 # --------------------------------------------------------------------------
 ModalidadLabel = Literal["online", "presencial"]
+
+# Franja horaria demandada por el cliente. Coherente (mismos límites) con
+# HorarioContactoLabel del intake; los rangos exactos viven en
+# graph/booking/contracts.py → FRANJA_HORAS.
+FranjaLabel = Literal["manana", "tarde"]
+
+# Étapa del sub-flujo de booking. None = fuera del sub-flujo.
+# El short-circuit de analyze_sentiment lee SOLO este flag (v9 nodes.py).
+BookingStageLabel = Literal["captura", "propuesta"]
+
+# Señal consumible de replan interno (≡ replan_errors del núcleo BI):
+# la emite la acción, la consume/limpia el planner de booking, nunca cruza
+# turnos sin consumirse.
+BookingSignalLabel = Literal[
+    "slot_stale",        # el slot elegido se ocupó tras la propuesta → replan
+    "ventana_agotada",   # sin cupo en ventana/franja → ofrecer ejecutiva
+    "creacion_fallida",  # la API rechazó el insert → ofrecer ejecutiva
+    "tanda_repetida",    # tanda nueva idéntica a la vigente → duda mal clasificada
+]
 
 # Formato razonable de email (validación práctica, no RFC 5322 completa).
 EMAIL_RE = re.compile(r"^[\w.+-]+@[\w-]+(\.[\w-]+)+$")
@@ -97,7 +130,9 @@ class TipoHITL(str, Enum):
 
 
 class HitlPayload(TypedDict):
-    """Payload del interrupt() hacia el operador (contrato firme nodo↔CLI)."""
+    """Payload del interrupt() hacia el operador (contrato firme nodo↔CLI).
+    Lo emite confirmar_y_crear en graph/booking/nodes.py cuando
+    REQUIERE_APROBACION_AGENDAMIENTO=True."""
     tipo: str            # TipoHITL.value
     thread_id: str
     query: str           # último mensaje del cliente
@@ -138,17 +173,26 @@ class AgentState(TypedDict, total=False):
     context: List[str]
     response: str
 
-    # --- Sub-flujo de agendamiento (nodo agendar_asesoria) ---
+    # --- Sub-flujo de BOOKING (subgrafo graph/booking/) ---
+    # Ledger del sub-flujo: lo escriben/leen los nodos de graph/booking/;
+    # analyze_sentiment solo lee booking_stage (short-circuit) y hace
+    # reset completo por abort/TTL. lead_* se conservan a propósito tras
+    # abortar: si el cliente retoma, no se le vuelve a pedir su correo.
     lead_nombre: str
     lead_email: str
     lead_modalidad: ModalidadLabel
-    recolectando_datos_agenda: bool           # short-circuit: capturando datos
-    agenda_started_en: str                    # ISO: inicio de captura (TTL 24 h)
-    esperando_confirmacion_booking: bool      # link enviado, reserva sin confirmar
-    agenda_enviada_en: str                    # ISO: envío del link (TTL 48 h)
-    agenda_link: str                          # link enviado (reusar, NO regenerar)
-    verificaciones_fallidas: int              # contador con escape a humano
-    booking: dict                             # cita confirmada (BookingInfo dump)
+    booking_stage: BookingStageLabel | None   # None | "captura" | "propuesta"
+    booking_decision: dict                    # dump de BookingDecision (turno actual)
+    booking_match: int | None                 # índice en slots_propuestos (validado)
+    booking_match_candidatos: List[int]       # ambigüedad real (subset a aclarar)
+    booking_signal: BookingSignalLabel | None # señal de replan consumible
+    booking_franja: FranjaLabel | None        # preferencia "por la mañana/tarde"
+    booking_attempts: int                     # anti-loop de reintentos de elección
+    slots_propuestos: List[str]               # ISO datetimes (fuente de verdad del match)
+    agenda_ventana_desde: int                 # offset de días para "otro día"
+    agenda_started_en: str                    # ISO: inicio del sub-flujo (TTL 24 h, único)
+    agenda_dia_sin_cupos: str | None          # "miércoles 09/09" si el día pedido está lleno
+    booking: dict                             # cita creada (dump de EventoAsesoria)
 
     # --- Sub-flujo de intake / ficha de lead (nodo intake_lead) ---
     intake_activo: bool                       # short-circuit: ficha en curso
@@ -199,20 +243,6 @@ class AnalisisResult(BaseModel):
     reason: str = Field(description="Justificación breve (1 línea).")
 
 
-class LeadExtract(BaseModel):
-    """Extracción de datos para agendamiento. Campos faltantes → None.
-    La validez del email NUNCA se delega al LLM: se verifica con EMAIL_RE."""
-    nombre: str | None = Field(default=None, description="Nombre completo.")
-    email: str | None = Field(default=None, description="Correo electrónico.")
-    modalidad: ModalidadLabel | None = Field(
-        default=None,
-        description=(
-            "'online' si prefiere videollamada/Google Meet/virtual; "
-            "'presencial' si prefiere oficina/en persona."
-        ),
-    )
-
-
 class IntakeExtract(BaseModel):
     """Mapeo texto libre → campos de la ficha de intake (nodo intake_lead).
     Los validadores deterministas de graph/intake.py son la fuente de verdad;
@@ -220,6 +250,10 @@ class IntakeExtract(BaseModel):
 
     ⚠️ consentimiento_datos queda FUERA a propósito: debe responderse
     directamente (sí/no), nunca inferirse con el LLM (Ley 21.719).
+
+    (La extracción del LEAD de agendamiento ya no vive aquí: es
+    BookingDecision en graph/booking/contracts.py, validada por
+    graph/booking/planner.py.)
     """
     nombre: str | None = Field(default=None, description="Nombre completo.")
     email: str | None = Field(default=None, description="Correo electrónico.")
@@ -265,8 +299,10 @@ def fallback_analisis(motivo: str = "error de parseo") -> AnalisisResult:
 # --------------------------------------------------------------------------
 def make_config(thread_id: str) -> dict:
     """LangGraph persiste el estado por thread_id vía checkpointer.
-    recursion_limit defensivo (el grafo es casi lineal; cubre el edge
-    intake → handoff y futuros ciclos)."""
+    recursion_limit defensivo: cubre el edge intake → handoff y las cadenas
+    internas del subgrafo de booking (planner → consultar → proponer, y el
+    replan confirmar → consultar por slot_stale), que cuentan como super-pasos
+    dentro de la misma invocación del grafo padre."""
     return {
         "configurable": {"thread_id": thread_id},
         "recursion_limit": 40,

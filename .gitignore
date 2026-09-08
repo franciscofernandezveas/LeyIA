@@ -7,6 +7,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.egg-info/
 .Python
 venv/
 .venv/
@@ -14,7 +15,7 @@ venv/
 # Bases de datos locales
 *.sqlite3
 *.db
-checkpoints.sqlite
+checkpoints.sqlite*
 
 # Chroma DB / índices locales
 chroma_db/
@@ -29,3 +30,14 @@ chroma_db/
 # Archivos del sistema
 .DS_Store
 Thumbs.db
+
+# Google Calendar auth
+credentials.json
+token.json
+service-account.json
+
+# Datos de clientes
+escalations/
+
+# Scripts temporales de dev
+generar_token.py
