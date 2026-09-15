@@ -105,7 +105,8 @@ FranjaLabel = Literal["manana", "tarde"]
 
 # Étapa del sub-flujo de booking. None = fuera del sub-flujo.
 # El short-circuit de analyze_sentiment lee SOLO este flag (v9 nodes.py).
-BookingStageLabel = Literal["captura", "propuesta"]
+BookingStageLabel = Literal["captura_nombre", "captura_email", "captura_modalidad", "propuesta"]
+
 
 # Señal consumible de replan interno (≡ replan_errors del núcleo BI):
 # la emite la acción, la consume/limpia el planner de booking, nunca cruza
@@ -172,6 +173,12 @@ class AgentState(TypedDict, total=False):
     # --- Atención RAG (nodo respuestas_faq) ---
     context: List[str]
     response: str
+    # --- Sub-flujo de FAQ (subgrafo graph/faq/) ---
+    faq_decision: dict | None        # dump de FAQDecision (turno actual)
+    faq_stage: str | None            # "respondiendo" | "clarificando"
+
+
+
 
     # --- Sub-flujo de BOOKING (subgrafo graph/booking/) ---
     # Ledger del sub-flujo: lo escriben/leen los nodos de graph/booking/;
@@ -195,11 +202,23 @@ class AgentState(TypedDict, total=False):
     booking: dict                             # cita creada (dump de EventoAsesoria)
 
     # --- Sub-flujo de intake / ficha de lead (nodo intake_lead) ---
-    intake_activo: bool                       # short-circuit: ficha en curso
-    intake_idx: int                           # índice de la pregunta actual
+    
+    # Agregar dentro de AgentState, en el bloque "Sub-flujo de intake":
+
+    # --- Sub-flujo de intake / ficha de lead (nodo intake_lead) ---
+    intake_activo: bool                       # ficha en curso
+    intake_idx: int                           # índice de la pregunta actual (telemetría;
+                                              # la fuente de verdad es _pendientes)
     intake_respuestas: dict                   # {campo: valor validado}
     intake_completado: bool                   # ficha lista → handoff directo
     intake_started_en: str                    # ISO: inicio de ficha (TTL 24 h)
+    intake_decision: dict | None              # dump de IntakeDecision (turno actual):
+                                              # {accion, tipo, confianza, razon, campos...}
+    intake_stage: str | None                  # apertura|preguntando|pausado|completado|...
+    intake_attempts: int                      # fallos de validación en la pregunta activa
+    intake_exit: str | None                   # None | "faq" (pausa) | "handoff" (parcial)
+    intake_resume: bool                       # tras FAQ lateral, intake re-pregunta pendiente
+               # ISO: inicio de ficha (TTL 24 h)
 
     # --- Escalamiento / cierre (nodo handoff_humano) ---
     closed: bool                              # hilo derivado/cerrado

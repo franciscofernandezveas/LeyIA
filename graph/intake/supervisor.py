@@ -1,23 +1,18 @@
-"""graph/intake/supervisor.py — Routing interno del sub-agente INTAKE.
-
-v7 — Corte definitivo: solo 3 acciones reales. La decisión es determinista
-y viene del planner (iniciar_ficha / procesar_respuesta / sin_consentimiento).
-"""
+"""graph/intake/supervisor.py — Routing interno del sub-agente INTAKE (v8)."""
 from core.contracts import AgentState
+
+_ACCIONES = {
+    "iniciar_ficha": "iniciar_ficha",
+    "procesar_respuesta": "procesar_respuesta",
+    "reanudar": "reanudar",
+    "pausar_para_faq": "pausar_para_faq",
+    "derivar_parcial": "derivar_parcial",
+    "abandonar_ficha": "abandonar_ficha",
+    "sin_consentimiento": "sin_consentimiento",
+}
 
 
 def route_intake(state: AgentState) -> str:
-    """Mapea la decisión del planner al nodo de acción correspondiente.
-
-    Defensivo: si intake_decision está corrupto o ausente, cae en
-    procesar_respuesta (el nodo más robusto: puede re-inicializar o
-    continuar según el ledger).
-    """
     d = state.get("intake_decision") or {}
-    accion = d.get("accion", "procesar_respuesta")
-
-    return {
-        "iniciar_ficha": "iniciar_ficha",
-        "procesar_respuesta": "procesar_respuesta",
-        "sin_consentimiento": "sin_consentimiento",
-    }.get(accion, "procesar_respuesta")
+    return _ACCIONES.get(d.get("accion", "procesar_respuesta"),
+                         "procesar_respuesta")

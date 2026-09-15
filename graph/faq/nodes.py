@@ -1,13 +1,28 @@
-"""graph/faq/nodes.py — Acciones del sub-agente FAQ."""
+"""graph/faq/nodes.py — Acciones del sub-agente FAQ.
+
+v2 — Integridad y consistencia con el sistema:
+  - Todos los nodos persisten su respuesta vía _guardar_ai (v11 lo declaraba
+    pero FAQ jamás lo implementó: los turnos FAQ no estaban en Postgres).
+  - derivar_a_ejecutiva YA NO MIENTE: nada de handoff_message con link vacío
+    ni promesas de gestiones que no ejecuta. Ahora señala ROUTE_INTAKE: el
+    padre inicia/continúa la ficha, y el planner semántico de intake decide
+    (si el cliente insiste en humano → derivación directa con ficha parcial).
+    El handoff real vive SOLO en handoff_humano, con summary + persistencia
+    + notificación.
+  - pedir_clarificacion y el fallback de error se mueven a prompts.yaml en
+    registro formal (usted, sin emojis) — coherencia v2.6.
+  - sugerir_agendar ya no toca `route`: el CTA pregunta y se espera la
+    respuesta; el siguiente turno clasifica agendar_asesoria y entra booking.
+"""
 import logging
 
 from langchain_core.messages import AIMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
-from core.contracts import ROUTE_AGENDAR, ROUTE_HANDOFF, ROUTE_FUERA_DOMINIO, AgentState
+from core.contracts import ROUTE_INTAKE, AgentState
 from core.llm import LLM
 from core.rag import retrieve
-from graph.nodes import _cfg, _recent_messages
+from graph.nodes import _cfg, _guardar_ai, _recent_messages, _wa_link
 
 logger = logging.getLogger(__name__)
 
@@ -43,9 +58,9 @@ def responder_pregunta(state: AgentState) -> AgentState:
         }).content
     except Exception as e:
         logger.exception("[faq] LLM falló: %s", e)
-        response = ("Disculpa, tuve un problema técnico procesando tu mensaje 🙏. "
-                    "¿Podrías repetírmelo en unos minutos?")
+        response = atn["faq_error"].format(wa_link=_wa_link())
 
+    _guardar_ai(state, response)
     return {
         "response": response,
         "context": [d.page_content for d in docs],
@@ -55,46 +70,45 @@ def responder_pregunta(state: AgentState) -> AgentState:
 
 def pedir_clarificacion(state: AgentState) -> AgentState:
     atn = _cfg()["atencion"]
-    response = ("No estoy seguro de haber entendido bien tu consulta. "
-                "¿Podrías darme un poco más de contexto? Por ejemplo, ¿se trata "
-                "de pensiones de alimentos, divorcio, visitas o alguna otra "
-                "materia familiar?")
+    response = atn["faq_clarificacion"]
+    _guardar_ai(state, response)
     return {"response": response, "messages": [AIMessage(content=response)]}
 
 
 def sugerir_agendar(state: AgentState) -> AgentState:
-    """El usuario mostró intención de agendar dentro del FAQ. Se devuelve
-    al grafo padre con la señal de que debe ir a booking."""
+    """El usuario mostró intención de agendar dentro del FAQ. Se envía el CTA
+    (pregunta) y se espera su respuesta: el próximo turno clasificará
+    agendar_asesoria y entrará al subgrafo de booking. NO se re-rutea en el
+    mismo turno para evitar duplicar el CTA con agenda_pedir_datos."""
     atn = _cfg()["atencion"]
     response = atn["cta_agendar"]
-    return {
-        "response": response,
-        "route": ROUTE_AGENDAR,  # señal para el grafo padre (opcional, según diseño)
-        "messages": [AIMessage(content=response)],
-    }
+    _guardar_ai(state, response)
+    return {"response": response, "messages": [AIMessage(content=response)]}
 
 
 def derivar_a_ejecutiva(state: AgentState) -> AgentState:
-    """Devuelve al grafo padre la señal de handoff."""
-    atn = _cfg()["atencion"]
-    response = atn["handoff_message"].format(
-        disclosure=atn["disclosure"],
-        whatsapp_ejecutiva="",  # se rellena en handoff_humano
-        thread_id=state.get("thread_id", ""),
-    )
+    """El planner FAQ detectó pedido de humano dentro de la conversación.
+
+    Señala ROUTE_INTAKE para que el padre desvíe el turno al subgrafo de
+    intake (embudo oficial: ficha → handoff). No emite mensaje: la respuesta
+    de ESTE turno la emite el intake (apertura o, si el cliente insiste,
+    derivación con ficha parcial).
+
+    Se limpia intake_resume: si el cliente venía de una pausa lateral y aquí
+    pidió humano, el planner de intake debe EVALUAR el mensaje (→
+    insiste_humano → derivar_parcial), no reanudar la ficha mecánicamente.
+    """
     return {
-        "response": response,
-        "route": ROUTE_HANDOFF,
-        "messages": [AIMessage(content=response)],
+        "route": ROUTE_INTAKE,
+        "intake_resume": False,
     }
 
 
 def derivar_a_fuera_dominio(state: AgentState) -> AgentState:
-    """Devuelve al grafo padre la señal de fuera de dominio."""
+    """Redirección amable por tema no legal. No re-rutea: este nodo ya
+    responde; si la ficha estaba pausada (duda lateral), el padre la
+    reanudará después vía route_post_faq."""
     atn = _cfg()["atencion"]
     response = atn["fuera_dominio_message"].format(disclosure=atn["disclosure"])
-    return {
-        "response": response,
-        "route": ROUTE_FUERA_DOMINIO,
-        "messages": [AIMessage(content=response)],
-    }
+    _guardar_ai(state, response)
+    return {"response": response, "messages": [AIMessage(content=response)]}

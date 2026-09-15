@@ -1,20 +1,13 @@
-"""graph/builder.py — Grafo padre con 3 sub-agentes especializados:
-booking, faq, intake. Solo hace routing de alto nivel.
+"""graph/builder.py — Grafo padre con 3 sub-agentes especializados.
 
-v4 — Tres subgrafos especializados:
-  - ROUTE_FAQ      → subgrafo graph/faq/   (respuestas desde RAG)
-  - ROUTE_AGENDAR  → subgrafo graph/booking/ (reservas)
-  - ROUTE_INTAKE   → subgrafo graph/intake/  (ficha proactiva)
-  - ROUTE_HANDOFF  → nodo transversal handoff_humano (resumen + escala)
-  - ROUTE_FUERA_DOMINIO → nodo transversal respuesta_fuera_dominio
+v5.1 — FAQ puede derivar a intake (pedido de humano contextual) y, si la
+  ficha ya estaba completada, directo a handoff. También mantiene la
+  reanudación del intake tras duda lateral.
 
-  El grafo padre NUNCA contiene la lógica de negocio de los sub-flujos:
-  solo enruta hacia el sub-agente correcto y, en el caso de intake,
-  decide post-ejecución si la ficha completó (handoff) o debe esperar
-  otro turno (END).
-
-  Invariante estructural: todo valor de VALID_ROUTES existe como nodo
-  registrado (test_toda_ruta_tiene_nodo sigue pasando).
+v5 — Pausa lateral del intake:
+  - INTAKE → FAQ: el cliente hace una duda a mitad de ficha; FAQ responde.
+  - FAQ → INTAKE: tras la respuesta, intake re-anexa la pregunta pendiente.
+  Decisiones en graph.nodes.route_post_intake / route_post_faq.
 """
 from langgraph.graph import END, START, StateGraph
 
@@ -28,32 +21,26 @@ from graph.faq.builder import build_faq_graph
 from graph.intake.builder import build_intake_graph
 from graph.nodes import (
     analyze_sentiment, handoff_humano, receive_message,
-    respuesta_fuera_dominio, route_query,
+    respuesta_fuera_dominio, route_post_faq, route_post_intake, route_query,
 )
 
 
 def build_graph() -> StateGraph:
     workflow = StateGraph(AgentState)
 
-    # Nodos transversales del padre
     workflow.add_node("receive_message", receive_message)
     workflow.add_node("analyze_sentiment", analyze_sentiment)
 
-    # Sub-agentes especializados (subgrafos compilados, sin checkpointer propio:
-    # heredan el del padre y persisten su ledger entre turnos).
     workflow.add_node(ROUTE_FAQ, build_faq_graph())
     workflow.add_node(ROUTE_AGENDAR, build_booking_graph())
     workflow.add_node(ROUTE_INTAKE, build_intake_graph())
 
-    # Nodos transversales de cierre
     workflow.add_node(ROUTE_HANDOFF, handoff_humano)
     workflow.add_node(ROUTE_FUERA_DOMINIO, respuesta_fuera_dominio)
 
-    # Entrada
     workflow.add_edge(START, "receive_message")
     workflow.add_edge("receive_message", "analyze_sentiment")
 
-    # Router principal: decide qué sub-agente ejecuta este turno
     workflow.add_conditional_edges(
         "analyze_sentiment",
         route_query,
@@ -66,18 +53,29 @@ def build_graph() -> StateGraph:
         },
     )
 
-    # Sub-agentes terminales: cierran el turno con su respuesta al cliente
-    for terminal in (ROUTE_FAQ, ROUTE_AGENDAR, ROUTE_HANDOFF, ROUTE_FUERA_DOMINIO):
+    # Terminales puros: su sub-flujo termina aquí y cierra el turno.
+    for terminal in (ROUTE_AGENDAR, ROUTE_HANDOFF, ROUTE_FUERA_DOMINIO):
         workflow.add_edge(terminal, END)
 
-    # Intake es el único sub-agente que puede necesitar una continuación
-    # inmediata: si la ficha se completó dentro del subgrafo, el padre
-    # deriva a handoff_humano en el mismo turno; si no, espera el próximo
-    # mensaje del cliente (END).
+    # Intake puede: pausar a FAQ (duda lateral), derivar a handoff
+    # (ficha completa o parcial) o terminar el turno.
     workflow.add_conditional_edges(
         ROUTE_INTAKE,
-        lambda state: ROUTE_HANDOFF if state.get("intake_completado") else END,
-        {ROUTE_HANDOFF: ROUTE_HANDOFF, END: END},
+        route_post_intake,
+        {ROUTE_FAQ: ROUTE_FAQ, ROUTE_HANDOFF: ROUTE_HANDOFF, END: END},
+    )
+
+    # FAQ: normalmente responde y cierra; si el intake estaba pausado, lo
+    # reanuda. Además, si el planner FAQ detectó un pedido de humano,
+    # señala intake (o handoff si la ficha ya estaba completa).
+    workflow.add_conditional_edges(
+        ROUTE_FAQ,
+        route_post_faq,
+        {
+            ROUTE_INTAKE: ROUTE_INTAKE,
+            ROUTE_HANDOFF: ROUTE_HANDOFF,
+            END: END,
+        },
     )
 
     return workflow.compile(checkpointer=checkpointer)
