@@ -74,7 +74,7 @@ import json
 import asyncio
 import time
 from datetime import datetime, date, time as dt_time, timedelta
-from typing import Dict, Optional, Any, AsyncGenerator
+from typing import Dict, Optional, Any, AsyncGenerator, Literal
 from contextlib import asynccontextmanager
 from uuid import uuid4, UUID
 from decimal import Decimal
@@ -126,7 +126,7 @@ MAX_RONDAS_RESUME = 5
 # 2. FASTAPI, CORS Y ROUTERS
 # ============================================================================
 
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, Depends, HTTPException, Request, Query
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -668,18 +668,24 @@ def _mock_metrics(range_str: str):
 
 
 @app.get("/api/metrics/overview")
-async def metrics_overview(range: str = Query("7d", enum=["7d", "30d", "90d"])):
+async def metrics_overview(
+    rango: Literal["7d", "30d", "90d"] = Query("7d", alias="range")
+):
     """
     Métricas del agente de WhatsApp para el dashboard del estudio de abogados.
     Si Supabase está configurado, lee datos reales; si no, devuelve datos de ejemplo.
 
+    Uso: GET /api/metrics/overview?range=7d  (también 30d, 90d)
+
     No requiere autenticación para facilitar pruebas del dashboard.
+    Nota: el parámetro interno se llama "rango" (alias "range") para no
+    pisar el builtin range() de Python dentro de la función.
     """
     try:
         if not supabase_metrics:
             raise RuntimeError("Supabase no configurado")
 
-        days, start, end = _parse_range(range)
+        days, start, end = _parse_range(rango)
         start_iso = start.isoformat()
         end_iso = end.isoformat()
 
@@ -783,7 +789,7 @@ async def metrics_overview(range: str = Query("7d", enum=["7d", "30d", "90d"])):
 
     except Exception as e:
         logger.warning(f"⚠️ Métricas reales no disponibles, devolviendo mock: {e}")
-        return _mock_metrics(range)
+        return _mock_metrics(rango)
 
 
 # ============================================================================
