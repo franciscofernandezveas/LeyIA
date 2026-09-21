@@ -25,4 +25,4 @@ ENV PORT=8000
 EXPOSE 8000
 
 # Inicia la API FastAPI
-CMD ["sh", "-c", "uvicorn api:app --host 0.0.0.0 --port ${PORT}"]
+CMD ["sh", "-c", "python -m scripts.build_index && uvicorn api:app --host 0.0.0.0 --port ${PORT}"]
