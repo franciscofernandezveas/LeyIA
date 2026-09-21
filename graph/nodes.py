@@ -1,5 +1,18 @@
 """graph/nodes.py — Nodos transversales del agente (Manzzo y Cía).
 
+v13 — Links wa.me con diagnóstico del intake:
+  - _wa_texto_intake(): "tarjeta de presentación" determinista (0 LLM) con
+    la ficha ya validada + thread_id (la ejecutiva cruza con el CRM al
+    recibir el mensaje del cliente). Acotada a WA_TEXTO_MAX porque el
+    ?text= se URL-encodea (~1.5-2x).
+  - _wa_link_diagnostico(): wa.me con ese diagnóstico prellenado.
+  - _wa_link_cliente() ahora usa el diagnóstico cuando hay intake → el
+    cliente recibe el MISMO link en ack_completado y en handoff_message
+    (consistencia); sin ficha, cae al saludo genérico. Con ficha parcial
+    (derivación anticipada) el intro refleja que NO completó el registro.
+  - El resumen LLM largo sigue yendo a la ejecutiva por
+    notificar_escalamiento + DB; el link lleva solo el diagnóstico compacto.
+
 v12 — Intake semántico + leads parciales + links wa.me:
   - analyze_sentiment clasifica SIEMPRE durante intake (metadata fresca
     para el lead: category/intent ya no quedan congelados); la precedencia
@@ -46,6 +59,9 @@ ESCALATIONS_DIR = Path("escalations")
 
 AGENDA_CAPTURA_TTL_HORAS = 24
 INTAKE_TTL_HORAS = 24
+
+# Largo máx. del texto crudo del wa.me (tras URL-encoding crece ~1.5-2x).
+WA_TEXTO_MAX = 900
 
 REQUIRED_KEYS = {
     "atencion": {"disclosure", "cta_agendar", "faq_system_prompt", "tonos",
@@ -126,13 +142,62 @@ def _wa_link(texto: str = "") -> str:
     return f"{base}?text={quote(texto)}" if texto else base
 
 
-def _wa_link_cliente(state: AgentState) -> str:
-    """wa.me prellenado con identidad del cliente (si la conocemos)."""
+def _wa_texto_intake(state: AgentState) -> str:
+    """Diagnóstico compacto del intake para el ?text= del wa.me.
+
+    Determinista (0 LLM): la ficha ya pasó los validadores, solo se formatea.
+    El resumen largo le llega a la ejecutiva por notificación/CRM; este texto
+    es la tarjeta de presentación que ella ve cuando el cliente le escribe.
+    Ficha parcial (derivación anticipada) → intro que NO afirma completado.
+    """
     r = state.get("intake_respuestas") or {}
     nombre = r.get("nombre")
-    cat = state.get("category") or ""
-    if nombre:
-        return _wa_link(f"Hola, soy {nombre}, acabo de derivar mi caso ({cat}).")
+
+    lineas = [
+        f"Hola, soy {nombre}." if nombre
+        else "Hola, vengo del asistente virtual de Manzzo y Cía.",
+        ("Acabo de completar mi registro. Resumen de mi caso:"
+         if state.get("intake_completado") else
+         "Prefiero hablar directamente con una ejecutiva. Datos que alcancé a registrar:"),
+    ]
+    if state.get("category"):
+        lineas.append(f"• Área: {state['category']}")
+    if r.get("email"):
+        lineas.append(f"• Correo: {r['email']}")
+    if r.get("situacion_actual"):
+        sit = str(r["situacion_actual"])
+        if len(sit) > 280:                      # campo libre: acotar
+            sit = sit[:277].rstrip() + "…"
+        lineas.append(f"• Mi situación: {sit}")
+    if r.get("etapa_proceso"):                   # ya viene como label legible
+        lineas.append(f"• Etapa de mi caso: {r['etapa_proceso']}")
+    # opcionales del planner, por si se agregan a QUESTIONS:
+    if r.get("comuna"):
+        lineas.append(f"• Comuna: {r['comuna']}")
+    if r.get("hijos_menores") is True:
+        lineas.append("• Tengo hijos menores de edad")
+    if r.get("horario_contacto"):
+        lineas.append(f"• Horario preferido: {r['horario_contacto']}")
+
+    tid = state.get("thread_id")
+    if tid:
+        lineas.append(f"(ID de mi atención: {tid})")   # trazabilidad con el CRM
+
+    txt = "\n".join(lineas)
+    if len(txt) > WA_TEXTO_MAX:
+        txt = txt[:WA_TEXTO_MAX - 1].rstrip() + "…"
+    return txt
+
+
+def _wa_link_diagnostico(state: AgentState) -> str:
+    """wa.me hacia la ejecutiva con el diagnóstico del intake prellenado."""
+    return _wa_link(_wa_texto_intake(state))
+
+
+def _wa_link_cliente(state: AgentState) -> str:
+    """wa.me prellenado con el diagnóstico del intake (si hay ficha)."""
+    if state.get("intake_respuestas"):
+        return _wa_link_diagnostico(state)
     return _wa_link("Hola, vengo del asistente virtual de Manzzo y Cía.")
 
 

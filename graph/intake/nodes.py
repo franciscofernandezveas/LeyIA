@@ -1,5 +1,15 @@
 """graph/intake/nodes.py — Acciones del sub-agente INTAKE.
 
+v9 — Link de completado con diagnóstico:
+  - _completar_ficha arma el wa.me con _wa_link_diagnostico (ficha validada
+    + thread_id para cruce CRM) en vez del saludo genérico.
+  - GOTCHA: fusiona las respuestas del turno en una copia del state antes
+    de llamarlo — state["intake_respuestas"] aún no tiene la última
+    respuesta e intake_completado aún viene False (el intro del diagnóstico
+    depende de él); se fuerza True en la copia.
+  - _wa_link se mantiene para derivación parcial / abandono / sin
+    consentimiento (mensajes sin ficha completa).
+
 v8 — Semántico + leads parciales:
   - Consentimiento = pregunta 1 → upsert incremental (completed=False) tras
     cada campo válido; completed=True al cerrar la ficha.
@@ -19,7 +29,8 @@ from langchain_core.messages import AIMessage
 from core.contracts import EMAIL_RE, AgentState, ROUTE_FAQ
 from core.db_client import upsert_lead
 from graph.nodes import (
-    _ahora_iso, _cfg, _guardar_ai, _primer_nombre, _telefono_cliente, _wa_link,
+    _ahora_iso, _cfg, _guardar_ai, _primer_nombre, _telefono_cliente,
+    _wa_link, _wa_link_diagnostico,
 )
 
 logger = logging.getLogger(__name__)
@@ -312,12 +323,15 @@ def procesar_respuesta(state: AgentState) -> AgentState:
 
 
 def _completar_ficha(state: AgentState, respuestas: dict) -> AgentState:
+    # state["intake_respuestas"] aún NO tiene la última respuesta del turno
+    # e intake_completado aún viene False (el intro del diagnóstico depende
+    # de él) → fusionar ambos en una copia antes de armar el link.
+    state_con_ficha = {
+        **state, "intake_respuestas": respuestas, "intake_completado": True,
+    }
     ack = _cfg()["intake"]["ack_completado"].format(
         nombre=_primer_nombre(respuestas.get("nombre")) or "",
-        wa_link=_wa_link(
-            f"Hola, soy {respuestas.get('nombre', '')}, "
-            f"acabo de completar mi registro ({state.get('category') or ''})."
-        ),
+        wa_link=_wa_link_diagnostico(state_con_ficha),
     )
     try:
         upsert_lead(
