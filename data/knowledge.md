@@ -5,7 +5,7 @@ Tipo de documento: Base de conocimiento para sistema RAG
 Fuente: https://manzzoycia.cl/
 Nombre de la firma: Manzzo y Cía (MANZZOYCIA.CL)
 País: Chile
-Última actualización del contenido: 2025
+Última actualización del contenido: 2026
 ================================================================================
 
 
