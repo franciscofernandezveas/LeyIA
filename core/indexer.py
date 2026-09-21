@@ -3,11 +3,12 @@
 Estrategia de chunking estructural:
   1. Se extrae el bloque que contiene las secciones (entre líneas '====').
   2. Se divide por secciones ('----' + 'SECCIÓN N: TÍTULO').
-  3. Sub-chunking semántico por sección:
-       - Sección 3 (servicios)   → un chunk por servicio numerado.
-       - Sección 8 (testimonios) → un chunk por testimonio.
-       - Sección 9 (FAQ)         → un chunk por par PREGUNTA/RESPUESTA.
-       - Resto                   → la sección completa (split recursivo si excede).
+  3. Sub-chunking semántico por TÍTULO de sección (no por número, así la
+     renumeración del documento no desalinea la metadata):
+       - Título con 'preguntas frecuentes'/'faq' → un chunk por PREGUNTA/RESPUESTA.
+       - Título con 'servicios'                  → un chunk por servicio numerado.
+       - Título con 'testimonio'                 → un chunk por testimonio.
+       - Resto                                   → sección completa (split si excede).
   4. Cada chunk lleva un encabezado de contexto (empresa + sección)
      para enriquecer el embedding, y metadatos filtrables.
 
@@ -134,6 +135,23 @@ def _parse_sections(text: str) -> List[Section]:
 # ---------------------------------------------------------------------------
 # Construcción de Documents
 # ---------------------------------------------------------------------------
+def _splitter_por_seccion(sec: Section) -> tuple[Optional[re.Pattern], str]:
+    """Tipo y patrón de split según el TÍTULO de la sección.
+
+    Despachar por título (no por número) hace el indexador inmune a
+    renumeraciones del documento: fue la causa del bug donde las FAQ
+    quedaron tipadas 'testimonio' y la privacidad como 'faq'.
+    """
+    t = sec.titulo.lower()
+    if "preguntas frecuentes" in t or "faq" in t:
+        return FAQ_RE, "faq"
+    if "servicios" in t:
+        return SERVICE_RE, "servicio"
+    if "testimonio" in t:
+        return TESTIMONY_RE, "testimonio"
+    return None, "seccion"
+
+
 def parse_knowledge_markdown(path: Optional[Path] = None) -> List[Document]:
     path = path or KNOWLEDGE_PATH
     raw = path.read_text(encoding="utf-8-sig")  # utf-8-sig: tolerante a BOM (Windows)
@@ -143,15 +161,8 @@ def parse_knowledge_markdown(path: Optional[Path] = None) -> List[Document]:
     docs: List[Document] = []
 
     for sec in sections:
-        # Sub-chunking semántico según la sección
-        if sec.numero == 9:
-            pieces, tipo = FAQ_RE.split(sec.cuerpo), "faq"
-        elif sec.numero == 3:
-            pieces, tipo = SERVICE_RE.split(sec.cuerpo), "servicio"
-        elif sec.numero == 8:
-            pieces, tipo = TESTIMONY_RE.split(sec.cuerpo), "testimonio"
-        else:
-            pieces, tipo = [sec.cuerpo], "seccion"
+        patron, tipo = _splitter_por_seccion(sec)
+        pieces = patron.split(sec.cuerpo) if patron else [sec.cuerpo]
 
         for piece in pieces:
             for sub in _maybe_split(piece.strip()):
