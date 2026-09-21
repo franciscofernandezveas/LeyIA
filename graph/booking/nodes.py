@@ -343,7 +343,8 @@ def responder_lateral(state: AgentState) -> AgentState:
         respuesta = ("La asesoría dura 30 minutos y puede ser online por Meet "
                      "o presencial en nuestra oficina.")
     _guardar_ai(state, respuesta)
-    return {"response": respuesta, "messages": [AIMessage(content=response)]}
+    return {"response": respuesta, "messages": [AIMessage(content=respuesta)]}
+
 
 
 # ---------------------------------------------------------------------------
