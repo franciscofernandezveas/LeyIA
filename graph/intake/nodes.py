@@ -1,5 +1,15 @@
 """graph/intake/nodes.py — Acciones del sub-agente INTAKE.
 
+v10 — Links wa.me limpios (oculta la URL enorme):
+  - Todos los links hacia la ejecutiva se renderizan como markdown
+    [Hablar con un humano](wa.me?text=...). El cliente ve texto limpio;
+    al pinchar, WhatsApp abre con el diagnóstico prellenado.
+  - _wa_link_display() envuelve _wa_link() en markdown; se usa en
+    _completar_ficha (vía _wa_link_diagnostico), _derivar_parcial,
+    abandonar_ficha y sin_consentimiento.
+  - El diagnóstico completo (ficha validada + thread_id) sigue viajando
+    oculto en el query param ?text= para la ejecutiva.
+
 v9 — Link de completado con diagnóstico:
   - _completar_ficha arma el wa.me con _wa_link_diagnostico (ficha validada
     + thread_id para cruce CRM) en vez del saludo genérico.
@@ -7,8 +17,6 @@ v9 — Link de completado con diagnóstico:
     de llamarlo — state["intake_respuestas"] aún no tiene la última
     respuesta e intake_completado aún viene False (el intro del diagnóstico
     depende de él); se fuerza True en la copia.
-  - _wa_link se mantiene para derivación parcial / abandono / sin
-    consentimiento (mensajes sin ficha completa).
 
 v8 — Semántico + leads parciales:
   - Consentimiento = pregunta 1 → upsert incremental (completed=False) tras
@@ -30,7 +38,7 @@ from core.contracts import EMAIL_RE, AgentState, ROUTE_FAQ
 from core.db_client import upsert_lead
 from graph.nodes import (
     _ahora_iso, _cfg, _guardar_ai, _primer_nombre, _telefono_cliente,
-    _wa_link, _wa_link_diagnostico,
+    _wa_link, _wa_link_diagnostico, _wa_link_display,
 )
 
 logger = logging.getLogger(__name__)
@@ -391,9 +399,10 @@ def derivar_parcial(state: AgentState) -> AgentState:
 
 def _derivar_parcial(state: AgentState, respuestas: dict) -> AgentState:
     msg = _cfg()["intake"]["derivacion_parcial"].format(
-        wa_link=_wa_link(
+        wa_link=_wa_link_display(
             f"Hola, soy {respuestas.get('nombre', '') or 'un cliente del asistente'}, "
-            "prefiero continuar directamente con la ejecutiva."
+            "prefiero continuar directamente con la ejecutiva.",
+            display="Hablar con un humano",
         )
     )
     _persistir_parcial(state, respuestas)
@@ -415,7 +424,9 @@ def abandonar_ficha(state: AgentState) -> AgentState:
     sus datos parciales quedan en el CRM para seguimiento."""
     respuestas = dict(state.get("intake_respuestas") or {})
     _persistir_parcial(state, respuestas)
-    msg = _cfg()["intake"]["cierre_abandono"].format(wa_link=_wa_link())
+    msg = _cfg()["intake"]["cierre_abandono"].format(
+        wa_link=_wa_link_display(display="Hablar con un humano")
+    )
     _guardar_ai(state, msg)
     return {
         "intake_activo": False,
@@ -430,7 +441,9 @@ def abandonar_ficha(state: AgentState) -> AgentState:
 
 
 def sin_consentimiento(state: AgentState, respuestas: dict | None = None) -> AgentState:
-    msg = _cfg()["intake"]["sin_consentimiento"].format(wa_link=_wa_link())
+    msg = _cfg()["intake"]["sin_consentimiento"].format(
+        wa_link=_wa_link_display(display="Hablar con un humano")
+    )
     _guardar_ai(state, msg)
     return {
         "intake_activo": False,

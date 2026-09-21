@@ -1,5 +1,14 @@
 """graph/nodes.py — Nodos transversales del agente (Manzzo y Cía).
 
+v14 — Links wa.me renderizados como markdown limpio:
+  - _wa_link_display() envuelve el wa.me en [display](url): el cliente ve
+    texto limpio, la URL enorme queda oculta.
+  - _wa_link_diagnostico() y _wa_link_cliente() ahora devuelven markdown
+    [Hablar con un humano](wa.me?text=...). Al pinchar, WhatsApp abre
+    con el diagnóstico completo ya escrito para la ejecutiva.
+  - El resumen LLM largo sigue yendo a la ejecutiva por
+    notificar_escalamiento + DB; el link solo lleva el diagnóstico compacto.
+
 v13 — Links wa.me con diagnóstico del intake:
   - _wa_texto_intake(): "tarjeta de presentación" determinista (0 LLM) con
     la ficha ya validada + thread_id (la ejecutiva cruza con el CRM al
@@ -10,8 +19,6 @@ v13 — Links wa.me con diagnóstico del intake:
     cliente recibe el MISMO link en ack_completado y en handoff_message
     (consistencia); sin ficha, cae al saludo genérico. Con ficha parcial
     (derivación anticipada) el intro refleja que NO completó el registro.
-  - El resumen LLM largo sigue yendo a la ejecutiva por
-    notificar_escalamiento + DB; el link lleva solo el diagnóstico compacto.
 
 v12 — Intake semántico + leads parciales + links wa.me:
   - analyze_sentiment clasifica SIEMPRE durante intake (metadata fresca
@@ -142,6 +149,12 @@ def _wa_link(texto: str = "") -> str:
     return f"{base}?text={quote(texto)}" if texto else base
 
 
+def _wa_link_display(texto: str = "", display: str = "Hablar con un humano") -> str:
+    """Markdown link [display](wa.me?text=...): el cliente ve texto limpio,
+    pero al pinchar abre el chat con el diagnóstico prellenado."""
+    return f"[{display}]({_wa_link(texto)})"
+
+
 def _wa_texto_intake(state: AgentState) -> str:
     """Diagnóstico compacto del intake para el ?text= del wa.me.
 
@@ -190,15 +203,18 @@ def _wa_texto_intake(state: AgentState) -> str:
 
 
 def _wa_link_diagnostico(state: AgentState) -> str:
-    """wa.me hacia la ejecutiva con el diagnóstico del intake prellenado."""
-    return _wa_link(_wa_texto_intake(state))
+    """Link limpio hacia la ejecutiva; el diagnóstico viaja oculto en ?text=."""
+    return _wa_link_display(_wa_texto_intake(state), display="Hablar con un humano")
 
 
 def _wa_link_cliente(state: AgentState) -> str:
     """wa.me prellenado con el diagnóstico del intake (si hay ficha)."""
     if state.get("intake_respuestas"):
         return _wa_link_diagnostico(state)
-    return _wa_link("Hola, vengo del asistente virtual de Manzzo y Cía.")
+    return _wa_link_display(
+        "Hola, vengo del asistente virtual de Manzzo y Cía.",
+        display="Hablar con un humano",
+    )
 
 
 def _recent_messages(state: AgentState, k: int = 6) -> list:
