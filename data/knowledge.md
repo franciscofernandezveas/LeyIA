@@ -123,6 +123,9 @@ una solución justa y equilibrada.
 SECCIÓN 4: PROMOCIONES Y PRECIOS
 --------------------------------------------------------------------------------
 
+PRECIO ASESORÍA MANZZO:
+-Precio consultoría/cita: $30.000(pesos chilenos)
+
 PROMOCIÓN ESPECIAL MARZO:
 Tramitación de causa de familia completa por solo $500.000 (pesos chilenos).
 Incluye: Divorcio, pensión de alimentos, relación directa y regular, y más.
@@ -158,6 +161,8 @@ SECCIÓN 5: LA CONSULTA INICIAL - QUÉ INCLUYE
 
 La consulta personalizada permite descubrir cómo negociar un monto justo, 
 evitar medidas de apremio y proteger la estabilidad financiera y familiar.
+
+-Precio consultoría/cita: $30.000
 
 
 --------------------------------------------------------------------------------
@@ -420,6 +425,7 @@ SECCIÓN 12: RESUMEN EJECUTIVO (PARA RESPUESTAS RÁPIDAS)
 - Teléfono: +56 9 4231 3989
 - Dirección: Psje. Doctor Sotero del Río #508, Of. 420, Santiago Centro
 - Cobertura: Todo Chile
+-Precio consultoría/cita: $30.000
 - Promoción destacada: Causa de familia completa (divorcio, pensión de 
   alimentos, relación directa y regular) por $500.000
 - Pago: Hasta 12 cuotas sin interés con tarjeta de crédito

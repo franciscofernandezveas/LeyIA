@@ -457,3 +457,5 @@ def sin_consentimiento(state: AgentState, respuestas: dict | None = None) -> Age
         "response": msg,
         "messages": [AIMessage(content=msg)],
     }
+
+
