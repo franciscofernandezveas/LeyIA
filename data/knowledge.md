@@ -120,26 +120,36 @@ una solución justa y equilibrada.
 
 
 --------------------------------------------------------------------------------
-SECCIÓN 4: PROMOCIONES Y PRECIOS
+SECCIÓN 4: PRECIOS Y PROMOCIONES (IMPORTANTE: DOS PRECIOS DISTINTOS)
 --------------------------------------------------------------------------------
 
-PRECIO ASESORÍA MANZZO:
--Precio consultoría/cita: $30.000(pesos chilenos)
+ACLARACIÓN CLAVE SOBRE PRECIOS:
+Existen DOS precios completamente distintos. NO confundirlos:
 
-PROMOCIÓN ESPECIAL MARZO:
-Tramitación de causa de familia completa por solo $500.000 (pesos chilenos).
-Incluye: Divorcio, pensión de alimentos, relación directa y regular, y más.
-Incluye defensa profesional y acompañamiento en todo el proceso.
+1. ASESORÍA / CONSULTA INICIAL / CITA: $30.000 (pesos chilenos)
+   - Es el valor de una reunión o asesoría con un abogado (30-45 minutos).
+   - Es el precio que corresponde cuando alguien pregunta "¿cuánto vale una
+     asesoría?", "¿cuánto cuesta la consulta?" o "¿cuánto vale la cita?".
+   - Si luego el cliente contrata un servicio, estos $30.000 se DESCUENTAN
+     del total a pagar.
 
-FACILIDADES DE PAGO:
-- Pago de servicios jurídicos en hasta 12 cuotas sin interés con tarjeta 
-  de crédito.
-- Esto permite cubrir los honorarios sin afectar el presupuesto mensual 
-  del cliente.
+2. TRAMITACIÓN DE CAUSA DE FAMILIA COMPLETA (PROMOCIÓN): $500.000 (pesos chilenos)
+   - Es el valor de contratar el SERVICIO COMPLETO de representación legal.
+   - Incluye: divorcio, pensión de alimentos, relación directa y regular, 
+     y más, con defensa profesional y acompañamiento en todo el proceso.
+   - Solo corresponde cuando alguien pregunta "¿cuánto cuesta llevar mi 
+     caso completo?", "¿cuánto cuesta contratarlos?" o "¿qué incluye la 
+     promoción?".
+   - NUNCA es el precio de una asesoría ni de una consulta.
 
-COSTO DE LA CONSULTA INICIAL:
-La consulta inicial tiene costo. Sin embargo, si luego el cliente contrata 
-los servicios de la firma, ese valor se descuenta del total a pagar.
+REGLA DE RESPUESTA (resumen para el asistente):
+- Pregunta por precio de asesoría/consulta/cita → responder $30.000.
+- Pregunta por precio de la causa completa/contratación → responder $500.000 
+  (precio promocional).
+
+FACILIDADES DE PAGO (aplican a la causa completa de $500.000):
+- Hasta 12 cuotas sin interés con tarjeta de crédito.
+- Permite cubrir los honorarios sin afectar el presupuesto mensual del cliente.
 
 
 --------------------------------------------------------------------------------
@@ -162,7 +172,7 @@ SECCIÓN 5: LA CONSULTA INICIAL - QUÉ INCLUYE
 La consulta personalizada permite descubrir cómo negociar un monto justo, 
 evitar medidas de apremio y proteger la estabilidad financiera y familiar.
 
--Precio consultoría/cita: $30.000
+- Precio de la asesoría/consulta/cita: $30.000 (pesos chilenos)
 
 
 --------------------------------------------------------------------------------
@@ -217,42 +227,7 @@ personalizado y profesional.
 
 
 --------------------------------------------------------------------------------
-SECCIÓN 8: TESTIMONIOS DE CLIENTES
---------------------------------------------------------------------------------
-
-Testimonio 1 - Luis M. (5 estrellas):
-"Gracias a la consulta inicial entendí exactamente qué debía hacer. Me 
-sentí acompañado durante todo el proceso y logré un acuerdo justo. Ahora 
-puedo estar tranquilo."
-
-Testimonio 2 - Carlos R. (5 estrellas):
-"Creía que no tenía opciones, pero su asesoría fue clave para proteger mi 
-estabilidad financiera. Fueron claros, rápidos y siempre estuvieron 
-atentos a mis dudas."
-
-Testimonio 3 - Jorge T. (5 estrellas):
-"No solo evitaron que embargaran mi sueldo, sino que también me ayudaron 
-a llegar a un acuerdo que benefició a mis hijos sin arruinar mi economía. 
-Excelente servicio."
-
-Testimonio 4 - Ricardo L. (5 estrellas):
-"Tenía mucho miedo de las medidas de apremio que podían tomar contra mí. 
-En la consulta inicial me explicaron todo y me dieron un plan claro. Ahora 
-sé que estoy protegido y puedo cumplir mis obligaciones de forma justa."
-
-Testimonio 5 - Alejandro G. (5 estrellas):
-"Estaba perdido con tantas dudas legales, pero su equipo me ayudó a 
-entender mis derechos y a evitar decisiones precipitadas. Gracias a su 
-apoyo, logré una resolución rápida y sin estrés."
-
-Testimonio 6 - Fernando P. (5 estrellas):
-"Había intentado resolver el problema por mi cuenta, pero solo estaba 
-empeorando. Después de la consulta inicial con ellos, supe exactamente 
-qué hacer. Me sentí respaldado y logré un acuerdo que me dio paz mental."
-
-
---------------------------------------------------------------------------------
-SECCIÓN 9: PREGUNTAS FRECUENTES (FAQ)
+SECCIÓN 8: PREGUNTAS FRECUENTES (FAQ)
 --------------------------------------------------------------------------------
 
 PREGUNTA 1: ¿Qué incluye la consulta inicial?
@@ -276,7 +251,7 @@ seguir. Si decides avanzar, la firma puede entregarte representación legal
 y acompañarte en todo el proceso.
 
 PREGUNTA 5: ¿La consulta inicial tiene costo?
-RESPUESTA: Sí, la consulta inicial tiene un costo. Sin embargo, si luego 
+RESPUESTA: Sí, la consulta inicial cuesta $30.000. Sin embargo, si luego 
 contratas los servicios, ese valor se descuenta del total a pagar.
 
 PREGUNTA 6: ¿Qué pasa si no puedo pagar el monto de la pensión de 
@@ -325,9 +300,20 @@ RESPUESTA: La firma puede ayudarte a gestionar y, en algunos casos,
 detener medidas como el embargo o la retención judicial. En la consulta 
 inicial te explicarán cómo trabajar para solucionar esta situación.
 
+PREGUNTA 14: ¿Cuánto cuesta una asesoría o consulta?
+RESPUESTA: La asesoría o consulta inicial cuesta $30.000 (pesos chilenos). 
+Si luego contratas el servicio, ese valor se descuenta del total. OJO: 
+$30.000 es el precio de la asesoría; la tramitación completa de una causa 
+tiene otro valor.
+
+PREGUNTA 15: ¿Cuánto cuesta contratar todo el servicio / llevar mi causa completa?
+RESPUESTA: La tramitación de la causa de familia completa tiene un precio 
+promocional de $500.000, pagadero en hasta 12 cuotas sin interés. OJO: 
+este valor NO corresponde a una asesoría (la asesoría cuesta $30.000).
+
 
 --------------------------------------------------------------------------------
-SECCIÓN 10: POLÍTICA DE PRIVACIDAD (RESUMEN)
+SECCIÓN 9: POLÍTICA DE PRIVACIDAD (RESUMEN)
 --------------------------------------------------------------------------------
 
 Responsable del tratamiento de datos: MANZZOYCIA.CL
@@ -378,7 +364,7 @@ supervisar la navegación web de sus hijos.
 
 
 --------------------------------------------------------------------------------
-SECCIÓN 11: TÉRMINOS Y CONDICIONES (RESUMEN)
+SECCIÓN 10: TÉRMINOS Y CONDICIONES (RESUMEN)
 --------------------------------------------------------------------------------
 
 RECOGIDA DE DATOS:
@@ -413,7 +399,7 @@ correo electrónico se almacenan.
 
 
 --------------------------------------------------------------------------------
-SECCIÓN 12: RESUMEN EJECUTIVO (PARA RESPUESTAS RÁPIDAS)
+SECCIÓN 11: RESUMEN EJECUTIVO (PARA RESPUESTAS RÁPIDAS)
 --------------------------------------------------------------------------------
 
 - Nombre: Manzzo y Cía
@@ -425,11 +411,11 @@ SECCIÓN 12: RESUMEN EJECUTIVO (PARA RESPUESTAS RÁPIDAS)
 - Teléfono: +56 9 4231 3989
 - Dirección: Psje. Doctor Sotero del Río #508, Of. 420, Santiago Centro
 - Cobertura: Todo Chile
--Precio consultoría/cita: $30.000
-- Promoción destacada: Causa de familia completa (divorcio, pensión de 
-  alimentos, relación directa y regular) por $500.000
+- Precio de asesoría/consulta/cita: $30.000 (NUNCA es $500.000)
+- Promoción causa de familia completa (divorcio, pensión de alimentos, 
+  relación directa y regular): $500.000 (NUNCA es el precio de una asesoría)
 - Pago: Hasta 12 cuotas sin interés con tarjeta de crédito
-- Consulta inicial: Con costo (descontable al contratar), dura 30-45 
+- Consulta inicial: $30.000 (descontable al contratar), dura 30-45 
   minutos, incluye revisión de caso, respuestas y plan preliminar
 - Diferenciadores: Experiencia, estrategias personalizadas, trato humano 
   y cercano, resultados comprobados
