@@ -16,7 +16,8 @@ from langchain_core.messages import AIMessage
 from langchain_core.prompts import ChatPromptTemplate
 
 from core.contracts import AgentState, EMAIL_RE, HitlPayload, TipoHITL
-from core.db_client import insert_booking, upsert_conversation
+from core.db_client import insert_booking, upsert_conversation, upsert_lead
+
 from core.llm import LLM
 from graph.nodes import (
     _cfg, _guardar_ai, _parse_dt, _primer_nombre, _telefono_cliente,
@@ -430,18 +431,35 @@ def confirmar_y_crear(state: AgentState) -> AgentState:
         hora_fin=evento.hora_fin, modalidad_linea=modalidad_linea,
         html_link=evento.html_link)
 
-    insert_booking(thread_id=tid, booking=evento.model_dump())
+    # Datos del cliente incluidos en el payload persistido
+    payload = {
+        **evento.model_dump(),
+        "cliente_nombre": state["lead_nombre"],
+        "cliente_email": state["lead_email"],
+        "inicio_cita": elegido.isoformat(),
+    }
+
+
+    # Sincroniza la ficha del lead con lo capturado en el wizard
+    # (va ANTES de insert_booking para que lead_id quede enlazado)
+    upsert_lead(thread_id=tid, intake_respuestas={
+        "nombre": state["lead_nombre"],
+        "email": state["lead_email"],
+        "telefono": _telefono_cliente(state),
+    })
+
+    insert_booking(thread_id=tid, booking=payload)
     upsert_conversation(thread_id=tid, status="agendado")
 
     try:
         from integrations.sheetdb import actualizar_booking
-        actualizar_booking({**state, "booking": evento.model_dump()})
+        actualizar_booking({**state, "booking": payload})
     except Exception as e:
         logger.exception("[booking] SheetDB (fallback) falló: %s", e)
 
     _guardar_ai(state, response)
     return {"response": response,
-            "booking": evento.model_dump(),
+            "booking": payload,
             "booking_stage": None,
             "slots_propuestos": [], "booking_match": None,
             "booking_attempts": 0, "booking_franja": None,

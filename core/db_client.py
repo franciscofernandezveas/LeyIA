@@ -242,8 +242,8 @@ def insert_booking(
         with _get_engine().connect() as conn:
             conn.execute(
                 text("""
-                insert into bookings (conversation_id, thread_id, lead_id, evento_id, fecha, hora_inicio, hora_fin, modalidad, meet_link, html_link, created_at)
-                select c.id, :thread_id, l.id, :evento_id, :fecha, :hora_inicio, :hora_fin, :modalidad, :meet_link, :html_link, now()
+                insert into bookings (conversation_id, thread_id, lead_id, evento_id, fecha, hora_inicio, hora_fin, modalidad, meet_link, html_link, cliente_nombre, cliente_email, inicio_cita, created_at)
+                select c.id, :thread_id, l.id, :evento_id, :fecha, :hora_inicio, :hora_fin, :modalidad, :meet_link, :html_link, :cliente_nombre, :cliente_email, CAST(:inicio_cita AS timestamptz), now()
                 from conversations c
                 left join leads l on l.thread_id = :thread_id
                 where c.thread_id = :thread_id
@@ -254,7 +254,11 @@ def insert_booking(
                     hora_fin = :hora_fin,
                     modalidad = :modalidad,
                     meet_link = :meet_link,
-                    html_link = :html_link
+                    html_link = :html_link,
+                    cliente_nombre = coalesce(:cliente_nombre, bookings.cliente_nombre),
+                    cliente_email = coalesce(:cliente_email, bookings.cliente_email),
+                    inicio_cita = coalesce(CAST(:inicio_cita AS timestamptz), bookings.inicio_cita),
+                    lead_id = coalesce(bookings.lead_id, excluded.lead_id)
                 """),
                 {
                     "thread_id": thread_id,
@@ -265,6 +269,9 @@ def insert_booking(
                     "modalidad": _safe(b.get("modalidad_label") or b.get("modalidad")),
                     "meet_link": _safe(b.get("meet_link")),
                     "html_link": _safe(b.get("html_link")),
+                    "cliente_nombre": _safe(b.get("cliente_nombre")),
+                    "cliente_email": _safe(b.get("cliente_email")),
+                    "inicio_cita": b.get("inicio_cita"),
                 },
             )
             conn.commit()
