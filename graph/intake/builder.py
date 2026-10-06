@@ -1,9 +1,10 @@
-"""graph/intake/builder.py — Subgrafo especializado INTAKE (v8).
+"""graph/intake/builder.py — Subgrafo especializado INTAKE (v9).
 
 Flujo interno:
   START → intake_planner ─┬─ iniciar_ficha ─────── END
-                          ├─ procesar_respuesta ─ END      (padre: handoff si completó/derivó)
+                          ├─ procesar_respuesta ─ END      (padre: handoff)
                           ├─ pausar_para_faq ──── END      (padre: FAQ → reanudar)
+                          ├─ pausar_ficha ─────── END      (padre: espera próximo msg)
                           ├─ reanudar ─────────── END
                           ├─ derivar_parcial ──── END      (padre: handoff)
                           ├─ abandonar_ficha ──── END
@@ -14,14 +15,15 @@ from langgraph.graph import END, START, StateGraph
 from core.contracts import AgentState
 
 from .nodes import (
-    abandonar_ficha, derivar_parcial, iniciar_ficha, pausar_para_faq,
-    procesar_respuesta, reanudar, sin_consentimiento,
+    abandonar_ficha, derivar_parcial, iniciar_ficha, pausar_ficha,
+    pausar_para_faq, procesar_respuesta, reanudar, sin_consentimiento,
 )
 from .planner import intake_planner
 from .supervisor import route_intake
 
 _TERMINALES = (
     "iniciar_ficha", "procesar_respuesta", "reanudar", "pausar_para_faq",
+    "pausar_ficha",
     "derivar_parcial", "abandonar_ficha", "sin_consentimiento",
 )
 
@@ -36,6 +38,7 @@ def build_intake_graph():
             "procesar_respuesta": procesar_respuesta,
             "reanudar": reanudar,
             "pausar_para_faq": pausar_para_faq,
+            "pausar_ficha": pausar_ficha,
             "derivar_parcial": derivar_parcial,
             "abandonar_ficha": abandonar_ficha,
             "sin_consentimiento": sin_consentimiento,

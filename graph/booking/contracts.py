@@ -35,6 +35,7 @@ REQUIERE_APROBACION_AGENDAMIENTO = False
 class BookingDecision(BaseModel):
     """Decisión del planner para ESTE turno."""
     accion: Literal[
+        "iniciar_wizard",
         "entregar_nombre",
         "entregar_email",
         "entregar_modalidad",

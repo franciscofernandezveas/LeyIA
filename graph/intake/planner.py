@@ -1,10 +1,26 @@
 """graph/intake/planner.py — Planner semántico del sub-flujo de intake.
 
+v10 — Pausa real:
+  - Nuevo tipo "pausar": el cliente pide pausa, un momento, más tarde,
+    ahora no, continúo después → pausa la ficha y espera al próximo
+    mensaje para reanudar.
+  - Mantiene guardia determinista para botones de oferta y umbral por
+    reversibilidad.
+
+v9 — UX fluida:
+  - Guardia determinista (costo 0) para los botones de la oferta de salida:
+    "Hablar con humano" / "Lo intento de nuevo" se resuelven SIN LLM, así
+    una misclasificación jamás rompe la oferta activa.
+  - Umbral de confianza por REVERSIBILIDAD de la acción: derivar/abandonar
+    son irreversibles para el turno → exigen confianza ≥ 0,55; pausar a FAQ
+    es reversible (FAQ responde y reanudar retoma) → se permite con duda
+    razonable en vez de castigar el mensaje contra el validador del campo.
+  - Prompt: reconoce botones/listas ("Sí, autorizo", "No autorizo",
+    "Lo intento de nuevo", títulos de la lista de etapa), la petición de
+    pausa ("pausa", "un momento") y las correcciones de datos ya entregados.
+
 v8 — 1 llamada LLM por turno activo: decide el tipo de turno Y extrae los
-campos explícitos (patrón BookingDecision). Los guardias estructurales
-(primer turno, reanudación, consentimiento rechazado, ficha completa) siguen
-siendo deterministas y de costo cero. Si el LLM falla, se degrada al
-comportamiento clásico: tratar el mensaje como respuesta al campo activo.
+campos explícitos. Guardias estructurales deterministas; fallback clásico.
 """
 import logging
 
@@ -32,10 +48,19 @@ _PROMPT_TURNO = ChatPromptTemplate.from_messages([
      "- Si el mensaje responde o aporta datos (aunque sea breve: un número de "
      "opción, un sí, una descripción) → respuesta_formulario y extrae TODO "
      "dato explícito (puede traer varios campos a la vez).\n"
+     "- Botones y listas: mensajes como 'Sí, autorizo', 'No autorizo', "
+     "'Lo intento de nuevo' o el título de una opción de la lista de etapa "
+     "→ respuesta_formulario (extrae lo que aplique; 'Lo intento de nuevo' "
+     "no es un dato).\n"
      "- Si hace una pregunta o comenta algo ajeno a la ficha SIN cancelarla "
      "(precios, proceso, '¿y mi hija?', etc.) → duda_o_consulta.\n"
-     "- Si pide hablar con una persona/ejecutiva, o es la segunda vez que lo "
-     "pide, o muestra hartazgo con las preguntas → insiste_humano.\n"
+     "- Si pide pausa o un momento ('pausa', 'un segundo', 'espera', "
+     "'más tarde', 'ahora no', 'continúo después') → pausar.\n"
+     "- Si corrige un dato ya entregado ('no, mi correo es otro…', 'me "
+     "equivoqué en el nombre') → respuesta_formulario y extrae el valor "
+     "corregido en el campo correspondiente.\n"
+     "- Si pide hablar con una persona/ejecutiva ('hablar con humano'), o es "
+     "la segunda vez que lo pide, o muestra hartazgo → insiste_humano.\n"
      "- Si no quiere seguir con el registro → abandonar.\n"
      "- NUNCA inventes ni infieras datos; null en lo ausente.\n"
      "- consentimiento_datos NO existe en el esquema: esa respuesta se valida "
@@ -69,8 +94,6 @@ def intake_planner(state: AgentState) -> AgentState:
                 "intake_stage": "preguntando"}
 
     if completado:
-        # Inalcanzable por diseño (analyze no rutea aquí con completado);
-        # reanudar con ledger vacío cierra en silencio sin romper el turno.
         logger.warning("[intake] planner invocado con ficha completada → noop")
         return {"intake_decision": {"accion": "reanudar"},
                 "intake_stage": "completado"}
@@ -82,6 +105,17 @@ def intake_planner(state: AgentState) -> AgentState:
     if not activo:
         return {"intake_decision": {"accion": "iniciar_ficha"},
                 "intake_stage": "apertura"}
+
+    # --- guardia: botones de la oferta de salida activa (0 LLM) ---
+    if state.get("intake_oferta_qid"):
+        from .nodes import RESPUESTAS_HUMANO, RESPUESTAS_REINTENTAR, _norm
+        rn = _norm(state.get("query") or "")
+        if rn in RESPUESTAS_HUMANO:
+            return {"intake_decision": {"accion": "derivar_parcial"},
+                    "intake_stage": "preguntando"}
+        if rn in RESPUESTAS_REINTENTAR:
+            return {"intake_decision": {"accion": "procesar_respuesta"},
+                    "intake_stage": "preguntando"}
 
     # --- turno activo: 1 LLM (decisión + extracción) ---
     from .nodes import QUESTIONS, _pendientes  # import local (evita ciclo)
@@ -114,12 +148,14 @@ def intake_planner(state: AgentState) -> AgentState:
     accion = {
         "respuesta_formulario": "procesar_respuesta",
         "duda_o_consulta": "pausar_para_faq",
+        "pausar": "pausar_ficha",
         "insiste_humano": "derivar_parcial",
         "abandonar": "abandonar_ficha",
     }.get(dec.tipo, "procesar_respuesta")
 
-    # Baja confianza en escape/duda → conservador: tratar como respuesta.
-    if accion != "procesar_respuesta" and dec.confianza < 0.55:
+    # Umbral por reversibilidad: derivar/abandonar son irreversibles para
+    # el turno → exigen confianza; la pausa a FAQ es reversible y barata.
+    if accion in ("derivar_parcial", "abandonar_ficha") and dec.confianza < 0.55:
         accion = "procesar_respuesta"
 
     return {

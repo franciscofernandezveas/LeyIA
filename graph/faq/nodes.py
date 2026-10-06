@@ -1,18 +1,18 @@
 """graph/faq/nodes.py — Acciones del sub-agente FAQ.
 
-v2 — Integridad y consistencia con el sistema:
-  - Todos los nodos persisten su respuesta vía _guardar_ai (v11 lo declaraba
-    pero FAQ jamás lo implementó: los turnos FAQ no estaban en Postgres).
-  - derivar_a_ejecutiva YA NO MIENTE: nada de handoff_message con link vacío
-    ni promesas de gestiones que no ejecuta. Ahora señala ROUTE_INTAKE: el
-    padre inicia/continúa la ficha, y el planner semántico de intake decide
-    (si el cliente insiste en humano → derivación directa con ficha parcial).
-    El handoff real vive SOLO en handoff_humano, con summary + persistencia
-    + notificación.
-  - pedir_clarificacion y el fallback de error se mueven a prompts.yaml en
-    registro formal (usted, sin emojis) — coherencia v2.6.
-  - sugerir_agendar ya no toca `route`: el CTA pregunta y se espera la
-    respuesta; el siguiente turno clasifica agendar_asesoria y entra booking.
+v3 — Integración con intake v11 (multi-burbuja / one-shot):
+  - Todos los emisores devuelven response_bubbles + response_interactive
+    (None), para que ningún payload interactivo del intake sobreviva de un
+    turno a otro por el canal.
+  - sugerir_agendar suma botón nativo "Agendar una hora": mismo título que
+    reconoce la excepción 0-LLM del padre en hilos cerrados y clasifica
+    limpio como agendar_asesoria en hilos abiertos.
+  - derivar_a_ejecutiva limpia response_interactive (no emite texto: la
+    respuesta del turno la da el subgrafo de intake).
+
+v2 — Integridad y consistencia: persistencia vía _guardar_ai; derivación sin
+mentiras (señala ROUTE_INTAKE, el handoff real vive solo en handoff_humano);
+pedir_clarificacion/faq_error en prompts.yaml; sugerir_agendar no re-rutea.
 """
 import logging
 
@@ -25,6 +25,13 @@ from core.rag import retrieve
 from graph.nodes import _cfg, _guardar_ai, _recent_messages, _wa_link
 
 logger = logging.getLogger(__name__)
+
+# Botón nativo del CTA de agendamiento. El title llega como query del turno
+# siguiente: en hilo cerrado post-intake lo reconoce la excepción 0-LLM de
+# analyze_sentiment (_AGENDAR_CTA); en hilo abierto clasifica como
+# agendar_asesoria sin costo de ambigüedad.
+_BOTON_AGENDAR = {"kind": "buttons",
+                  "buttons": [{"id": "agendar", "title": "Agendar una hora"}]}
 
 
 def responder_pregunta(state: AgentState) -> AgentState:
@@ -63,6 +70,8 @@ def responder_pregunta(state: AgentState) -> AgentState:
     _guardar_ai(state, response)
     return {
         "response": response,
+        "response_bubbles": [response],
+        "response_interactive": None,
         "context": [d.page_content for d in docs],
         "messages": [AIMessage(content=response)],
     }
@@ -72,18 +81,24 @@ def pedir_clarificacion(state: AgentState) -> AgentState:
     atn = _cfg()["atencion"]
     response = atn["faq_clarificacion"]
     _guardar_ai(state, response)
-    return {"response": response, "messages": [AIMessage(content=response)]}
+    return {"response": response,
+            "response_bubbles": [response],
+            "response_interactive": None,
+            "messages": [AIMessage(content=response)]}
 
 
 def sugerir_agendar(state: AgentState) -> AgentState:
     """El usuario mostró intención de agendar dentro del FAQ. Se envía el CTA
-    (pregunta) y se espera su respuesta: el próximo turno clasificará
-    agendar_asesoria y entrará al subgrafo de booking. NO se re-rutea en el
-    mismo turno para evitar duplicar el CTA con agenda_pedir_datos."""
+    (pregunta + botón nativo) y se espera su respuesta: el próximo turno
+    clasifica agendar_asesoria (o, en hilo cerrado post-intake, la excepción
+    0-LLM del padre) y entra booking. NO se re-rutea en el mismo turno."""
     atn = _cfg()["atencion"]
     response = atn["cta_agendar"]
     _guardar_ai(state, response)
-    return {"response": response, "messages": [AIMessage(content=response)]}
+    return {"response": response,
+            "response_bubbles": [response],
+            "response_interactive": _BOTON_AGENDAR,
+            "messages": [AIMessage(content=response)]}
 
 
 def derivar_a_ejecutiva(state: AgentState) -> AgentState:
@@ -101,6 +116,7 @@ def derivar_a_ejecutiva(state: AgentState) -> AgentState:
     return {
         "route": ROUTE_INTAKE,
         "intake_resume": False,
+        "response_interactive": None,
     }
 
 
@@ -111,4 +127,7 @@ def derivar_a_fuera_dominio(state: AgentState) -> AgentState:
     atn = _cfg()["atencion"]
     response = atn["fuera_dominio_message"].format(disclosure=atn["disclosure"])
     _guardar_ai(state, response)
-    return {"response": response, "messages": [AIMessage(content=response)]}
+    return {"response": response,
+            "response_bubbles": [response],
+            "response_interactive": None,
+            "messages": [AIMessage(content=response)]}

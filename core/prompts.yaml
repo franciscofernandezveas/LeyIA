@@ -273,42 +273,62 @@ classification:
       reason: "No es un servicio legal."
 
 # ----------------------------------------------------------------------------
-# INTAKE PROACTIVO — ficha de lead + caso (v2.9: semántico + leads parciales)
+# INTAKE — ficha conversada (v3.0: UX fluida, multi-burbuja, tuteo)
 # ----------------------------------------------------------------------------
 intake:
 
-  apertura: |
-    Antes de ponerlo en contacto con nuestra ejecutiva, debo recabar los
-    antecedentes básicos de su caso. Toda la información que proporcione
-    se trata de manera confidencial y se utiliza exclusivamente para la
-    evaluación preliminar de su consulta.
-    Esto evita que deba repetir los detalles posteriormente.
-    Si lo prefiere, puede responder varias preguntas en un mismo mensaje.
+  apertura_ia: |
+    👋 ¡Hola! Soy el *asistente virtual* de Manzzo y Cía — un sistema
+    automatizado, no una persona, pero estoy aquí para ayudarte.
 
-  ack_completado: |
-    Registro completado, {nombre}. Derivo su caso de inmediato; la
-    ejecutiva asignada ya dispone de todos sus antecedentes.
-    Si lo prefiere, puede escribirle directamente ahora: {wa_link}
+  apertura_expectativa: |
+    Te haré unas preguntas rápidas (unos 2 minutos) para preparar tu caso.
+    En cualquier momento puedes hacer una pregunta, pedir *hablar con una
+    persona* o escribir *pausa* para retomar después.
 
   aviso_saltar: |
-    (Dato opcional: responda "saltar" para omitir esta pregunta.)
+    Si prefieres no responder, escribe *saltar*.
 
-  sin_consentimiento: |
-    Entendido. Conforme a la normativa de protección de datos personales,
-    sin su autorización no puedo compartir sus antecedentes con el equipo,
-    por lo que no será posible derivar su caso.
-    Si lo prefiere, puede escribir directamente a nuestra ejecutiva: {wa_link}
+  error_no_saltar: |
+    Este dato sí lo necesito para poder derivar tu caso 🙏 Si te complica,
+    también puedes pedir *hablar con una persona*.
+
+  oferta_salida: |
+    {nombre}este dato se nos está resistiendo 😅 ¿Qué prefieres?
+    • Te paso con una ejecutiva que lo toma directamente contigo, o
+    • lo intentamos una vez más.
 
   reanudar: |
-    Gracias por su paciencia. Para no hacerle repetir información,
-    retomemos su registro:
+    ¡Seguimos donde quedamos 💪!
+
+  reanudar_duda: |
+    Sobre lo que preguntaste {duda}: espero haberte orientado 🙌 Seguimos
+    donde quedamos:
+
+  cierre_listo: |
+    🎉 ¡Listo{nombre}! Tu ficha quedó registrada.
+
+  cierre_sla: |
+    Una ejecutiva revisará tu caso y te contactará *hoy dentro del horario
+    hábil* (09:00–18:30). Quedó todo anotado a tu nombre.
+
+  cierre_ctas: |
+    ¿Quieres asegurar la hora? Agenda ahora mismo 👇
+    Si prefieres que te contactemos nosotros, escríbele directo a la
+    ejecutiva: {wa_link}
+
+  sin_consentimiento: |
+    Entendido, sin problema. Sin tu autorización no puedo registrar ni
+    compartir tus antecedentes con el equipo, así que no podré derivar tu
+    caso por esta vía. Si lo prefieres, puedes escribir directamente a
+    nuestra ejecutiva: {wa_link}
 
   derivacion_parcial: |
-    Entendido, no le haremos repetir datos en formularios. Derivo su caso
-    de inmediato a nuestra ejecutiva con los antecedentes que ya tenemos.
-    Puede escribirle directamente aquí: {wa_link}
+    Ningún problema{nombre} — te paso directamente con una ejecutiva que
+    toma tu caso desde aquí, con lo que ya llevamos anotado 🤝
+    {wa_link}
 
   cierre_abandono: |
-    Entendido, quedamos atentos para cuando desee retomar su consulta.
-    Si en algún momento prefiere atención directa, puede escribir a
-    nuestra ejecutiva aquí: {wa_link}
+    Entendido, quedamos atentos para cuando quieras retomar tu consulta.
+    Si prefieres atención directa, escribe a nuestra ejecutiva aquí:
+    {wa_link}

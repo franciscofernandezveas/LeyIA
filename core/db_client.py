@@ -60,9 +60,6 @@ def _safe(val: Any) -> Any:
     return str(val)[:5000]
 
 
-# ---------------------------------------------------------------------------
-# CONVERSACIONES
-# ---------------------------------------------------------------------------
 def upsert_conversation(
     thread_id: str,
     channel: str | None = None,
@@ -86,8 +83,14 @@ def upsert_conversation(
                 values (:thread_id, :channel, :status, :intent, :category, :summary, CAST(:metadata_json AS jsonb), now(), now())
                 on conflict (thread_id) do update set
                     status = coalesce(:status, conversations.status),
-                    intent_first = coalesce(:intent, conversations.intent_first),
-                    category = coalesce(:category, conversations.category),
+                    intent_first = coalesce(conversations.intent_first, excluded.intent_first),
+                    category = case
+                        when conversations.category is null
+                             or conversations.category in ('otro', 'consulta_general')
+                             or excluded.category not in ('otro', 'consulta_general')
+                        then excluded.category
+                        else conversations.category
+                    end,
                     summary = coalesce(:summary, conversations.summary),
                     metadata = coalesce(conversations.metadata, '{}'::jsonb) || CAST(:metadata_json AS jsonb),
                     updated_at = now(),
@@ -107,6 +110,7 @@ def upsert_conversation(
             conn.commit()
     except Exception as e:
         logger.exception("[db] upsert_conversation falló: %s", e)
+
 
 
 def insert_message(

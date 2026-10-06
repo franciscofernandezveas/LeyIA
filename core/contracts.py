@@ -37,6 +37,7 @@ from typing import Annotated, List, Literal, TypedDict, get_args
 
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
+from typing_extensions import TypedDict, NotRequired
 
 
 # --------------------------------------------------------------------------
@@ -167,6 +168,7 @@ class AgentState(TypedDict, total=False):
     urgency: UrgencyLabel
     intent: IntentLabel
     category: CategoryLabel
+    case_category: CategoryLabel
     clf_reason: str                           # auditoría/debug
     route: str                                # decisión de routing (VALID_ROUTES)
 
@@ -225,6 +227,10 @@ class AgentState(TypedDict, total=False):
     summary: str                              # resumen del caso para la ejecutiva
     notificacion_pendiente: bool              # WhatsApp falló; reintentar por job
 
+
+    response_bubbles: NotRequired[list[str]]        # burbujas separadas (fallback: response)
+    response_interactive: NotRequired[dict | None]  # {"kind": "buttons"|"list", ...} one-shot
+    intake_oferta_qid: NotRequired[str | None]      # campo para el que ya se ofreció salida
 
 # --------------------------------------------------------------------------
 # 5) ESQUEMAS DE SALIDA ESTRUCTURADA DEL LLM

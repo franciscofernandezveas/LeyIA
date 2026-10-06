@@ -1,39 +1,23 @@
 """graph/nodes.py — Nodos transversales del agente (Manzzo y Cía).
 
-v14 — Links wa.me renderizados como markdown limpio:
-  - _wa_link_display() envuelve el wa.me en [display](url): el cliente ve
-    texto limpio, la URL enorme queda oculta.
-  - _wa_link_diagnostico() y _wa_link_cliente() ahora devuelven markdown
-    [Hablar con un humano](wa.me?text=...). Al pinchar, WhatsApp abre
-    con el diagnóstico completo ya escrito para la ejecutiva.
-  - El resumen LLM largo sigue yendo a la ejecutiva por
-    notificar_escalamiento + DB; el link solo lleva el diagnóstico compacto.
+v16.1 — Fix #5 (pausa real en intake):
+  - route_post_intake reconoce intake_exit == "pausa" y termina el turno.
+  - analyze_sentiment detecta intake pausado y reanuda al próximo mensaje.
+  - Mantiene FIX #2 (email) y FIX #3 (SheetDB con consentimiento).
 
-v13 — Links wa.me con diagnóstico del intake:
-  - _wa_texto_intake(): "tarjeta de presentación" determinista (0 LLM) con
-    la ficha ya validada + thread_id (la ejecutiva cruza con el CRM al
-    recibir el mensaje del cliente). Acotada a WA_TEXTO_MAX porque el
-    ?text= se URL-encodea (~1.5-2x).
-  - _wa_link_diagnostico(): wa.me con ese diagnóstico prellenado.
-  - _wa_link_cliente() ahora usa el diagnóstico cuando hay intake → el
-    cliente recibe el MISMO link en ack_completado y en handoff_message
-    (consistencia); sin ficha, cae al saludo genérico. Con ficha parcial
-    (derivación anticipada) el intro refleja que NO completó el registro.
+v16 — FIX #2 + FIX #3 en handoff_humano:
+  - Notificación por email a ejecutiva cuando se deriva un lead.
+  - SheetDB sincroniza solo con consentimiento explícito.
+  - Flag notificacion_pendiente combina WhatsApp + email.
 
-v12 — Intake semántico + leads parciales + links wa.me:
-  - analyze_sentiment clasifica SIEMPRE durante intake (metadata fresca
-    para el lead: category/intent ya no quedan congelados); la precedencia
-    de estado fuerza route=ROUTE_INTAKE. Booking conserva su short-circuit.
-  - Abort por substrings (_parece_abort) queda SOLO para booking; el escape
-    del intake lo decide su planner semántico.
-  - TTL de intake expira el ledger COMPLETO (no más fichas zombie).
-  - route_post_intake / route_post_faq: pausa lateral INTAKE→FAQ→INTAKE.
-  - handoff_humano: lead completed según intake_completado real; {whatsapp_ejecutiva}
-    ahora recibe link wa.me clickable con texto prellenado.
-  - _wa_link(): helper único para links de la ejecutiva.
-
-v11 — Hooks de persistencia PostgreSQL.
+v15 — Integración del intake v11 (UX fluida) en el grafo padre:
+  - analyze_sentiment: excepción 0-LLM en hilo cerrado — CTA agendar.
+  - handoff_humano silencioso cuando intake ya despidió el turno.
+  - response_bubbles / response_interactive one-shot.
+  - _RESET_INTAKE incluye intake_oferta_qid.
+  - TEMPLATE_ARGS valida subconjunto de placeholders.
 """
+
 import json
 import logging
 import re
@@ -57,6 +41,7 @@ from core.db_client import (
     insert_escalation, insert_message, upsert_conversation, upsert_lead,
 )
 from core.llm import LLM, with_structured_output
+from core.notifications import notificar_email
 from tools.notify_whatsapp import WHATSAPP_EJECUTIVA, notificar_escalamiento
 
 logger = logging.getLogger(__name__)
@@ -67,21 +52,23 @@ ESCALATIONS_DIR = Path("escalations")
 AGENDA_CAPTURA_TTL_HORAS = 24
 INTAKE_TTL_HORAS = 24
 
-# Largo máx. del texto crudo del wa.me (tras URL-encoding crece ~1.5-2x).
 WA_TEXTO_MAX = 900
+
+_AGENDAR_CTA = ("agendar una hora", "agendar", "agendar ahora",
+                "agendar hora", "quiero agendar", "quiero agendar una hora")
 
 REQUIRED_KEYS = {
     "atencion": {"disclosure", "cta_agendar", "faq_system_prompt", "tonos",
                  "summary_system_prompt", "fuera_dominio_message",
                  "handoff_message", "hilo_cerrado_message",
-                 "agenda_pedir_nombre", "agenda_pedir_email", "agenda_pedir_modalidad","agenda_proponer_slots",
+                 "agenda_pedir_nombre", "agenda_pedir_email",
+                 "agenda_pedir_modalidad", "agenda_proponer_slots",
                  "agenda_reintento_slots", "agenda_sin_horarios",
                  "agenda_confirmada", "agenda_slot_ocupado",
                  "agenda_eleccion_ambigua", "agenda_abortado",
                  "agenda_lateral_system"},
     "classification": {"system_prompt", "few_shot_examples"},
-    "intake": {"apertura", "ack_completado", "aviso_saltar",
-               "sin_consentimiento", "reanudar",
+    "intake": {"aviso_saltar", "sin_consentimiento", "reanudar",
                "derivacion_parcial", "cierre_abandono"},
 }
 
@@ -91,7 +78,7 @@ TEMPLATE_ARGS = {
     "atencion.handoff_message": {"disclosure", "whatsapp_ejecutiva", "thread_id"},
     "atencion.hilo_cerrado_message": {"whatsapp_ejecutiva", "thread_id"},
     "atencion.cta_agendar": set(),
-        "atencion.agenda_pedir_nombre": set(),
+    "atencion.agenda_pedir_nombre": set(),
     "atencion.agenda_pedir_email": set(),
     "atencion.agenda_pedir_modalidad": set(),
     "atencion.agenda_proponer_slots": {"nombre", "opciones"},
@@ -103,24 +90,34 @@ TEMPLATE_ARGS = {
     "atencion.agenda_eleccion_ambigua": {"opciones"},
     "atencion.agenda_abortado": set(),
     "atencion.agenda_lateral_system": {"opciones"},
-    "intake.apertura": set(),
-    "intake.ack_completado": {"nombre", "wa_link"},
+    "intake.apertura_ia": set(),
+    "intake.apertura_expectativa": set(),
     "intake.aviso_saltar": set(),
     "intake.sin_consentimiento": {"wa_link"},
     "intake.reanudar": set(),
-    "intake.derivacion_parcial": {"wa_link"},
+    "intake.reanudar_duda": {"duda"},
+    "intake.oferta_salida": {"nombre"},
+    "intake.error_no_saltar": set(),
+    "intake.cierre_listo": {"nombre"},
+    "intake.cierre_sla": set(),
+    "intake.cierre_ctas": {"wa_link"},
+    "intake.derivacion_parcial": {"wa_link", "nombre"},
     "intake.cierre_abandono": {"wa_link"},
 }
 _PLACEHOLDER_RE = re.compile(r"{(\w+)}")
 
-# Abort por substrings: SOLO booking (el intake usa su planner semántico).
 _ABORT_BOOKING = ("no quiero", "mejor no", "olvídalo", "olvidalo",
                   "dejalo", "déjalo", "ya no me interesa")
 
+_EMAIL_BUSCA = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+_NOMBRE_RE = re.compile(
+    r"(?:soy|me llamo|mi nombre es)\s+"
+    r"([A-Za-zÁÉÍÓÚÜÑáéíóúüñ]{2,}"
+    r"(?:\s+[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]{2,}){0,3})",
+    re.IGNORECASE,
+)
 
-# ---------------------------------------------------------------------------
-# HELPERS
-# ---------------------------------------------------------------------------
+
 @lru_cache(maxsize=1)
 def _cfg() -> dict:
     with open(PROMPTS_PATH, encoding="utf-8") as f:
@@ -134,35 +131,26 @@ def _cfg() -> dict:
         seccion, key = dotted.split(".", 1)
         tpl = (cfg.get(seccion) or {}).get(key) or ""
         encontrados = set(_PLACEHOLDER_RE.findall(tpl))
-        if encontrados != esperados:
-            bad.append(f"{dotted}: plantilla usa {sorted(encontrados)} "
-                       f"pero el nodo entrega {sorted(esperados)}")
+        if not encontrados.issubset(esperados):
+            bad.append(f"{dotted}: plantilla usa "
+                       f"{sorted(encontrados - esperados)} que el nodo no "
+                       f"entrega (disponibles: {sorted(esperados)})")
     if bad:
         raise ValueError("prompts.yaml — placeholders desalineados:\n" + "\n".join(bad))
     return cfg
 
 
 def _wa_link(texto: str = "") -> str:
-    """Link clickable wa.me hacia la ejecutiva, con texto prellenado opcional."""
     num = re.sub(r"\D", "", WHATSAPP_EJECUTIVA or "")
     base = f"https://wa.me/{num}"
     return f"{base}?text={quote(texto)}" if texto else base
 
 
 def _wa_link_display(texto: str = "", display: str = "Hablar con un humano") -> str:
-    """Markdown link [display](wa.me?text=...): el cliente ve texto limpio,
-    pero al pinchar abre el chat con el diagnóstico prellenado."""
     return f"[{display}]({_wa_link(texto)})"
 
 
 def _wa_texto_intake(state: AgentState) -> str:
-    """Diagnóstico compacto del intake para el ?text= del wa.me.
-
-    Determinista (0 LLM): la ficha ya pasó los validadores, solo se formatea.
-    El resumen largo le llega a la ejecutiva por notificación/CRM; este texto
-    es la tarjeta de presentación que ella ve cuando el cliente le escribe.
-    Ficha parcial (derivación anticipada) → intro que NO afirma completado.
-    """
     r = state.get("intake_respuestas") or {}
     nombre = r.get("nombre")
 
@@ -173,18 +161,18 @@ def _wa_texto_intake(state: AgentState) -> str:
          if state.get("intake_completado") else
          "Prefiero hablar directamente con una ejecutiva. Datos que alcancé a registrar:"),
     ]
-    if state.get("category"):
-        lineas.append(f"• Área: {state['category']}")
+    area = state.get("case_category") or state.get("category")
+    if area:
+        lineas.append(f"• Área: {area}")
     if r.get("email"):
         lineas.append(f"• Correo: {r['email']}")
     if r.get("situacion_actual"):
         sit = str(r["situacion_actual"])
-        if len(sit) > 280:                      # campo libre: acotar
+        if len(sit) > 280:
             sit = sit[:277].rstrip() + "…"
         lineas.append(f"• Mi situación: {sit}")
-    if r.get("etapa_proceso"):                   # ya viene como label legible
+    if r.get("etapa_proceso"):
         lineas.append(f"• Etapa de mi caso: {r['etapa_proceso']}")
-    # opcionales del planner, por si se agregan a QUESTIONS:
     if r.get("comuna"):
         lineas.append(f"• Comuna: {r['comuna']}")
     if r.get("hijos_menores") is True:
@@ -194,7 +182,7 @@ def _wa_texto_intake(state: AgentState) -> str:
 
     tid = state.get("thread_id")
     if tid:
-        lineas.append(f"(ID de mi atención: {tid})")   # trazabilidad con el CRM
+        lineas.append(f"(ID de mi atención: {tid})")
 
     txt = "\n".join(lineas)
     if len(txt) > WA_TEXTO_MAX:
@@ -203,12 +191,10 @@ def _wa_texto_intake(state: AgentState) -> str:
 
 
 def _wa_link_diagnostico(state: AgentState) -> str:
-    """Link limpio hacia la ejecutiva; el diagnóstico viaja oculto en ?text=."""
     return _wa_link_display(_wa_texto_intake(state), display="Hablar con un humano")
 
 
 def _wa_link_cliente(state: AgentState) -> str:
-    """wa.me prellenado con el diagnóstico del intake (si hay ficha)."""
     if state.get("intake_respuestas"):
         return _wa_link_diagnostico(state)
     return _wa_link_display(
@@ -254,6 +240,10 @@ def _primer_nombre(nombre: str | None) -> str:
     return partes[0] if partes else ""
 
 
+def _norm_simple(s: str) -> str:
+    return (s or "").strip().lower().rstrip(".")
+
+
 def _transcript(state: AgentState) -> list[dict]:
     return [{"rol": m.type, "contenido": m.content}
             for m in state.get("messages", [])]
@@ -281,7 +271,26 @@ def _parece_abort(query: str) -> bool:
 
 def _telefono_cliente(state: AgentState) -> str | None:
     tid = state.get("thread_id") or ""
-    return tid if re.fullmatch(r"\+\d{8,15}", tid) else None
+    return tid if re.fullmatch(r"\+?\d{8,15}", tid) else None
+
+
+def _precaptura_contacto(state: AgentState) -> dict | None:
+    """Llena nombre/email del mensaje actual sin depender del routing.
+    No persiste: solo alimenta intake_respuestas en memoria."""
+    resp = dict(state.get("intake_respuestas") or {})
+    q = state.get("query") or ""
+
+    if "nombre" not in resp and (m := _NOMBRE_RE.search(q)):
+        palabras = m.group(1).split()
+        if len(palabras) >= 2:
+            resp["nombre"] = " ".join(p.capitalize() for p in palabras)
+
+    if "email" not in resp and (m := _EMAIL_BUSCA.search(q)):
+        e = m.group(0).lower().replace(" ", "")
+        if EMAIL_RE.fullmatch(e):
+            resp["email"] = e
+
+    return resp if resp != (state.get("intake_respuestas") or {}) else None
 
 
 def _canal_desconocido(thread_id: str | None) -> str:
@@ -290,7 +299,7 @@ def _canal_desconocido(thread_id: str | None) -> str:
         return "cli"
     if tid.startswith("web-"):
         return "web"
-    if re.fullmatch(r"\+\d{8,15}", tid):
+    if re.fullmatch(r"\+?\d{8,15}", tid):
         return "whatsapp"
     return "desconocido"
 
@@ -328,18 +337,14 @@ def _persist_escalation(state: AgentState, summary: str) -> Path:
     return path
 
 
-# Reset TOTAL del ledger de intake (TTL o inconsistencias) — mata fichas zombie.
 _RESET_INTAKE = {
     "intake_activo": False, "intake_idx": 0, "intake_respuestas": {},
     "intake_attempts": 0, "intake_exit": None, "intake_resume": False,
     "intake_decision": None, "intake_stage": None, "intake_started_en": None,
-    "intake_completado": False,
+    "intake_completado": False, "intake_oferta_qid": None,
 }
 
 
-# ---------------------------------------------------------------------------
-# ENTRADA + CLASIFICACIÓN
-# ---------------------------------------------------------------------------
 def receive_message(state: AgentState) -> AgentState:
     last_human = next(
         (m for m in reversed(state.get("messages", [])) if m.type == "human"), None
@@ -351,26 +356,36 @@ def receive_message(state: AgentState) -> AgentState:
     tid = state.get("thread_id", "")
     upsert_conversation(thread_id=tid, channel=_canal_desconocido(tid),
                         status="abierto")
-    if q != state.get("query"):
-        insert_message(thread_id=tid, role="human", content=q)
-        return {"query": q}
-    return {}
+
+    insert_message(thread_id=tid, role="human", content=q)
+    return {"query": q}
 
 
 def analyze_sentiment(state: AgentState) -> AgentState:
-    """Clasificación unificada. Durante booking: short-circuit 0 LLM (como
-    siempre). Durante intake: clasifica igual (metadata fresca) pero la
-    precedencia de estado fuerza ROUTE_INTAKE; el planner del subgrafo
-    entiende el mensaje en contexto (respuesta/duda/escape)."""
+    query = state["query"]
 
     if state.get("closed"):
-        return {"route": ROUTE_HANDOFF, "clf_reason": "seguimiento de caso cerrado"}
+        if state.get("intake_completado") \
+                and _norm_simple(query) in _AGENDAR_CTA:
+            return {"route": ROUTE_AGENDAR,
+                    "clf_reason": "CTA agendar post-intake completado (0 LLM)"}
+        return {"route": ROUTE_HANDOFF,
+                "clf_reason": "seguimiento de caso cerrado"}
 
-    query = state["query"]
     en_booking = bool(state.get("booking_stage"))
     en_intake = bool(state.get("intake_activo")) and not state.get("intake_completado")
+    en_intake_pausado = en_intake and state.get("intake_exit") == "pausa"
     reset: dict = {}
     forzar_intake = False
+
+    # --- intake pausado: cualquier mensaje retoma la ficha ---
+    if en_intake_pausado:
+        return {
+            "route": ROUTE_INTAKE,
+            "clf_reason": "intake pausado → reanudar",
+            "intake_exit": None,
+            "intake_resume": True,
+        }
 
     # --- booking: comportamiento histórico intacto ---
     if en_booking:
@@ -397,7 +412,6 @@ def analyze_sentiment(state: AgentState) -> AgentState:
         else:
             forzar_intake = True
 
-    # --- clasificación unificada (siempre que no haya short-circuit 0 LLM) ---
     cfg = _cfg()["classification"]
     prompt = ChatPromptTemplate.from_messages([
         ("system", cfg["system_prompt"]),
@@ -429,6 +443,16 @@ def analyze_sentiment(state: AgentState) -> AgentState:
         route = ROUTE_INTAKE
         reason = f"intake activo (clasificación solo metadata) | {result.reason}"
 
+    # Determinar categoría estable del caso (primera sustantiva gana)
+    current_case_category = state.get("case_category")
+    new_category = result.category
+    case_category = current_case_category
+    if not current_case_category or (
+        current_case_category in ("otro", "consulta_general")
+        and new_category not in ("otro", "consulta_general")
+    ):
+        case_category = new_category
+
     logger.info("clf | %s/%s/%s/%s → %s | %s",
                 result.sentiment, result.urgency, result.intent,
                 result.category, route, reason)
@@ -436,10 +460,14 @@ def analyze_sentiment(state: AgentState) -> AgentState:
     upsert_conversation(thread_id=state.get("thread_id", ""),
                         intent=result.intent, category=result.category)
 
+    contacto_updates = {} if (pre := _precaptura_contacto(state)) is None else {"intake_respuestas": pre}
+
     return {
         "sentiment": result.sentiment, "urgency": result.urgency,
         "intent": result.intent, "category": result.category,
+        "case_category": case_category,
         "clf_reason": reason, "route": route,
+        **contacto_updates,
         **reset,
     }
 
@@ -462,38 +490,30 @@ def route_query(state: AgentState) -> str:
     return route
 
 
-# ---------------------------------------------------------------------------
-# CONTINUACIONES POST-SUBGRAFO (pausa lateral del intake + handoff)
-# ---------------------------------------------------------------------------
 def route_post_intake(state: AgentState) -> str:
-    """Tras el subgrafo intake:
-    - pausa por duda lateral → FAQ responde en el mismo turno;
-    - ficha completa o derivación parcial → handoff;
-    - resto → END (esperar próximo mensaje)."""
     if state.get("intake_exit") == "faq":
         return ROUTE_FAQ
+    if state.get("intake_exit") == "pausa":
+        return END
     if state.get("intake_completado") or state.get("intake_exit") == "handoff":
         return ROUTE_HANDOFF
     return END
 
 
 def route_post_faq(state: AgentState) -> str:
-    """Si el FAQ respondió una duda lateral con el intake pausado, el subgrafo
-    de intake se re-invocaba para re-anexar la pregunta pendiente."""
     if state.get("intake_resume") and state.get("intake_activo") \
             and not state.get("intake_completado"):
         return ROUTE_INTAKE
     return END
 
 
-# ---------------------------------------------------------------------------
-# NODOS TERMINALES TRANSVERSALES
-# ---------------------------------------------------------------------------
 def respuesta_fuera_dominio(state: AgentState) -> AgentState:
     atn = _cfg()["atencion"]
     response = atn["fuera_dominio_message"].format(disclosure=atn["disclosure"])
     _guardar_ai(state, response)
-    return {"response": response, "messages": [AIMessage(content=response)]}
+    return {"response": response, "response_bubbles": [response],
+            "response_interactive": None,
+            "messages": [AIMessage(content=response)]}
 
 
 def handoff_humano(state: AgentState) -> AgentState:
@@ -505,7 +525,9 @@ def handoff_humano(state: AgentState) -> AgentState:
             whatsapp_ejecutiva=_wa_link_cliente(state), thread_id=tid,
         )
         _guardar_ai(state, response)
-        return {"response": response, "messages": [AIMessage(content=response)]}
+        return {"response": response, "response_bubbles": [response],
+                "response_interactive": None,
+                "messages": [AIMessage(content=response)]}
 
     try:
         summary_prompt = ChatPromptTemplate.from_messages([
@@ -523,15 +545,12 @@ def handoff_humano(state: AgentState) -> AgentState:
     upsert_conversation(thread_id=tid, status="escalado",
                         summary=summary, closed=True)
 
-    # Lead en CRM: solo con consentimiento expreso; completed refleja si la
-    # ficha se terminó o es parcial (derivación anticipada por insistencia
-    # del cliente o por reintentos agotados).
     respuestas = state.get("intake_respuestas") or {}
     if respuestas.get("consentimiento_datos") is True:
         upsert_lead(
             thread_id=tid,
             intake_respuestas=respuestas,
-            category=state.get("category"),
+            category=state.get("case_category") or state.get("category"),
             completed=bool(state.get("intake_completado")),
         )
 
@@ -550,11 +569,46 @@ def handoff_humano(state: AgentState) -> AgentState:
                       notificado_whatsapp=notificacion_ok)
 
     _persist_escalation(state, summary)
+
+    # FIX #2: Notificación por email a ejecutiva
+    telefono = _telefono_cliente(state)
+    wa_link = _wa_link_cliente(state)
+    nombre = respuestas.get("nombre") or state.get("lead_nombre") or "Sin nombre"
+    categoria_final = state.get("case_category") or state.get("category") or "otro"
+    email_body = f"""
+    <h3>Nuevo lead derivado — Manzzo y Cía</h3>
+    <p><b>Thread ID:</b> {tid}</p>
+    <p><b>Nombre:</b> {nombre}</p>
+    <p><b>Teléfono:</b> {telefono or 'No disponible'}</p>
+    <p><b>Categoría:</b> {categoria_final}</p>
+    <p><b>Urgencia:</b> {state.get('urgency', 'media')}</p>
+    <p><b>Resumen:</b> {summary}</p>
+    <p><b>Link WhatsApp cliente:</b> <a href="{wa_link}">{wa_link}</a></p>
+    <p><b>Ficha completa:</b> {respuestas}</p>
+    """
+    email_ok = notificar_email(
+        subject=f"[Manzzo Bot] Nuevo lead: {nombre} | {categoria_final}",
+        body_html=email_body,
+    )
+
+    # FIX #3: SheetDB solo con consentimiento explícito
     try:
         from integrations.sheetdb import sync_lead
-        sync_lead(state)
+        if respuestas.get("consentimiento_datos") is True:
+            sync_lead(state, modo="completo")
+        else:
+            sync_lead(state, modo="minimo")
     except Exception as e:
         logger.exception("SheetDB (fallback) falló: %s", e)
+
+    intake_ya_despidio = state.get("intake_exit") in ("booking", "handoff") \
+        or bool(state.get("intake_completado"))
+    if intake_ya_despidio:
+        return {
+            "summary": summary, "closed": True,
+            "notificacion_pendiente": not (notificacion_ok or email_ok),
+            "intake_exit": None,
+        }
 
     response = atn["handoff_message"].format(
         disclosure=atn["disclosure"],
@@ -563,7 +617,9 @@ def handoff_humano(state: AgentState) -> AgentState:
     )
     _guardar_ai(state, response)
     return {
-        "response": response, "summary": summary, "closed": True,
-        "notificacion_pendiente": not notificacion_ok,
+        "response": response, "response_bubbles": [response],
+        "response_interactive": None,
+        "summary": summary, "closed": True,
+        "notificacion_pendiente": not (notificacion_ok or email_ok),
         "messages": [AIMessage(content=response)],
     }

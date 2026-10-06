@@ -27,7 +27,8 @@ IntakeActionLabel = Literal[
     "iniciar_ficha",        # apertura (0 LLM)
     "procesar_respuesta",   # validar + avanzar/completar
     "reanudar",             # vuelve de FAQ lateral: re-anexa pendiente (0 LLM)
-    "pausar_para_faq",      # el cliente hizo una duda: FAQ responde, luego reanudar
+    "pausar_para_faq", 
+    "pausar_ficha",     # el cliente hizo una duda: FAQ responde, luego reanudar
     "derivar_parcial",      # insiste humano o reintentos agotados → handoff con lo que haya
     "abandonar_ficha",      # cancela el registro: cierre amable + link
     "sin_consentimiento",
@@ -35,7 +36,8 @@ IntakeActionLabel = Literal[
 
 IntakeTurnoLabel = Literal[
     "respuesta_formulario",  # está respondiendo la ficha (puede traer varios campos)
-    "duda_o_consulta",       # hace una pregunta/cambia de tema sin cancelar
+    "duda_o_consulta",  
+    "pausar",     # hace una pregunta/cambia de tema sin cancelar
     "insiste_humano",        # quiere una persona YA (2ª vez o explícito)
     "abandonar",             # no quiere seguir con el registro
 ]

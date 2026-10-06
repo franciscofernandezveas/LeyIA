@@ -1,10 +1,20 @@
 """graph/booking/planner.py — Comprensión del turno de agendamiento.
 
-v3 — Wizard de captura secuencial:
-  - Según booking_stage, extrae SOLO el campo activo (nombre, email, modalidad).
-  - Modalidad resuelve con fast-path determinista (1/2, online/presencial).
-  - Una vez en propuesta, funciona igual que antes (elegir horario, otra fecha, etc.).
+v4.3 — Match exacto por título de botón:
+  - Si el cliente pincha "Lun 06/10 09:00", el planner lo mapea
+    directamente al slot correspondiente.
+  - Lenguaje natural sigue siendo el camino principal; esto es un
+    redoble defensivo para canales interactivos.
+
+v4.2 — Lenguaje natural primero:
+  - "a las 16 hrs este viernes", "el lunes a las 17:30", "la primera opción",
+    "la última" → match_slot los interpreta.
+  - "1", "2", "opción 3" → fallback numérico.
+
+v4 — FIX primer ingreso:
+  - stage=None siempre devuelve acción "iniciar_wizard".
 """
+
 import logging
 import re
 import unicodedata
@@ -52,6 +62,44 @@ def _slot_display(s) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Helper duplicado de nodes.py: evita import circular
+# ---------------------------------------------------------------------------
+def _slot_button_label(s) -> str:
+    """Etiqueta corta para botones/lista de WhatsApp (máx. ~16 chars)."""
+    dias_abr = {"lunes": "Lun", "martes": "Mar", "miercoles": "Mie",
+                "jueves": "Jue", "viernes": "Vie",
+                "sabado": "Sab", "domingo": "Dom"}
+    dia = dias_abr[_DIASEM[s.weekday()]]
+    return f"{dia} {s.strftime('%d/%m')} {s.strftime('%H:%M')}"
+
+
+_ORDINALES = {
+    "primera": 1, "primero": 1, "primer": 1, "1ra": 1, "1ro": 1,
+    "segunda": 2, "segundo": 2, "2do": 2, "2da": 2,
+    "tercera": 3, "tercero": 3, "3ro": 3, "3ra": 3,
+    "cuarta": 4, "cuarto": 4, "4to": 4, "4ta": 4,
+    "quinta": 5, "quinto": 5, "5to": 5, "5ta": 5,
+    "sexta": 6, "sexto": 6, "6to": 6, "6ta": 6,
+    "septima": 7, "septimo": 7, "7mo": 7, "7ma": 7,
+    "octava": 8, "octavo": 8, "8vo": 8, "8va": 8,
+    "novena": 9, "noveno": 9, "9no": 9, "9na": 9,
+    "decima": 10, "decimo": 10, "10mo": 10, "10ma": 10,
+}
+
+
+def _extraer_ordinal(texto: str) -> int | None:
+    """Interpreta 'la primera', 'opción 3', 'elijo la 2', etc."""
+    t = _norm(texto)
+    m = re.search(r"(?:opcion|numero|nro|eleccion|elijo|escoja|seleccione|escoger|elegir)\s*(\d+)", t)
+    if m:
+        return int(m.group(1))
+    for palabra, num in _ORDINALES.items():
+        if palabra in t:
+            return num
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Fast-paths deterministas
 # ---------------------------------------------------------------------------
 def _fast_path(raw: str, stage: str | None, slots: list) -> BookingDecision | None:
@@ -59,31 +107,73 @@ def _fast_path(raw: str, stage: str | None, slots: list) -> BookingDecision | No
     if _parece_abort(raw):
         return BookingDecision(accion="abortar")
 
-    # En captura de modalidad: resolver directo
+    # --- captura de modalidad (sin cambios) ---
     if stage == "captura_modalidad":
         if re.search(r"\b1\b", t) or _RE_ONLINE.search(t):
             return BookingDecision(accion="entregar_modalidad", modalidad="online")
         if re.search(r"\b2\b", t) or _RE_PRESENCIAL.search(t):
             return BookingDecision(accion="entregar_modalidad", modalidad="presencial")
 
-    # En propuesta: franja, elección, día específico, otro día
-    if stage == "propuesta":
-        if _RE_MANANA.search(t):
-            return BookingDecision(accion="filtrar_franja", franja="manana")
-        if _RE_TARDE.search(t):
-            return BookingDecision(accion="filtrar_franja", franja="tarde")
+    if stage != "propuesta" or not slots:
+        return None
 
-        if slots:
-            m = match_slot(raw, slots, ref=datetime.now(GCAL_TZ).date())
-            if m is not None:
-                return BookingDecision(accion="elegir_horario")
+    # ------------------------------------------------------------------
+    # 1) Lenguaje natural PRIMERO: día + hora / hora única / ordinal
+    # ------------------------------------------------------------------
+    m = match_slot(raw, slots, ref=datetime.now(GCAL_TZ).date())
+    if m is not None:
+        if isinstance(m, int):
+            logger.info("[booking] fast-path match_slot único: slot idx %d", m)
+            return BookingDecision(accion="elegir_horario", eleccion=m + 1)
+        if isinstance(m, list) and len(m) == 1:
+            logger.info("[booking] fast-path match_slot único (lista): slot idx %d", m[0])
+            return BookingDecision(accion="elegir_horario", eleccion=m[0] + 1)
+        if isinstance(m, list) and len(m) > 1:
+            logger.info("[booking] fast-path match_slot ambiguo: %s", m)
+            return BookingDecision(accion="elegir_horario")
 
-        off = extraer_dias_offset(raw, datetime.now(GCAL_TZ).date())
-        if off is not None:
-            return BookingDecision(accion="pedir_otra_fecha", dias_offset=off)
+    # ------------------------------------------------------------------
+    # 2) Día/fecha explícito que NO calzó exactamente → replanificar,
+    #    NUNCA tratar como duda lateral ("el lunes", "mañana", "04/09"...).
+    # ------------------------------------------------------------------
+    off = extraer_dias_offset(raw, datetime.now(GCAL_TZ).date())
+    if off is not None:
+        logger.info("[booking] fast-path otro día: offset %d", off)
+        return BookingDecision(accion="pedir_otra_fecha", dias_offset=off)
 
-        if any(p in t for p in _OTRO_DIA):
-            return BookingDecision(accion="pedir_otra_fecha")
+    # ------------------------------------------------------------------
+    # 3) Franja horaria (cuando no pidió día específico)
+    # ------------------------------------------------------------------
+    if _RE_MANANA.search(t):
+        return BookingDecision(accion="filtrar_franja", franja="manana")
+    if _RE_TARDE.search(t):
+        return BookingDecision(accion="filtrar_franja", franja="tarde")
+
+    # ------------------------------------------------------------------
+    # 4) Ordinales y números simples
+    # ------------------------------------------------------------------
+    ordinal = _extraer_ordinal(raw)
+    if ordinal is not None and 1 <= ordinal <= len(slots):
+        logger.info("[booking] fast-path ordinal: opción %d", ordinal)
+        return BookingDecision(accion="elegir_horario", eleccion=ordinal)
+
+    raw_stripped = raw.strip()
+    if raw_stripped.isdigit():
+        opcion = int(raw_stripped)
+        if 1 <= opcion <= len(slots):
+            logger.info("[booking] fallback numérico: opción %d", opcion)
+            return BookingDecision(accion="elegir_horario", eleccion=opcion)
+        logger.info("[booking] número fuera de rango: %d (slots=%d)",
+                    opcion, len(slots))
+
+    # ------------------------------------------------------------------
+    # 5) Match exacto contra título de botón enviado por el adaptador
+    # ------------------------------------------------------------------
+    titulo_cliente = _norm(raw)
+    for i, s in enumerate(slots, 1):
+        if _norm(_slot_button_label(s)) == titulo_cliente:
+            logger.info("[booking] match exacto por título de botón: %d", i)
+            return BookingDecision(accion="elegir_horario", eleccion=i)
 
     return None
 
@@ -126,6 +216,7 @@ Opciones vigentes:
 Señal anterior: {señal}
 
 Reglas:
+- "la primera", "opción 3" → elegir_horario con elección 1-based.
 - "por la mañana"/"en la tarde" → filtrar_franja; "mañana" A SOLAS es el día siguiente.
 - Día de semana o fecha específica no en opciones → pedir_otra_fecha.
 - elegir_horario SOLO si se refiere a una opción vigente.
@@ -168,6 +259,16 @@ def booking_planner(state: AgentState) -> AgentState:
                 "booking_attempts": 0, "booking_franja": None,
                 "booking_match": None, "booking_match_candidatos": []}
 
+    # FIX v4: primer ingreso al booking → siempre iniciar wizard de captura
+    if stage is None:
+        logger.info("[booking] primer ingreso → iniciar wizard de captura")
+        return {**init,
+                "booking_decision": BookingDecision(accion="iniciar_wizard").model_dump(),
+                "booking_stage": "captura_nombre",
+                "booking_match": None,
+                "booking_match_candidatos": [],
+                "booking_signal": None}
+
     # Guard: slots vencidos
     if stage == "propuesta" and slots and min(slots) < datetime.now(GCAL_TZ):
         logger.info("[booking] slots vencidos → regenerar propuesta")
@@ -179,16 +280,19 @@ def booking_planner(state: AgentState) -> AgentState:
         or _decidir_llm(state, slots) \
         or _fallback_decision(stage)
 
-    # Match de slot
+    # Match de slot: usa elección explícita primero, luego match_slot
     match, candidatos = None, []
     if decision.accion == "elegir_horario" and slots:
-        m = match_slot(raw, slots, ref=datetime.now(GCAL_TZ).date())
-        if isinstance(m, int):
-            match = m
-        elif isinstance(m, list):
-            candidatos = m
-        elif decision.eleccion and 1 <= decision.eleccion <= len(slots):
+        if decision.eleccion and 1 <= decision.eleccion <= len(slots):
             match = decision.eleccion - 1
+            logger.info("[booking] match por elección explícita: %d", match)
+        else:
+            m = match_slot(raw, slots, ref=datetime.now(GCAL_TZ).date())
+            logger.info("[booking] match_slot('%s') → %s", raw, m)
+            if isinstance(m, int):
+                match = m
+            elif isinstance(m, list):
+                candidatos = m
 
     updates = {}
     if decision.nombre:

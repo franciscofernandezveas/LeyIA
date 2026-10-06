@@ -1,4 +1,4 @@
-"""graph/intake/supervisor.py — Routing interno del sub-agente INTAKE (v8)."""
+"""graph/intake/supervisor.py — Routing interno del sub-agente INTAKE (v9)."""
 from core.contracts import AgentState
 
 _ACCIONES = {
@@ -6,6 +6,7 @@ _ACCIONES = {
     "procesar_respuesta": "procesar_respuesta",
     "reanudar": "reanudar",
     "pausar_para_faq": "pausar_para_faq",
+    "pausar_ficha": "pausar_ficha",
     "derivar_parcial": "derivar_parcial",
     "abandonar_ficha": "abandonar_ficha",
     "sin_consentimiento": "sin_consentimiento",

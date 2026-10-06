@@ -1,42 +1,13 @@
 # app.py
 """Dashboard Streamlit para el agente Manzzo y Cía (LeyIA).
 
-Versión: v6.2 — Alineada con main.py v6.1 (CLI). Mismo contrato con agent_graph.
-
-Cambios v6.1 → v6.2:
-  a) load_dotenv() al inicio, ANTES de importar core.*/graph.* — sin esto,
-     db_client.py lee DATABASE_URL=None al importarse y todos los upserts
-     fallan en silencio (los '[db] ... falló' solo salen en la terminal).
-     En Streamlit Cloud es un no-op inofensivo (los Secrets ya son env vars).
-  b) resolve_hitl(): si el resume falla, el panel ya NO se limpia a ciegas.
-     El interrupt sigue vivo en el checkpoint → borrarlo solo de la UI
-     habilitaba el chat sobre un hilo interrumpido → LangGraph lanzaba error
-     al recibir input normal. Ahora se re-sincroniza desde el checkpoint
-     (fuente de verdad): el panel persiste y el operador puede reintentar.
-  c) cargar_hilo(): valida que el hilo exista en el checkpointer (fix /cargar
-     de la CLI aquí no portado) y hace UN solo get_state en vez de tres.
-
-Alineación con la CLI (main.py v6.1):
-  · Misma forma de invoke: {"messages": [("human", q)], "thread_id": ...}
-    sin "query" — receive_message la deriva del último mensaje humano.
-  · Mismo resume HITL: Command(resume={"aprobado": ..., "nota": ...}).
-  · thread_id estable en session_state (prefijo "web-" para distinguir en BD).
-  · Historial reconstruido desde el checkpointer al cargar un hilo.
-  · Chat deshabilitado mientras haya HITL pendiente (≡ drenar-antes-de-enviar
-    de la CLI: mismo efecto, UI bloqueada en vez de drenado automático).
-
-Roles:
-  🧑 CLIENTE  → chat inferior.
-  👷 OPERADOR → panel que aparece cuando el grafo interrumpe (HITL).
-
-Uso:
-    streamlit run app.py
+Versión: v6.3.2 — import limpio de Command y corrección de sintaxis.
+Alineada con grafo padre v16.1, intake v9 y booking por booking_stage.
 """
-# ⚠️ ORDEN CRÍTICO: load_dotenv() antes de importar core.*/graph.*,
-# porque db_client.py captura DATABASE_URL en tiempo de importación.
 from dotenv import load_dotenv
 load_dotenv()
 
+import importlib
 import json
 import logging
 import uuid
@@ -55,6 +26,9 @@ logger = logging.getLogger(__name__)
 ESCALATIONS_DIR = Path("escalations")
 GOLDEN_PATH = Path("tests/golden_sentiment.json")
 
+MODULOS_CON_CFG = ("graph.nodes", "graph.faq.nodes",
+                   "graph.intake.nodes", "graph.booking.nodes")
+
 st.set_page_config(page_title="LeyIA · Manzzo y Cía", page_icon="⚖️",
                    layout="wide")
 
@@ -64,7 +38,7 @@ st.set_page_config(page_title="LeyIA · Manzzo y Cía", page_icon="⚖️",
 # ---------------------------------------------------------------------------
 def init_state() -> None:
     st.session_state.setdefault("thread_id", f"web-{uuid.uuid4().hex[:8]}")
-    st.session_state.setdefault("chat_log", [])         # [{rol, content, meta}]
+    st.session_state.setdefault("chat_log", [])
     st.session_state.setdefault("pending_interrupt", None)
     st.session_state.setdefault("last_meta", {})
 
@@ -81,12 +55,15 @@ def log(rol: str, content: str, meta: dict | None = None) -> None:
                                       "meta": meta})
 
 
+META_KEYS = ("sentiment", "urgency", "intent", "category", "case_category",
+             "route", "clf_reason", "closed",
+             "booking_stage", "intake_activo", "intake_exit",
+             "intake_completado", "notificacion_pendiente")
+
+
 def extract_meta(result: dict) -> dict:
-    """Trazabilidad del turno: clasificación + flags de sub-flujos (estado v8)."""
-    keys = ("sentiment", "urgency", "intent", "category", "route",
-            "closed", "recolectando_datos_agenda",
-            "esperando_eleccion_horario", "intake_activo")
-    return {k: result.get(k) for k in keys if result.get(k) not in (None, False)}
+    return {k: result.get(k) for k in META_KEYS
+            if result.get(k) not in (None, False)}
 
 
 def _config() -> dict:
@@ -94,17 +71,15 @@ def _config() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Helpers de checkpoint (≡ _pending_interrupts/_estado_hilo de main.py)
+# Helpers de checkpoint
 # ---------------------------------------------------------------------------
 def _interrupts_de_snap(snap) -> list:
-    """Extrae los interrupts de un snapshot ya obtenido (sin get_state extra)."""
     if not snap or not snap.tasks:
         return []
     return [i for task in snap.tasks for i in (task.interrupts or [])]
 
 
 def _interrupts_pendientes() -> list:
-    """Interrupts pendientes en el checkpoint del hilo actual."""
     return _interrupts_de_snap(agent_graph.get_state(_config()))
 
 
@@ -114,27 +89,22 @@ def _estado_hilo() -> dict:
 
 
 def _resumen_subflujo(valores: dict | None = None) -> str | None:
-    """≡ los ℹ️ de la CLI al hacer /cargar.
-
-    Si se pasan `valores` (snapshot ya consultado), no hace get_state extra;
-    si no, consulta el checkpoint del hilo actual (uso desde el sidebar).
-    """
     st_ = valores if valores is not None else _estado_hilo()
     if st_.get("closed"):
-        return "🗂️ Caso cerrado/derivado a la ejecutiva"
-    if st_.get("intake_activo"):
-        return "📋 Ficha de intake en curso"
-    if st_.get("recolectando_datos_agenda"):
+        return "🗂️ Caso cerrado/derivado a la ejecutiva (seguimiento → handoff)"
+    if st_.get("booking_stage"):
+        if st_.get("slots_propuestos"):
+            return "🕐 Eligiendo un horario disponible"
         return "🗓️ Capturando datos de agendamiento"
-    if st_.get("esperando_eleccion_horario"):
-        return "🕐 Eligiendo un horario disponible"
+    if st_.get("intake_activo") and not st_.get("intake_completado"):
+        if st_.get("intake_exit") == "pausa":
+            return ("⏸️ Intake en pausa — el próximo mensaje del cliente "
+                    "reanuda la ficha solo")
+        return "📋 Ficha de intake en curso"
     return None
 
 
 def cargar_hilo(thread_id: str) -> None:
-    """≡ /cargar de la CLI v6.1: valida existencia, cambia de hilo,
-    reconstruye el chat desde el checkpoint y levanta el panel del
-    operador si quedó un HITL pendiente. UN solo get_state."""
     snap = agent_graph.get_state(make_config(thread_id))
     valores = (snap.values or {}) if snap else {}
     pendientes = _interrupts_de_snap(snap)
@@ -143,21 +113,17 @@ def cargar_hilo(thread_id: str) -> None:
     st.session_state.last_meta = {}
     st.session_state.chat_log = []
 
-    # Validación (≡ fix /cargar de la CLI): typo o id inexistente → avisar
-    # en el chat en vez de conversar a ciegas bajo un hilo basura.
     if not valores:
         log("sistema",
             f"⚠️ `{thread_id}` no existe en el checkpointer; "
             "se creará como hilo nuevo al primer mensaje.")
 
-    # Reconstruir conversación visible desde los mensajes persistidos
     for m in valores.get("messages", []):
         if m.type == "human":
             log("cliente", m.content)
         elif m.type == "ai" and m.content:
             log("agente", m.content)
 
-    # HITL pendiente de una sesión anterior → operador decide ahora
     st.session_state.pending_interrupt = pendientes[0].value if pendientes else None
 
     aviso = _resumen_subflujo(valores)
@@ -166,12 +132,12 @@ def cargar_hilo(thread_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Ciclo del grafo — NADA se pierde: todo va al chat_log
+# Ciclo del grafo
 # ---------------------------------------------------------------------------
 def process_result(result: dict) -> None:
     if "__interrupt__" in result:
         st.session_state.pending_interrupt = result["__interrupt__"][0].value
-        return                                       # el panel se renderiza abajo
+        return
 
     st.session_state.pending_interrupt = None
     meta = extract_meta(result)
@@ -185,8 +151,6 @@ def process_result(result: dict) -> None:
 
 
 def send_client_message(query: str) -> None:
-    """≡ paso 2 de la CLI: solo messages + thread_id. La derivación de query
-    la hace receive_message dentro del grafo."""
     log("cliente", query)
     with st.spinner("🤖 pensando…"):
         try:
@@ -197,25 +161,17 @@ def send_client_message(query: str) -> None:
             )
             process_result(result)
         except Exception as e:
-            # Antes: st.error() aquí → el rerun lo borraba = error invisible.
-            # Ahora: va al chat_log (persiste) + traceback en terminal.
             logger.exception("Error invocando el grafo")
             log("sistema", f"⚠️ Error del agente: `{type(e).__name__}: {e}`")
 
 
 def resolve_hitl(decision: dict) -> None:
-    """Resume el HITL pendiente. Si el resume falla (ej. Calendar API caída),
-    el checkpoint sigue interrumpido → re-sincronizamos desde él (fuente de
-    verdad) en vez de limpiar la UI a ciegas. ≡ CLI v6.1: hilo en pausa."""
     with st.spinner("Procesando decisión del operador…"):
         try:
             result = agent_graph.invoke(Command(resume=decision),
                                         config=_config())
-            process_result(result)      # puede encadenar otra interrupción
+            process_result(result)
         except Exception as e:
-            # Antes: pending_interrupt = None → chat habilitado sobre un hilo
-            # AÚN interrumpido → el siguiente mensaje del cliente hacía que
-            # LangGraph lanzara error por input normal en vez de Command(resume).
             logger.exception("Error resolviendo HITL")
             log("sistema", f"⚠️ Error tras decisión del operador: "
                            f"`{type(e).__name__}: {e}`. "
@@ -227,8 +183,12 @@ def resolve_hitl(decision: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Panel del OPERADOR (solo cuando hay __interrupt__ pendiente)
+# Panel del OPERADOR
 # ---------------------------------------------------------------------------
+_CLAVES_HITL_CONOCIDAS = {"tipo", "query", "detalle", "lead",
+                          "urgencia", "categoria"}
+
+
 def render_operator_panel() -> None:
     payload = st.session_state.pending_interrupt
     tipo = str(payload.get("tipo", ""))
@@ -239,7 +199,6 @@ def render_operator_panel() -> None:
     st.markdown(f"**Cliente:** {payload.get('query', '—')}")
     st.caption(payload.get("detalle", ""))
 
-    # Lead + clasificación (≡ el print de la CLI)
     lead = payload.get("lead") or {}
     if lead:
         st.markdown(
@@ -249,6 +208,12 @@ def render_operator_panel() -> None:
               if payload.get(k) is not None}
     if extras:
         st.write(extras)
+
+    desconocidas = {k: v for k, v in payload.items()
+                    if k not in _CLAVES_HITL_CONOCIDAS}
+    if desconocidas:
+        with st.expander("Payload adicional del HITL"):
+            st.json(json.loads(json.dumps(desconocidas, default=str)))
 
     if tipo == TipoHITL.APROBACION_AGENDAMIENTO.value:
         col1, col2 = st.columns(2)
@@ -265,7 +230,6 @@ def render_operator_panel() -> None:
             resolve_hitl({"aprobado": False, "nota": nota})
             st.rerun()
     else:
-        # Fallback defensivo (≡ CLI): HITL de tipo desconocido → rechazo
         nota = st.text_input("Nota:", key="hitl_nota_generica")
         if st.button("Rechazar HITL desconocido"):
             log("operador", f"Rechazó HITL desconocido ({tipo}).")
@@ -285,7 +249,7 @@ def render_chat() -> None:
         role = "assistant" if msg["rol"] in ("agente", "sistema") else "user"
         with st.chat_message(role, avatar=AVATARES.get(msg["rol"])):
             if msg["rol"] == "sistema" and msg["content"].startswith("⚠️"):
-                st.error(msg["content"])     # errores en rojo, DENTRO del chat
+                st.error(msg["content"])
             else:
                 st.markdown(msg["content"])
             if msg.get("meta"):
@@ -294,7 +258,7 @@ def render_chat() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Sidebar: sesión, clasificación, debug y QA
+# Sidebar
 # ---------------------------------------------------------------------------
 def render_sidebar() -> None:
     with st.sidebar:
@@ -304,7 +268,6 @@ def render_sidebar() -> None:
         st.button("🔄 Hilo nuevo", on_click=new_thread,
                   use_container_width=True)
 
-        # ≡ /cargar <id> de la CLI
         with st.expander("📂 Cargar hilo existente"):
             tid = st.text_input("thread_id", key="cargar_id",
                                 placeholder="web-xxxxxxxx o cli-xxxxxxxx")
@@ -312,18 +275,29 @@ def render_sidebar() -> None:
                 cargar_hilo(tid.strip())
                 st.rerun()
 
-        # Estado de sub-flujo del hilo actual (≡ los ℹ️ de la CLI)
         aviso = _resumen_subflujo()
         if aviso:
             st.info(aviso)
 
         if st.button("🔁 Recargar cfg", use_container_width=True,
                      help="Limpia caches de prompts.yaml y auth de Calendar"):
-            from graph.nodes import _cfg
-            _cfg.cache_clear()
-            from tools.google_calendar import _api_resource
-            _api_resource.cache_clear()      # re-auth en la próxima llamada
-            st.success("Caches limpiados")
+            limpiados = []
+            for nombre_mod in MODULOS_CON_CFG:
+                try:
+                    mod = importlib.import_module(nombre_mod)
+                except ImportError:
+                    continue
+                cfg_fn = getattr(mod, "_cfg", None)
+                if hasattr(cfg_fn, "cache_clear"):
+                    cfg_fn.cache_clear()
+                    limpiados.append(nombre_mod)
+            try:
+                from tools.google_calendar import _api_resource
+                _api_resource.cache_clear()
+                limpiados.append("tools.google_calendar")
+            except (ImportError, AttributeError):
+                pass
+            st.success(f"Caches limpiados: {', '.join(limpiados) or 'ninguno'}")
 
         st.divider()
         st.header("📊 Último turno")
@@ -334,7 +308,6 @@ def render_sidebar() -> None:
         else:
             st.caption("Aún no hay turnos clasificados.")
 
-        # Quick-tests desde el golden set (QA del clasificador)
         st.divider()
         st.header("🧪 Quick-test (golden)")
         if GOLDEN_PATH.exists():
@@ -352,7 +325,6 @@ def render_sidebar() -> None:
         else:
             st.caption(f"No se encontró {GOLDEN_PATH}")
 
-        # Visor de escalamientos cerrados
         st.divider()
         st.header("🗂️ Casos cerrados")
         if ESCALATIONS_DIR.exists():
@@ -366,7 +338,6 @@ def render_sidebar() -> None:
             else:
                 st.caption("Sin escalamientos aún.")
 
-        # Inspector del estado real del grafo (checkpoint) — clave para debug
         st.divider()
         with st.expander("🔬 Estado del grafo (debug)"):
             try:

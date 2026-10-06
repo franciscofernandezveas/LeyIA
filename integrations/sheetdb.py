@@ -101,8 +101,13 @@ def _detectar_canal(thread_id: str | None) -> str:
     return "desconocido"
 
 
-def _build_payload(state: dict, canal: str | None = None) -> dict:
-    """Mapea el estado del grafo al payload de SheetDB."""
+def _build_payload(state: dict, canal: str | None = None,
+                   modo: str = "completo") -> dict:
+    """Mapea el estado del grafo al payload de SheetDB.
+
+    modo='completo' → ficha completa (requiere consentimiento previo).
+    modo='minimo'   → solo datos operacionales; NUNCA situación, resumen ni PII sensible.
+    """
     r = state.get("intake_respuestas") or {}
     booking = state.get("booking") or {}
 
@@ -112,6 +117,39 @@ def _build_payload(state: dict, canal: str | None = None) -> dict:
     created = state.get("intake_started_en") or _now_iso()
     closed = _now_iso()
 
+    consent = r.get("consentimiento_datos") is True
+
+    # FIX #3: payload mínimo cuando no hay consentimiento
+    if modo == "minimo" or not consent:
+        return {
+            COL["id_lead"]: state.get("thread_id", ""),
+            COL["thread_id"]: state.get("thread_id", ""),
+            COL["created_at"]: created,
+            COL["closed_at"]: closed,
+            COL["source"]: canal,
+            COL["lead_status"]: "pendiente_consentimiento",
+            COL["nombre"]: "",
+            COL["email"]: "",
+            COL["telefono"]: "",
+            COL["situacion"]: "",
+            COL["category"]: state.get("category", ""),
+            COL["urgency"]: state.get("urgency", ""),
+            COL["sentiment"]: state.get("sentiment", ""),
+            COL["consentimiento"]: "NO",
+            COL["summary"]: "Pendiente consentimiento datos — no contactar hasta autorización",
+            COL["agenda_link"]: state.get("agenda_link", ""),
+            COL["booking_fecha"]: _format_booking(booking),
+            COL["modalidad"]: state.get("lead_modalidad", ""),
+            COL["asignado_a"]: "",
+            COL["notas"]: "Lead generado sin autorización de datos. "
+                          "Solicitar consentimiento antes de contactar.",
+            COL["intent"]: state.get("intent", ""),
+            COL["route"]: state.get("route", ""),
+            COL["clf_reason"]: state.get("clf_reason", ""),
+            COL["json_backup"]: "",
+        }
+
+    # modo completo (consentimiento == True)
     payload = {
         COL["id_lead"]: state.get("thread_id", ""),
         COL["created_at"]: created,
@@ -143,7 +181,6 @@ def _build_payload(state: dict, canal: str | None = None) -> dict:
         COL["clf_reason"]: state.get("clf_reason", ""),
     }
 
-    # JSON backup: serializar solo campos esenciales, no todo el state
     backup = {
         "thread_id": state.get("thread_id"),
         "clasificacion": {
@@ -165,6 +202,7 @@ def _build_payload(state: dict, canal: str | None = None) -> dict:
     payload[COL["json_backup"]] = json_str[:MAX_JSON_BACKUP_CHARS]
 
     return payload
+
 
 
 def _safe_url(value: str) -> str:
@@ -299,7 +337,8 @@ def actualizar_booking(state: dict) -> dict:
         COL["nombre"]: state.get("lead_nombre") or r.get("nombre", ""),
         COL["email"]: state.get("lead_email") or r.get("email", ""),
         COL["telefono"]: r.get("telefono") or _telefono_cliente(thread_id) or "",
-        COL["category"]: state.get("category", ""),
+        COL["category"]: state.get("case_category") or state.get("category", ""),
+
         COL["intent"]: state.get("intent", ""),
     }
     return actualizar_lead_por_thread_id(thread_id, data)

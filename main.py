@@ -1,33 +1,29 @@
 # main.py
 """CLI interactiva para probar el agente de soporte de Manzzo y Cía.
 
-Versión: v6.1 (Google Calendar: agenda directa, sin Calendly).
-
-Cambios respecto a v6:
-  a) drenar_interrupts(): se elimina el parámetro muerto `mostrar_si_vacio`.
-  b) drenar_interrupts(): límite de rondas de reanudación — si el nodo que
-     procesa el resume falla siempre (ej. Calendar API caída), el operador
-     ya no queda atrapado en un loop infinito.
-  c) /cargar valida que el hilo exista en el checkpointer y avisa si no.
-  d) El chequeo de interrupts post-invoke se pasa como argumento a
-     drenar_interrupts() para no golpear dos veces el checkpointer.
-
-Roles que juegas en la terminal:
-  1️⃣  CLIENTE  → escribes mensajes normalmente.
-  2️⃣  OPERADOR → si el grafo se interrumpe (HITL), decides aprobar la
-                 creación del evento en Google Calendar o redactar la
-                 respuesta de rechazo.
+Versión: v6.2.1 — import robusto de langgraph.Command para entornos
+con langgraph<0.2 o builds parciales. Alineada con grafo padre v16.1
+e intake v9 / booking por booking_stage.
 
 Comandos:
-  /nuevo            → crea un hilo nuevo (nueva conversación)
+  /nuevo            → crea un hilo nuevo
   /cargar <id>      → retoma un hilo persistido por su thread_id
   /hilo             → muestra el thread_id actual
   /salir            → termina
 """
+# ⚠️ ORDEN CRÍTICO: load_dotenv() antes de importar core.*/graph.*,
+# porque db_client.py captura DATABASE_URL en tiempo de importación.
+from dotenv import load_dotenv
+load_dotenv()
+
 import logging
 import uuid
 
+# langgraph>=0.2 expone Command en langgraph.types; algunas builds/versions
+# anteriores lo tienen en langgraph.types.command. Pruebo ambas y, si fallan,
+# doy un mensaje útil en vez de un import críptico.
 from langgraph.types import Command
+
 
 from core.contracts import TipoHITL, make_config
 from graph.builder import agent_graph
@@ -35,11 +31,6 @@ from graph.builder import agent_graph
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
 
 LINE = "─" * 64
-
-# Máximo de rondas de reanudación por llamada a drenar_interrupts().
-# Protege contra un nodo de resume que falle de forma permanente
-# (ej. Google Calendar API caída): sin esto, el operador quedaría
-# respondiendo el mismo HITL para siempre.
 MAX_RONDAS_RESUME = 5
 
 
@@ -47,7 +38,6 @@ MAX_RONDAS_RESUME = 5
 # Helpers de interrupt / estado
 # ---------------------------------------------------------------------------
 def _pending_interrupts(config: dict):
-    """Devuelve los interrupts pendientes de un checkpoint dado."""
     snap = agent_graph.get_state(config)
     if not snap or not snap.tasks:
         return []
@@ -55,35 +45,43 @@ def _pending_interrupts(config: dict):
 
 
 def _estado_hilo(config: dict) -> dict:
-    """Snapshot rápido del estado para mensajes informativos al cargar."""
     snap = agent_graph.get_state(config)
     if not snap:
         return {}
     return snap.values or {}
 
 
+def _resumen_subflujo(valores: dict) -> str | None:
+    if valores.get("closed"):
+        return ("Hilo cerrado/escalado — los próximos mensajes van a "
+                "seguimiento (handoff), salvo el CTA de agendar.")
+    if valores.get("booking_stage"):
+        if valores.get("slots_propuestos"):
+            return "Este hilo estaba eligiendo un horario propuesto."
+        return "Este hilo estaba capturando datos de agendamiento."
+    if valores.get("intake_activo") and not valores.get("intake_completado"):
+        if valores.get("intake_exit") == "pausa":
+            return ("Ficha de intake EN PAUSA — tu próximo mensaje la "
+                    "reanuda automáticamente (no es un interrupt).")
+        return "Este hilo tiene una ficha de intake en curso."
+    return None
+
+
 def _mostrar_respuesta(result: dict) -> None:
-    """Imprime la respuesta del agente + metadatos de routing."""
     response = result.get("response") or "(sin respuesta generada)"
     print(f"\n🤖 {response}")
     print(
-        f"   [sentimiento: {result.get('sentiment')} · "
-        f"vía: {result.get('route')} · "
-        f"intent: {result.get('intent')}]"
+        f"   [{result.get('sentiment')}/{result.get('urgency')} · "
+        f"{result.get('intent')}/{result.get('category')} → {result.get('route')}]"
     )
+    if reason := result.get("clf_reason"):
+        print(f"   · {reason}")
 
 
 # ---------------------------------------------------------------------------
 # Rol: OPERADOR HUMANO
 # ---------------------------------------------------------------------------
 def resolver_hitl(payload: dict) -> dict:
-    """Muestra la solicitud pendiente y pide la decisión del operador.
-
-    El único HITL activo es la aprobación de agendamiento
-    (solo cuando REQUIERE_APROBACION_AGENDAMIENTO = True en nodes.py).
-    En la configuración por defecto el evento se crea directo y este HITL
-    no se dispara.
-    """
     print(f"\n{LINE}")
     print("⏸️  INTERVENCIÓN HUMANA REQUERIDA (eres el operador)")
     print(f"   Tipo   : {payload.get('tipo')}")
@@ -91,6 +89,11 @@ def resolver_hitl(payload: dict) -> dict:
     print(f"   Lead   : {payload.get('lead')}")
     print(f"   Categoría: {payload.get('categoria')} · Urgencia: {payload.get('urgencia')}")
     print(f"   Detalle: {payload.get('detalle')}")
+
+    conocidas = {"tipo", "query", "lead", "categoria", "urgencia", "detalle"}
+    extras = {k: v for k, v in payload.items() if k not in conocidas}
+    if extras:
+        print(f"   Extra  : {extras}")
     print(LINE)
 
     tipo = payload.get("tipo")
@@ -108,29 +111,11 @@ def resolver_hitl(payload: dict) -> dict:
         print("❌ Rechazado.\n")
         return {"aprobado": False, "nota": nota}
 
-    # Fallback defensivo: si en el futuro se agrega otro tipo de HITL,
-    # el operador puede verlo y responder sin romper el contrato.
     print(f"  [r] Rechazar HITL de tipo desconocido: {tipo}")
     return {"aprobado": False, "nota": "HITL no reconocido por el operador"}
 
 
 def drenar_interrupts(config: dict, pendientes: list | None = None) -> dict | None:
-    """Resuelve todos los interrupts pendientes de un hilo.
-
-    Args:
-        config:     config del hilo (con thread_id).
-        pendientes: lista de interrupts ya consultada por el llamador, para
-                    ahorrar un round-trip al checkpointer. Si es None, se
-                    consulta aquí.
-
-    Devuelve el último resultado del grafo tras cerrar los HITLs, o None
-    si no había interrupts pendientes. Cada resultado intermedio ya se
-    imprime aquí (para que el operador vea la respuesta post-aprobación).
-
-    Protección anti loop-infinito: si tras MAX_RONDAS_RESUME rondas de
-    reanudación sigue habiendo interrupts (un nodo de resume que falla
-    siempre), se aborta y el hilo queda en pausa para revisión manual.
-    """
     ultimo_resultado = None
     rondas = 0
     interrupts = pendientes if pendientes is not None else _pending_interrupts(config)
@@ -179,8 +164,6 @@ def main():
     print(f"🧵 thread_id: {thread_id}")
     print("    Usa /cargar <thread_id> para retomar una conversación.\n")
 
-    # Si arrancamos con un thread que ya tenía un HITL pendiente, lo drenamos.
-    # (Con un UUID nuevo esto es un no-op, pero lo dejamos por robustez.)
     drenar_interrupts(config)
 
     while True:
@@ -211,10 +194,9 @@ def main():
 
             candidato_id = partes[1].strip()
             candidato_config = make_config(candidato_id)
-            st = _estado_hilo(candidato_config)
+            valores = _estado_hilo(candidato_config)
 
-            # Validación: typo o id inexistente → no cambiar de hilo a ciegas.
-            if not st:
+            if not valores:
                 print(
                     f"⚠️  '{candidato_id}' no existe en el checkpointer. "
                     "Si continúas, se creará como hilo nuevo al primer mensaje."
@@ -228,30 +210,15 @@ def main():
             config = candidato_config
 
             print(f"🧵 Hilo cargado: {thread_id}")
-            if st.get("intake_activo"):
-                print("   ℹ️  Este hilo tiene una ficha de intake en curso.")
-            elif st.get("recolectando_datos_agenda"):
-                print("   ℹ️  Este hilo estaba capturando datos de agendamiento.")
-            elif st.get("esperando_eleccion_horario"):
-                print("   ℹ️  Este hilo estaba eligiendo un horario disponible.")
+            if aviso := _resumen_subflujo(valores):
+                print(f"   ℹ️  {aviso}")
 
             drenar_interrupts(config)
             print()
             continue
 
-        # ------------------------------------------------------------------
-        # 1. Drenar HITLs viejos antes de meter un mensaje nuevo.
-        #    Si el hilo estaba interrumpido e ignoramos esto, LangGraph
-        #    lanzaría un error al recibir input normal en vez de Command(resume).
-        # ------------------------------------------------------------------
         drenar_interrupts(config)
 
-        # ------------------------------------------------------------------
-        # 2. Enviar el mensaje del cliente.
-        #    Nota: ya NO pasamos "query": query. receive_message lo deriva del
-        #    último mensaje humano. thread_id sí se mantiene en el state porque
-        #    varios nodos lo usan (handoff, expediente).
-        # ------------------------------------------------------------------
         try:
             result = agent_graph.invoke(
                 {"messages": [("human", query)], "thread_id": thread_id},
@@ -265,11 +232,6 @@ def main():
             )
             continue
 
-        # ------------------------------------------------------------------
-        # 3. Si el último nodo disparó un HITL nuevo, lo resolvemos pasando la
-        #    lista ya consultada (ahorra un segundo get_state al checkpointer).
-        #    Si no, mostramos la respuesta normal del grafo.
-        # ------------------------------------------------------------------
         pendientes = _pending_interrupts(config)
         if pendientes:
             drenar_interrupts(config, pendientes=pendientes)

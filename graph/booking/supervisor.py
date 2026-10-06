@@ -1,8 +1,9 @@
 """graph/booking/supervisor.py — Routing interno del sub-flujo.
 
-v3.1 — Guard defensivo: si en propuesta faltan datos de contacto, se
-  reinicia el wizard de captura en lugar de confirmar con datos vacíos.
+v3.2 — FIX: reconoce acción 'iniciar_wizard' y stage=None para iniciar
+  la cadena de captura antes de cualquier otra ruta.
 """
+
 import logging
 
 from core.contracts import AgentState
@@ -32,6 +33,10 @@ def route_booking(state: AgentState) -> str:
     d = state.get("booking_decision") or {}
     accion = d.get("accion")
     stage = state.get("booking_stage")
+
+    # 0) FIX v3.2: primer ingreso o reinicio del wizard → capturar datos primero
+    if accion == "iniciar_wizard" or stage is None:
+        return _siguiente_captura(state)
 
     # 1) Anti-loop
     if (state.get("booking_attempts") or 0) >= BOOKING_MAX_ATTEMPTS:
