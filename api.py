@@ -322,12 +322,20 @@ class HITLDecision(BaseModel):
 async def debug_routes():
     routes = []
     for r in app.routes:
+        # Los routers incluidos no tienen 'path'; son contenedores de rutas
+        if not hasattr(r, "path"):
+            continue
         routes.append({
-            "path": r.path,
-            "name": r.name,
-            "methods": list(r.methods) if hasattr(r, "methods") else []
+            "path": getattr(r, "path", ""),
+            "name": getattr(r, "name", ""),
+            "methods": list(getattr(r, "methods", [])),
         })
-    return {"total": len(routes), "routes": [r for r in routes if r["path"].startswith("/api") or r["path"].startswith("/webhook")]}
+
+    return {
+        "total": len(routes),
+        "routes": [r for r in routes if r["path"].startswith(("/api", "/webhook"))]
+    }
+
 
 
 @app.get("/api/debug/ping")
