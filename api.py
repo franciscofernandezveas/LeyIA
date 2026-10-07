@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # api.py - FastAPI Server para LeyIA (Agente de soporte Manzzo y Cía)
-# v1.0.0 - Capa HTTP/SSE sobre agent_graph (LangGraph) + Auth propio + HITL web
+# v1.0.0 - Capa HTTP/SSE sobre agent_graph (LangGraph) + Auth propio + HITL web + WhatsApp
 #
 # A diferencia de la CLI (main.py), aquí CLIENTE y OPERADOR son personas
 # distintas: el HITL NO se resuelve dentro del chat, se notifica por SSE
 # (evento "hitl") y se resuelve con POST /api/v1/hitl/resume.
+# Además se expone el webhook de WhatsApp en /webhook/whatsapp como monolito.
 
 # ============================================================================
 # 0. CARGAR .env ANTES DE CUALQUIER IMPORT PESADO
@@ -152,7 +153,7 @@ ALLOWED_ORIGINS = [
 app = FastAPI(
     title="LeyIA - API",
     version="1.0.0",
-    description="API del agente de soporte Manzzo y Cía (LangGraph + HITL + SSE streaming)",
+    description="API del agente de soporte Manzzo y Cía (LangGraph + HITL + SSE streaming + WhatsApp)",
 )
 
 app.add_middleware(
@@ -175,6 +176,11 @@ async def log_requests(request: Request, call_next):
 # REGISTRO DE RUTAS
 logger.info("Registrando routers...")
 app.include_router(auth_router)
+
+# Webhook público de WhatsApp (no requiere auth; la seguridad es la firma HMAC de Meta)
+from integrations.whatsapp.router import router as whatsapp_router
+app.include_router(whatsapp_router)
+logger.info("✅ WhatsApp webhook router registrado en /webhook/whatsapp")
 
 # ============================================================================
 # 3. SESIONES POR USUARIO (thread_id del checkpointer)
@@ -321,7 +327,7 @@ async def debug_routes():
             "name": r.name,
             "methods": list(r.methods) if hasattr(r, "methods") else []
         })
-    return {"total": len(routes), "routes": [r for r in routes if r["path"].startswith("/api")]}
+    return {"total": len(routes), "routes": [r for r in routes if r["path"].startswith("/api") or r["path"].startswith("/webhook")]}
 
 
 @app.get("/api/debug/ping")
@@ -504,7 +510,7 @@ async def stream_chat(
 
 
 # ============================================================================
-# 9. HITL (ROL OPERADOR)
+# 9. HITL (ROL OPERADOR) - AHORA TAMBIÉN RESUELVE HILOS DE WHATSAPP
 # ============================================================================
 
 @app.get("/api/v1/hitl/pending")
@@ -526,6 +532,7 @@ async def hitl_pending(user: User = Depends(get_current_user)):
 @app.post("/api/v1/hitl/resume")
 async def hitl_resume(
     body: HITLDecision,
+    thread_id: Optional[str] = Query(None, description="Thread externo, ej. wa-56912345678"),
     user: User = Depends(get_current_user),
 ):
     """Aprueba o rechaza el HITL pendiente (ej. crear evento en Google Calendar).
@@ -534,11 +541,20 @@ async def hitl_resume(
       aprobar  → {"aprobado": True}
       rechazar → {"aprobado": False, "nota": "..."}
     Se resuelve UN interrupt por llamada; si quedan más, vienen en "pending".
+
+    NUEVO: si se pasa thread_id (por ejemplo wa-56912345678), el operador
+    puede resolver HITLs de conversaciones de WhatsApp. La respuesta se
+    envía de vuelta al cliente por WhatsApp automáticamente.
     """
     if not AGENT_AVAILABLE:
         raise HTTPException(status_code=503, detail="Agente LeyIA no disponible")
 
-    thread_id = SESSIONS.get(user.id, {}).get("thread_id")
+    # Si no viene thread_id externo, usamos el del operador logueado (chat web)
+    if thread_id:
+        logger.info(f"Operador {user.email} resolviendo HITL de thread externo: {thread_id}")
+    else:
+        thread_id = SESSIONS.get(user.id, {}).get("thread_id")
+
     if not thread_id:
         raise HTTPException(status_code=404, detail="El usuario no tiene hilo activo")
 
@@ -550,7 +566,7 @@ async def hitl_resume(
     actual = _serialize_interrupt(pendientes[0])
     logger.info(
         f"⏸️ Resolviendo HITL | tipo={actual.get('tipo')} | "
-        f"aprobado={body.aprobado} | user={user.email}"
+        f"aprobado={body.aprobado} | user={user.email} | thread={thread_id}"
     )
 
     if body.aprobado:
@@ -575,6 +591,16 @@ async def hitl_resume(
             f"Aún quedan {len(restantes)} interrupt(s) tras el resume "
             f"(máx. protección CLI: {MAX_RONDAS_RESUME} rondas)"
         )
+
+    # Si el thread resuelto es de WhatsApp, enviar la respuesta al cliente
+    if thread_id.startswith("wa-") and values.get("response"):
+        try:
+            from integrations.whatsapp.client import send_text
+            customer_phone = thread_id[3:]  # wa-<número>
+            await send_text(to=customer_phone, body=values["response"])
+            logger.info(f"Respuesta HITL enviada por WhatsApp a {customer_phone}")
+        except Exception as e:
+            logger.error(f"No se pudo enviar respuesta HITL por WhatsApp: {e}", exc_info=True)
 
     return {
         "success": True,
@@ -793,7 +819,7 @@ async def metrics_overview(
 
 
 # ============================================================================
-# 11. MANEJO DE ERRORES Y LIFESPAN
+# 11. MANEJO DE ERRORES Y LIFESPAN (con reaper de WhatsApp)
 # ============================================================================
 
 @app.exception_handler(HTTPException)
@@ -819,7 +845,18 @@ async def lifespan(app: FastAPI):
     logger.info(f"🔍 LangSmith tracing: {'ACTIVO' if LANGSMITH_ENABLED else 'INACTIVO'} | "
                 f"project={os.getenv('LANGSMITH_PROJECT', 'leyia')}")
     logger.info(f"🤖 agent_graph: {'OK' if AGENT_AVAILABLE else 'NO DISPONIBLE'}")
+
+    from integrations.whatsapp.handler import reaper_loop
+    reaper = asyncio.create_task(reaper_loop())
+    logger.info("🔄 Reaper de WhatsApp iniciado")
+
     yield
+
+    reaper.cancel()
+    try:
+        await reaper
+    except asyncio.CancelledError:
+        pass
     logger.info("🛑 LeyIA API finalizada")
 
 app.router.lifespan_context = lifespan
