@@ -1,0 +1,9 @@
+# integrations/whatsapp/config.py
+import os
+
+VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
+APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "")
+ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
+PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
+API_VERSION = os.getenv("WHATSAPP_API_VERSION", "v21.0")
+OPERATOR_NUMBER = os.getenv("WHATSAPP_OPERATOR_NUMBER", "")
