@@ -3,24 +3,14 @@ import logging
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert
 
-from whatsapp.db.connection import async_session
-from whatsapp.db.models import MessageRecord
-from whatsapp.normalizer import WhatsAppMessage
+from .connection import async_session
+from .models import MessageRecord
+from ..normalizer import WhatsAppMessage
 
 logger = logging.getLogger(__name__)
 
 
 async def register_message(message: WhatsAppMessage) -> str:
-    """
-    Inserta el mensaje de forma atómica (seguro bajo reintentos de Meta
-    y concurrencia entre réplicas de la API).
-
-    Retorna el estado resultante:
-      "new"       → insertado ahora. El webhook debe encolarlo.
-      "pending"   → ya existía pero nunca se procesó.
-                    El webhook debe re-encolarlo.
-      "processed" → ya existía y el worker lo atendió. Ignorar.
-    """
     stmt = (
         insert(MessageRecord)
         .values(
@@ -51,10 +41,6 @@ async def register_message(message: WhatsAppMessage) -> str:
 
 
 async def mark_processed(whatsapp_message_id: str) -> None:
-    """
-    Llamado por el handler DESPUÉS de procesar exitosamente el mensaje,
-        dentro del lock de conversación.
-    """
     async with async_session() as session:
         await session.execute(
             update(MessageRecord)

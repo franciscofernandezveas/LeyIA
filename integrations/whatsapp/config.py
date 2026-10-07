@@ -1,4 +1,3 @@
-# integrations/whatsapp/config.py
 import os
 
 VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")

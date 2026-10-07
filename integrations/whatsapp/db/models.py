@@ -1,4 +1,3 @@
-# whatsapp/db/models.py
 import uuid
 from datetime import datetime
 
@@ -11,7 +10,7 @@ class Base(DeclarativeBase):
     pass
 
 
-class MessageRecord(Base):           # antes: Message
+class MessageRecord(Base):
     __tablename__ = "whatsapp_messages"
 
     id: Mapped[uuid.UUID] = mapped_column(

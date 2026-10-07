@@ -1,11 +1,7 @@
-from integrations.whatsapp.normalizer import WhatsAppMessage
+from .normalizer import WhatsAppMessage
 
 
 def parse_webhook_payload(payload: dict) -> list[WhatsAppMessage]:
-    """
-    El webhook de Meta puede traer varios entry/change/messages.
-    Los 'statuses' (entregado, leído) se ignoran.
-    """
     messages: list[WhatsAppMessage] = []
 
     for entry in payload.get("entry", []):

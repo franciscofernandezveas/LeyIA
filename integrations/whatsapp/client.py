@@ -1,10 +1,11 @@
+import logging
 import httpx
 
-from whatsapp.config import ACCESS_TOKEN, API_VERSION, PHONE_NUMBER_ID
+from .config import ACCESS_TOKEN, API_VERSION, PHONE_NUMBER_ID
 
+logger = logging.getLogger("leyia-whatsapp")
 API_BASE = "https://graph.facebook.com"
-
-MAX_WA_LEN = 4000  # WhatsApp corta ~4096 caracteres
+MAX_WA_LEN = 4000
 
 
 def _chunks(text: str):
@@ -27,7 +28,6 @@ async def _post(payload: dict) -> dict:
             json=payload,
         )
         if response.status_code >= 400:
-            logger = __import__("logging").getLogger("leyia-whatsapp")
             logger.error(f"WA API {response.status_code}: {response.text}")
         response.raise_for_status()
         return response.json()
@@ -52,5 +52,4 @@ async def mark_as_read(wamid: str) -> None:
             "message_id": wamid,
         })
     except Exception:
-        logger = __import__("logging").getLogger("leyia-whatsapp")
         logger.warning(f"mark_as_read falló para {wamid}", exc_info=True)

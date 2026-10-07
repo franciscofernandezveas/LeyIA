@@ -4,12 +4,13 @@ import logging
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 
-from whatsapp.config import APP_SECRET, VERIFY_TOKEN
-from whatsapp.handler import handle_messages
-from whatsapp.parser import parse_webhook_payload
-from whatsapp import verifier
+from .config import APP_SECRET, VERIFY_TOKEN
+from .handler import handle_messages
+from .parser import parse_webhook_payload
+from . import verifier
 
 logger = logging.getLogger("leyia-whatsapp")
+
 router = APIRouter(prefix="/webhook/whatsapp", tags=["whatsapp"])
 
 
@@ -39,6 +40,6 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
 
     messages = parse_webhook_payload(payload)
     if messages:
-        background_tasks.add_task(handle_messages, messages)  # Meta recibe su 200 ya
+        background_tasks.add_task(handle_messages, messages)
 
     return {"status": "ok"}
