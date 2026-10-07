@@ -9,11 +9,11 @@ from agent_runtime import (
     AGENT_AVAILABLE, graph_config, in_executor,
     invoke_sync, pending_interrupts, state_values,
 )
-from whatsapp.client import mark_as_read, send_text
-from whatsapp.db.connection import async_session
-from whatsapp.db.models import MessageRecord
-from whatsapp.db.repository import mark_processed, register_message
-from whatsapp.normalizer import WhatsAppMessage
+from .client import mark_as_read, send_text
+from .db.connection import async_session
+from .db.models import MessageRecord
+from .db.repository import mark_processed, register_message
+from .normalizer import WhatsAppMessage
 
 logger = logging.getLogger("leyia-whatsapp")
 
@@ -24,14 +24,14 @@ MSG_HITL = ("⏸️ Tu solicitud está pendiente de revisión por un abogado del
 MSG_ONLY_TEXT = "Por ahora solo puedo procesar mensajes de texto 🙏"
 MSG_ERROR = "Tuvimos un problema técnico. Inténtalo en unos minutos."
 
-_locks: dict[str, asyncio.Lock] = {}  # orden por conversación (válido con 1 réplica)
+_locks: dict[str, asyncio.Lock] = {}
 
 
 async def handle_messages(messages: list[WhatsAppMessage]) -> None:
     for msg in messages:
-        status = await register_message(msg)       # INSERT ON CONFLICT DO NOTHING
+        status = await register_message(msg)
         if status == "processed":
-            continue                                # reintento de Meta → ignorar
+            continue
 
         lock = _locks.setdefault(msg.customer_phone, asyncio.Lock())
         async with lock:
@@ -40,7 +40,6 @@ async def handle_messages(messages: list[WhatsAppMessage]) -> None:
                 await mark_processed(msg.message_id)
             except Exception:
                 logger.exception("Fallo procesando %s", msg.message_id)
-                # queda 'pending' → lo recoge el reaper
 
 
 async def process_message(msg: WhatsAppMessage) -> None:
@@ -56,10 +55,9 @@ async def run_agent(wa_id: str, text: str, name: str | None) -> str:
     if not AGENT_AVAILABLE:
         return MSG_ERROR
 
-    thread_id = f"wa-{wa_id}"          # determinístico: el checkpointer lo persiste
+    thread_id = f"wa-{wa_id}"
     config = graph_config(thread_id, user_id=wa_id, channel="whatsapp")
 
-    # Misma regla que tu chat web: con HITL pendiente no entran mensajes nuevos
     if await in_executor(pending_interrupts, config):
         return MSG_HITL
 
@@ -77,8 +75,6 @@ async def run_agent(wa_id: str, text: str, name: str | None) -> str:
     return values.get("response") or "No pude generar una respuesta, ¿puedes repetir tu consulta?"
 
 
-# ---- Reaper: recupera mensajes 'pending' huérfanos ----
-
 async def reaper_loop() -> None:
     while True:
         try:
@@ -91,7 +87,6 @@ async def reaper_loop() -> None:
 async def _recover_pending() -> None:
     now = datetime.now(timezone.utc)
     async with async_session() as session:
-        # dar por muertos los que llevan >1h pending
         await session.execute(
             update(MessageRecord)
             .where(MessageRecord.status == "pending",
