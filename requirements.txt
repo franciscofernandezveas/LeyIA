@@ -19,3 +19,11 @@ google-auth
 sqlalchemy>=2.0.0
 psycopg2-binary>=2.9.0
 supabase>=2.0.0
+sqlalchemy[asyncio]>=2.0
+greenlet>=3.0
+asyncpg>=0.28
+httpx>=0.24
+pydantic>=2.0
+fastapi>=0.100
+uvicorn[standard]>=0.23
+python-dotenv>=1.0
