@@ -47,6 +47,7 @@ google-auth
 sqlalchemy>=2.0.0
 sqlalchemy[asyncio]>=2.0
 psycopg>=3.1.0
+psycopg-pool>=3.1.0
 asyncpg>=0.28
 greenlet>=3.0
 
@@ -54,4 +55,3 @@ greenlet>=3.0
 # Supabase (métricas y auth opcional)
 # =========================
 supabase>=2.0.0
-psycopg2-binary>=2.9.0

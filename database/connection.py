@@ -1,7 +1,8 @@
 import os
 import re
-import psycopg2
-from psycopg2.pool import SimpleConnectionPool
+
+import psycopg
+from psycopg_pool import ConnectionPool
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -22,42 +23,43 @@ if not DATABASE_URL or "tu-database-url" in DATABASE_URL.lower():
 
     DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
-# Asegurar prefijo postgresql://
+# Normalizar prefijo
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-_pool = None
+# Eliminar pgbouncer=true si viene (no compatible con psycopg3 directo)
+if "?pgbouncer=true" in DATABASE_URL:
+    DATABASE_URL = DATABASE_URL.replace("?pgbouncer=true", "")
+if "&pgbouncer=true" in DATABASE_URL:
+    DATABASE_URL = DATABASE_URL.replace("&pgbouncer=true", "")
+if DATABASE_URL.endswith("?"):
+    DATABASE_URL = DATABASE_URL[:-1]
+
+_pool: ConnectionPool | None = None
 
 
-def _get_pool():
+def _get_pool() -> ConnectionPool:
     global _pool
     if _pool is None:
-        _pool = SimpleConnectionPool(
-            minconn=1,
-            maxconn=20,
-            dsn=DATABASE_URL,
+        _pool = ConnectionPool(
+            conninfo=DATABASE_URL,
+            min_size=1,
+            max_size=20,
+            open=True,
         )
     return _pool
 
 
-def get_connection():
-    conn = _get_pool().getconn()
-
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT 1")
-    except Exception:
-        conn = psycopg2.connect(DATABASE_URL)
-
-    return conn
+def get_connection() -> psycopg.Connection:
+    return _get_pool().getconn()
 
 
-def release_connection(conn):
+def release_connection(conn: psycopg.Connection) -> None:
     _get_pool().putconn(conn)
 
 
-def close_all_connections():
+def close_all_connections() -> None:
     global _pool
     if _pool:
-        _pool.closeall()
+        _pool.close()
         _pool = None

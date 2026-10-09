@@ -1,7 +1,7 @@
 from contextlib import contextmanager
 from typing import Optional
 
-from psycopg2.extras import RealDictCursor
+from psycopg.rows import dict_row
 
 from database.connection import get_connection, release_connection
 
@@ -12,7 +12,7 @@ def db_cursor(commit: bool = False):
     cursor = None
     try:
         conn = get_connection()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor = conn.cursor(row_factory=dict_row)
         yield cursor
         if commit:
             conn.commit()
