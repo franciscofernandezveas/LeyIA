@@ -11,7 +11,9 @@ from agent_runtime import (
     AGENT_AVAILABLE, graph_config, in_executor,
     invoke_sync, pending_interrupts, state_values,
 )
-from .client import mark_as_read, send_text
+from .client import (
+    MAX_INTERACTIVE_BODY, mark_as_read, send_interactive, send_text,
+)
 from .db.connection import async_session
 from .db.models import MessageRecord
 from .db.repository import mark_processed, register_message
@@ -25,6 +27,8 @@ MSG_HITL = ("⏸️ Tu solicitud está pendiente de revisión por un abogado del
             "Te escribiremos apenas sea resuelta.")
 MSG_ONLY_TEXT = "Por ahora solo puedo procesar mensajes de texto 🙏"
 MSG_ERROR = "Tuvimos un problema técnico. Inténtalo en unos minutos."
+
+PROCESSABLE_TYPES = ("text", "interactive")
 
 _locks: dict[str, asyncio.Lock] = {}
 
@@ -90,24 +94,24 @@ async def process_message(msg: WhatsAppMessage) -> None:
     Responde al cliente y, solo si todo sale bien, marca el mensaje como leído.
     Esto evita POSTs a Facebook en cada reintento fallido.
     """
-    if msg.message_type != "text" or not msg.text:
+    if msg.message_type not in PROCESSABLE_TYPES or not msg.text:
         await send_text(msg.customer_phone, MSG_ONLY_TEXT)
     else:
         reply = await run_agent(msg.customer_phone, msg.text, msg.customer_name)
-        await send_text(msg.customer_phone, reply)
+        await _deliver(msg.customer_phone, reply)
 
     await mark_as_read(msg.message_id)
 
 
-async def run_agent(wa_id: str, text: str, name: str | None) -> str:
+async def run_agent(wa_id: str, text: str, name: str | None) -> dict:
     if not AGENT_AVAILABLE:
-        return MSG_ERROR
+        return {"text": MSG_ERROR, "interactive": None}
 
     thread_id = f"wa-{wa_id}"
     config = graph_config(thread_id, user_id=wa_id, channel="whatsapp")
 
     if await in_executor(pending_interrupts, config):
-        return MSG_HITL
+        return {"text": MSG_HITL, "interactive": None}
 
     payload = {"messages": [("human", text)], "thread_id": thread_id}
     await in_executor(invoke_sync, payload, config)
@@ -119,10 +123,38 @@ async def run_agent(wa_id: str, text: str, name: str | None) -> str:
                 OPERATOR_NUMBER,
                 f"⚖️ HITL de {name or wa_id} ({thread_id}). Revísalo en el dashboard.",
             )
-        return MSG_HITL
+        return {"text": MSG_HITL, "interactive": None}
 
     values = await in_executor(state_values, config)
-    return values.get("response") or "No pude generar una respuesta, ¿puedes repetir tu consulta?"
+    return {
+        "text": values.get("response")
+                or "No pude generar una respuesta, ¿puedes repetir tu consulta?",
+        "interactive": values.get("response_interactive"),
+    }
+
+
+async def _deliver(to: str, reply: dict) -> None:
+    text = (reply.get("text") or "").strip()
+    interactive = reply.get("interactive")
+
+    if not interactive:
+        if text:
+            await send_text(to, text)
+        return
+
+    try:
+        # Body del interactivo: máx 1024 chars.
+        # Si la respuesta cabe, viaja como body; si no, texto previo + interactivo.
+        if text and len(text) <= MAX_INTERACTIVE_BODY:
+            await send_interactive(to, text, interactive)
+        else:
+            if text:
+                await send_text(to, text)
+            await send_interactive(to, "Elige una opción 👇", interactive)
+    except ValueError:
+        logger.warning("interactive inválido, fallback a texto", exc_info=True)
+        if text:
+            await send_text(to, text)
 
 
 async def reaper_loop() -> None:
