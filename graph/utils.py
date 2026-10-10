@@ -294,3 +294,10 @@ def _upsert_conversacion_abierta(thread_id: str) -> None:
         channel=_canal_desconocido(thread_id),
         status="abierto",
     )
+_ABORT_BOOKING = ("no quiero", "mejor no", "olvídalo", "olvidalo",
+                  "dejalo", "déjalo", "ya no me interesa")
+
+
+def _parece_abort(query: str) -> bool:
+    q = query.lower()
+    return any(p in q for p in _ABORT_BOOKING)

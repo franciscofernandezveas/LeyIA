@@ -28,10 +28,12 @@ from core.llm import LLM, with_structured_output
 from core.notifications import notificar_email
 from graph.utils import (
     _ahora_iso, _cfg, _expirado, _ficha_intake, _format_few_shots,
-    _guardar_ai, _norm_simple, _persist_escalation, _primer_nombre,
-    _recent_messages, _telefono_cliente, _transcript_resumen, _upsert_conversacion_abierta,
-    _wa_link_cliente, _wa_link_display,
+    _guardar_ai, _norm_simple, _parece_abort, _persist_escalation,
+    _primer_nombre, _recent_messages, _telefono_cliente,
+    _transcript_resumen, _upsert_conversacion_abierta, _wa_link_cliente,
+    _wa_link_display,
 )
+
 from tools.notify_whatsapp import WHATSAPP_EJECUTIVA, notificar_escalamiento
 
 logger = logging.getLogger(__name__)
@@ -41,8 +43,7 @@ WA_TEXTO_MAX = 900
 _AGENDAR_CTA = ("agendar una hora", "agendar", "agendar ahora",
                 "agendar hora", "quiero agendar", "quiero agendar una hora")
 
-_ABORT_BOOKING = ("no quiero", "mejor no", "olvídalo", "olvidalo",
-                  "dejalo", "déjalo", "ya no me interesa")
+
 
 _EMAIL_BUSCA = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 _NOMBRE_RE = re.compile(
@@ -361,6 +362,3 @@ def handoff_humano(state: AgentState) -> AgentState:
     }
 
 
-def _parece_abort(query: str) -> bool:
-    q = query.lower()
-    return any(p in q for p in _ABORT_BOOKING)
