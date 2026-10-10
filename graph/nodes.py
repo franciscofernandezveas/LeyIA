@@ -273,7 +273,6 @@ def _telefono_cliente(state: AgentState) -> str | None:
     tid = state.get("thread_id") or ""
     return tid if re.fullmatch(r"\+?\d{8,15}", tid) else None
 
-
 def _precaptura_contacto(state: AgentState) -> dict | None:
     """Llena nombre/email del mensaje actual sin depender del routing.
     No persiste: solo alimenta intake_respuestas en memoria."""
@@ -286,11 +285,10 @@ def _precaptura_contacto(state: AgentState) -> dict | None:
             resp["nombre"] = " ".join(p.capitalize() for p in palabras)
 
     if "email" not in resp and (m := _EMAIL_BUSCA.search(q)):
-        e = m.group(0).lower().replace(" ", "")
-        if EMAIL_RE.fullmatch(e):
-            resp["email"] = e
+        resp["email"] = m.group(0).lower().replace(" ", "")
 
     return resp if resp != (state.get("intake_respuestas") or {}) else None
+
 
 
 def _canal_desconocido(thread_id: str | None) -> str:
