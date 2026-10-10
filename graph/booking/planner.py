@@ -22,7 +22,7 @@ from datetime import datetime
 
 from core.contracts import AgentState
 from core.llm import LLM
-from graph.nodes import _ahora_iso, _parse_dt, _parece_abort
+from graph.utils import _ahora_iso, _parse_dt, _parece_abort
 from graph.slot_match import extraer_dias_offset, match_slot
 from tools.google_calendar import TZ as GCAL_TZ
 
