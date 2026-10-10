@@ -1,7 +1,8 @@
 import uuid
 from datetime import datetime
+from typing import Optional
 
-from sqlalchemy import DateTime, String, Text, func
+from sqlalchemy import DateTime, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -27,3 +28,10 @@ class MessageRecord(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+    # Nuevas columnas para control de reintentos del Reaper
+    retries: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_attempted_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    failed_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

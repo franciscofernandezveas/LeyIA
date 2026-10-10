@@ -1,9 +1,11 @@
 import asyncio
 import logging
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select, update
+import httpx
+from sqlalchemy import or_, select, update
 
 from agent_runtime import (
     AGENT_AVAILABLE, graph_config, in_executor,
@@ -26,6 +28,24 @@ MSG_ERROR = "Tuvimos un problema técnico. Inténtalo en unos minutos."
 
 _locks: dict[str, asyncio.Lock] = {}
 
+# --- Configuración del Reaper ---
+MAX_REAPER_RETRIES = 3
+REAPER_BACKOFF_SECONDS = 120
+NON_RETRYABLE_STATUS = "dead_letter"
+RETRYABLE_EXHAUSTED_STATUS = "failed"
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """
+    True para errores transitorios de red/rate-limit.
+    False para bugs de código (NameError, TypeError, AttributeError, etc.).
+    """
+    if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError)):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in (429, 500, 502, 503, 504)
+    return False
+
 
 async def handle_messages(messages: list[WhatsAppMessage]) -> None:
     for msg in messages:
@@ -38,17 +58,45 @@ async def handle_messages(messages: list[WhatsAppMessage]) -> None:
             try:
                 await process_message(msg)
                 await mark_processed(msg.message_id)
+                logger.info("Mensaje procesado %s", msg.message_id)
             except Exception:
                 logger.exception("Fallo procesando %s", msg.message_id)
+                # Registrar el intento fallido para que el Reaper respete backoff
+                await _bump_failure_attempt(msg.message_id)
+
+
+async def _bump_failure_attempt(message_id: str) -> None:
+    """Incrementa retries/last_attempted_at sin cambiar el status."""
+    try:
+        async with async_session() as session:
+            row = (
+                await session.execute(
+                    select(MessageRecord).where(
+                        MessageRecord.whatsapp_message_id == message_id
+                    )
+                )
+            ).scalar_one_or_none()
+
+            if row:
+                row.retries = (row.retries or 0) + 1
+                row.last_attempted_at = datetime.now(timezone.utc)
+                await session.commit()
+    except Exception:
+        logger.exception("No se pudo registrar intento fallido para %s", message_id)
 
 
 async def process_message(msg: WhatsAppMessage) -> None:
-    await mark_as_read(msg.message_id)
+    """
+    Responde al cliente y, solo si todo sale bien, marca el mensaje como leído.
+    Esto evita POSTs a Facebook en cada reintento fallido.
+    """
     if msg.message_type != "text" or not msg.text:
         await send_text(msg.customer_phone, MSG_ONLY_TEXT)
-        return
-    reply = await run_agent(msg.customer_phone, msg.text, msg.customer_name)
-    await send_text(msg.customer_phone, reply)
+    else:
+        reply = await run_agent(msg.customer_phone, msg.text, msg.customer_name)
+        await send_text(msg.customer_phone, reply)
+
+    await mark_as_read(msg.message_id)
 
 
 async def run_agent(wa_id: str, text: str, name: str | None) -> str:
@@ -67,8 +115,10 @@ async def run_agent(wa_id: str, text: str, name: str | None) -> str:
     pendings = await in_executor(pending_interrupts, config)
     if pendings:
         if OPERATOR_NUMBER:
-            await send_text(OPERATOR_NUMBER,
-                            f"⚖️ HITL de {name or wa_id} ({thread_id}). Revísalo en el dashboard.")
+            await send_text(
+                OPERATOR_NUMBER,
+                f"⚖️ HITL de {name or wa_id} ({thread_id}). Revísalo en el dashboard.",
+            )
         return MSG_HITL
 
     values = await in_executor(state_values, config)
@@ -86,19 +136,41 @@ async def reaper_loop() -> None:
 
 async def _recover_pending() -> None:
     now = datetime.now(timezone.utc)
+
     async with async_session() as session:
+        # Mensajes muy antiguos que nadie pudo recuperar
         await session.execute(
             update(MessageRecord)
-            .where(MessageRecord.status == "pending",
-                   MessageRecord.created_at < now - timedelta(hours=1))
-            .values(status="failed")
+            .where(
+                MessageRecord.status == "pending",
+                MessageRecord.created_at < now - timedelta(hours=1),
+            )
+            .values(status=RETRYABLE_EXHAUSTED_STATUS)
         )
-        rows = (await session.execute(
-            select(MessageRecord)
-            .where(MessageRecord.status == "pending",
-                   MessageRecord.created_at < now - timedelta(seconds=90))
-            .limit(20)
-        )).scalars().all()
+
+        # Seleccionar candidatos con backoff y límite de reintentos
+        rows = (
+            await session.execute(
+                select(MessageRecord)
+                .where(
+                    MessageRecord.status == "pending",
+                    MessageRecord.created_at < now - timedelta(seconds=90),
+                    MessageRecord.retries < MAX_REAPER_RETRIES,
+                    or_(
+                        MessageRecord.last_attempted_at.is_(None),
+                        MessageRecord.last_attempted_at
+                        < now - timedelta(seconds=REAPER_BACKOFF_SECONDS),
+                    ),
+                )
+                .order_by(MessageRecord.created_at)
+                .limit(20)
+            )
+        ).scalars().all()
+
+        # Registrar que vamos a intentarlos
+        for row in rows:
+            row.retries = (row.retries or 0) + 1
+            row.last_attempted_at = now
         await session.commit()
 
     for row in rows:
@@ -110,11 +182,37 @@ async def _recover_pending() -> None:
             text=row.content,
             timestamp="",
         )
+
         lock = _locks.setdefault(msg.customer_phone, asyncio.Lock())
         async with lock:
             try:
                 await process_message(msg)
                 await mark_processed(msg.message_id)
                 logger.info("Reaper recuperó %s", row.whatsapp_message_id)
-            except Exception:
+            except Exception as exc:
                 logger.exception("Reaper: sigue fallando %s", row.whatsapp_message_id)
+
+                # Errores no recuperables (bugs de código) van directo a dead_letter
+                if not _is_retryable(exc):
+                    await _mark_dead_letter(
+                        row.id,
+                        f"{type(exc).__name__}: {str(exc)[:200]}",
+                    )
+
+
+async def _mark_dead_letter(record_id: uuid.UUID, reason: str) -> None:
+    """Marca un mensaje como dead_letter para que no se reintente más."""
+    try:
+        async with async_session() as session:
+            await session.execute(
+                update(MessageRecord)
+                .where(MessageRecord.id == record_id)
+                .values(
+                    status=NON_RETRYABLE_STATUS,
+                    failed_reason=reason,
+                )
+            )
+            await session.commit()
+            logger.warning("Mensaje %s movido a dead_letter: %s", record_id, reason)
+    except Exception:
+        logger.exception("No se pudo marcar dead_letter para %s", record_id)

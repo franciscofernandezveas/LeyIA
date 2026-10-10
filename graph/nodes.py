@@ -10,6 +10,7 @@ v17 — Refactor crítico:
 """
 
 import logging
+import os
 import re
 
 from langchain_core.messages import AIMessage
@@ -39,6 +40,9 @@ from tools.notify_whatsapp import WHATSAPP_EJECUTIVA, notificar_escalamiento
 logger = logging.getLogger(__name__)
 
 WA_TEXTO_MAX = 900
+
+INTAKE_TTL_HORAS = int(os.getenv("INTAKE_TTL_HORAS", "24"))
+AGENDA_CAPTURA_TTL_HORAS = int(os.getenv("AGENDA_CAPTURA_TTL_HORAS", "2"))
 
 _AGENDAR_CTA = ("agendar una hora", "agendar", "agendar ahora",
                 "agendar hora", "quiero agendar", "quiero agendar una hora")
@@ -360,5 +364,3 @@ def handoff_humano(state: AgentState) -> AgentState:
         "notificacion_pendiente": not (notificacion_ok or email_ok),
         "messages": [AIMessage(content=response)],
     }
-
-

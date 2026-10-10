@@ -46,7 +46,8 @@ google-auth
 # =========================
 sqlalchemy>=2.0.0
 sqlalchemy[asyncio]>=2.0
-psycopg>=3.1.0
+psycopg[binary]>=3.1
+
 psycopg-pool>=3.1.0
 asyncpg>=0.28
 greenlet>=3.0

@@ -13,7 +13,7 @@ País: Chile
 SECCIÓN 1: INFORMACIÓN GENERAL DE LA FIRMA
 --------------------------------------------------------------------------------
 
-¿Quién es Manzzo y Cía?
+¿Que es Manzzo y Cía?
 Manzzo y Cía es una firma de abogados chilena especializada en Derecho de 
 Familia, con un enfoque estratégico que prioriza los derechos de sus clientes 
 y el bienestar de sus familias. Además, ofrecen asesoría y representación 

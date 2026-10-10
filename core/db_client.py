@@ -8,6 +8,11 @@ Persiste:
   - bookings: citas creadas en Google Calendar
 
 Todas las operaciones son best-effort: no lanzan excepción hacia el grafo.
+
+Nota driver: psycopg3. Tras el pooler en modo transacción los prepared
+ statements colisionan entre sesiones (DuplicatePreparedStatement), por eso
+el engine se crea con prepare_threshold=None — mismo criterio que
+core.persistence.build_postgres_checkpointer.
 """
 import json
 import logging
@@ -32,9 +37,9 @@ def _get_engine() -> Engine:
         if not raw:
             raise RuntimeError("DATABASE_URL no está configurada")
 
-        # Supabase a veces añade ?pgbouncer=true; psycopg2 no lo entiende.
+        # Supabase añade ?pgbouncer=true en la URL del pooler; psycopg no lo entiende.
         cleaned = raw.replace("?pgbouncer=true", "").replace("&pgbouncer=true", "")
-        if "?" in cleaned and cleaned.endswith("?"):
+        if cleaned.endswith("?"):
             cleaned = cleaned[:-1]
 
         _engine = create_engine(
@@ -44,6 +49,10 @@ def _get_engine() -> Engine:
             max_overflow=10,
             pool_pre_ping=True,
             pool_recycle=3600,
+            # psycopg3: nunca preparar statements en el servidor; tras el
+            # pooler (modo transacción) los backends compartidos ya tienen
+            # nombres como _pg3_0 ocupados → DuplicatePreparedStatement.
+            connect_args={"prepare_threshold": None},
         )
     return _engine
 
