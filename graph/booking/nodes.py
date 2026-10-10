@@ -1,5 +1,6 @@
 """graph/booking/nodes.py — Acciones del sub-agente BOOKING.
 
+v7.1 — Importa helpers desde graph/utils.py (rompe ciclo graph.nodes↔booking).
 v7 — Botones interactivos de horarios:
   - `_interactive_slots` genera payload declarativo (botones nativos si
     ≤3 horarios, lista nativa si 4-10). Fallback visual para canales que
@@ -31,7 +32,7 @@ from core.contracts import AgentState, EMAIL_RE, HitlPayload, TipoHITL
 from core.db_client import insert_booking, upsert_conversation, upsert_lead
 
 from core.llm import LLM
-from graph.nodes import (
+from graph.utils import (
     _cfg, _guardar_ai, _parse_dt, _primer_nombre, _telefono_cliente,
 )
 from tools.google_calendar import (
@@ -86,7 +87,6 @@ def _interactive_slots(slots: list) -> dict | None:
             "description": f"Asesoría a las {s.strftime('%H:%M')} hrs",
         })
 
-    # WhatsApp lista soporta hasta 10 opciones; botones hasta 3.
     if len(options) > 10:
         options = options[:10]
 

@@ -1,13 +1,13 @@
 """graph/intake/nodes.py — Acciones del sub-agente INTAKE.
 
-v12 — Pausa real:
-  - Nodo pausar_ficha: detiene la ficha y espera al próximo mensaje.
-  - El padre (graph/nodes.py) detecta intake_exit == "pausa" y reanuda
-    con intake_resume=True al recibir un nuevo mensaje del cliente.
-
-v11 — UX conversacional fluida:
-  - Multi-burbuja, acuse de recibo, progreso con contenido, errores
-    humanizados, reanudar con puente a la duda, cierre con CTA.
+v13 — Refactor crítico:
+  - Rompe ciclo de importación (usa graph.utils en vez de graph.nodes).
+  - Elimina _CAMPOS_SOLO_EXTRACCION; todo campo acepta extracción LLM + fallback
+    validador directo (nombre ya no depende solo del LLM).
+  - intake_exit: 'agendar' alinea CTA de cierre con routing del padre.
+  - abandono/sin_consentimiento terminan el turno (intake_exit='end', closed=True).
+  - Eventos de negocio estructurados.
+  - Truncado defensivo de burbujas contra WA_TEXTO_MAX.
 """
 
 import logging
@@ -15,9 +15,10 @@ import unicodedata
 
 from langchain_core.messages import AIMessage
 
-from core.contracts import EMAIL_RE, AgentState, ROUTE_FAQ
+from core.contracts import EMAIL_RE, AgentState
 from core.db_client import upsert_lead
-from graph.nodes import (
+from graph.intake.utils import _evento_intake, _pack
+from graph.utils import (
     _ahora_iso, _cfg, _guardar_ai, _primer_nombre, _recent_messages,
     _telefono_cliente, _wa_link, _wa_link_diagnostico, _wa_link_display,
 )
@@ -37,7 +38,6 @@ RESPUESTAS_HUMANO = ("hablar con humano", "hablar con una persona",
                      "hablar con un humano", "hablar con una ejecutiva",
                      "hablar con la ejecutiva")
 
-_CAMPOS_SOLO_EXTRACCION = {"nombre"}
 
 DEFAULT_AP_IA = ("👋 ¡Hola! Soy el *asistente virtual* de Manzzo y Cía — "
                  "un sistema automatizado, no una persona, pero estoy aquí "
@@ -50,7 +50,7 @@ DEFAULT_AVISO_SALTAR = "Si prefieres no responder, escribe *saltar*."
 DEFAULT_ERROR_NO_SALTAR = ("Este dato sí lo necesito para poder derivar tu "
                            "caso 🙏 Si te complica, también puedes pedir "
                            "*hablar con una persona*.")
-DEFAULT_OFERTA = ("{nombre}este dato se nos está resistiendo 😅 ¿Qué "
+DEFAULT_OFERTA = ("{nombre}Este dato se nos está resistiendo 😅 ¿Qué "
                   "prefieres?\n• Te paso con una ejecutiva que lo toma "
                   "directamente contigo, o\n• lo intentamos una vez más.")
 DEFAULT_REANUDA = "¡Seguimos donde quedamos 💪!"
@@ -259,17 +259,6 @@ def _interactive_de(q: dict) -> dict | None:
     return q.get("interactive")
 
 
-def _pack(burbujas: list[str], interactive: dict | None = None) -> dict:
-    burbujas = [b for b in burbujas if b]
-    msg = "\n\n".join(burbujas)
-    return {
-        "response": msg,
-        "response_bubbles": burbujas,
-        "response_interactive": interactive,
-        "messages": [AIMessage(content=msg)],
-    }
-
-
 def _ack_campo(qid: str, respuestas: dict) -> str:
     nombre = _primer_nombre(respuestas.get("nombre"))
     if qid == "nombre":
@@ -357,8 +346,6 @@ def iniciar_ficha(state: AgentState) -> AgentState:
     if tel:
         respuestas["telefono"] = tel
 
-    # Precaptura nombre/email del mensaje que dispara el intake (ej:
-    # "Hola soy Juan Pérez, mi correo es jp@gmail.com")
     _aplicar_extraccion(respuestas, state.get("intake_decision") or {})
 
     pend = _pendientes(state, respuestas)
@@ -371,6 +358,7 @@ def iniciar_ficha(state: AgentState) -> AgentState:
     ]
     pack = _pack(burbujas, interactive=_interactive_de(q0))
     _guardar_ai(state, pack["response"])
+    _evento_intake("intake_iniciado", state, pregunta=q0["id"])
     return {
         **pack,
         "intake_activo": True,
@@ -422,16 +410,13 @@ def procesar_respuesta(state: AgentState) -> AgentState:
     else:
         _aplicar_extraccion(respuestas, decision)
         if q_actual["id"] not in respuestas:
-            if q_actual["id"] in _CAMPOS_SOLO_EXTRACCION:
+            val, err = q_actual["validate"](raw)
+            if err:
+                logger.info("[intake] validador rechazó %s: %s",
+                            q_actual["id"], err)
                 error_key = "retry"
             else:
-                val, err = q_actual["validate"](raw)
-                if err:
-                    logger.info("[intake] validador rechazó %s: %s",
-                                q_actual["id"], err)
-                    error_key = "retry"
-                else:
-                    respuestas[q_actual["id"]] = val
+                respuestas[q_actual["id"]] = val
 
     if respuestas.get("consentimiento_datos") is False:
         return sin_consentimiento(state, respuestas)
@@ -528,12 +513,15 @@ def _completar_ficha(state: AgentState, respuestas: dict) -> AgentState:
         logger.warning("upsert_lead (completado) falló: %s", e)
 
     _guardar_ai(state, pack["response"])
+    _evento_intake("intake_completado", state,
+                   respuestas_keys=list(respuestas.keys()),
+                   tiene_email=bool(respuestas.get("email")))
     return {
         **pack,
         "intake_activo": False,
         "intake_completado": True,
         "intake_respuestas": respuestas,
-        "intake_exit": "booking",
+        "intake_exit": "agendar",
         "intake_decision": None,
         "intake_stage": "completado",
         "intake_oferta_qid": None,
@@ -542,8 +530,10 @@ def _completar_ficha(state: AgentState, respuestas: dict) -> AgentState:
 
 def pausar_ficha(state: AgentState) -> AgentState:
     """El cliente pide pausa: detener la ficha y esperar al próximo mensaje."""
-    pack = _pack(["Perfecto, quedo aquí esperando. Cuando quiera retomar, me escribe 🤙"])
+    pack = _pack(["Perfecto, quedo aquí esperando. Cuando quieras retomar, "
+                  "solo escríbeme 🤙"])
     _guardar_ai(state, pack["response"])
+    _evento_intake("intake_pausado", state)
     return {
         **pack,
         "intake_activo": True,
@@ -557,6 +547,7 @@ def pausar_ficha(state: AgentState) -> AgentState:
 
 def pausar_para_faq(state: AgentState) -> AgentState:
     logger.info("[intake] duda lateral → pausa a FAQ")
+    _evento_intake("intake_duda_lateral", state)
     return {
         "intake_exit": "faq",
         "intake_resume": True,
@@ -605,6 +596,7 @@ def reanudar(state: AgentState) -> AgentState:
     pack = _pack([puente, _form_pregunta(state, q, respuestas, nombre)],
                  interactive=_interactive_de(q))
     _guardar_ai(state, pack["response"])
+    _evento_intake("intake_reanudado", state, pregunta=q["id"])
     return {**base, **pack}
 
 
@@ -626,6 +618,8 @@ def _derivar_parcial(state: AgentState, respuestas: dict) -> AgentState:
     _persistir_parcial(state, respuestas)
     pack = _pack([msg])
     _guardar_ai(state, pack["response"])
+    _evento_intake("intake_derivacion_parcial", state,
+                   respuestas_keys=list(respuestas.keys()))
     return {
         **pack,
         "intake_activo": False,
@@ -646,15 +640,17 @@ def abandonar_ficha(state: AgentState) -> AgentState:
     )
     pack = _pack([msg])
     _guardar_ai(state, pack["response"])
+    _evento_intake("intake_abandonado", state,
+                   respuestas_keys=list(respuestas.keys()))
     return {
         **pack,
         "intake_activo": False,
         "intake_completado": False,
-        "intake_exit": None,
+        "intake_exit": "end",
         "intake_stage": "abandonado",
         "intake_decision": None,
         "intake_oferta_qid": None,
-        "route": ROUTE_FAQ,
+        "closed": True,
     }
 
 
@@ -664,15 +660,16 @@ def sin_consentimiento(state: AgentState, respuestas: dict | None = None) -> Age
     )
     pack = _pack([msg])
     _guardar_ai(state, pack["response"])
+    _evento_intake("intake_sin_consentimiento", state)
     return {
         **pack,
         "intake_activo": False,
         "intake_completado": False,
         "intake_respuestas": (respuestas if respuestas is not None
                               else state.get("intake_respuestas")),
-        "intake_exit": None,
+        "intake_exit": "end",
         "intake_decision": None,
         "intake_stage": "sin_consentimiento",
         "intake_oferta_qid": None,
-        "route": ROUTE_FAQ,
+        "closed": True,
     }

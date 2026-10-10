@@ -1,26 +1,8 @@
 """graph/intake/planner.py — Planner semántico del sub-flujo de intake.
 
-v10 — Pausa real:
-  - Nuevo tipo "pausar": el cliente pide pausa, un momento, más tarde,
-    ahora no, continúo después → pausa la ficha y espera al próximo
-    mensaje para reanudar.
-  - Mantiene guardia determinista para botones de oferta y umbral por
-    reversibilidad.
-
-v9 — UX fluida:
-  - Guardia determinista (costo 0) para los botones de la oferta de salida:
-    "Hablar con humano" / "Lo intento de nuevo" se resuelven SIN LLM, así
-    una misclasificación jamás rompe la oferta activa.
-  - Umbral de confianza por REVERSIBILIDAD de la acción: derivar/abandonar
-    son irreversibles para el turno → exigen confianza ≥ 0,55; pausar a FAQ
-    es reversible (FAQ responde y reanudar retoma) → se permite con duda
-    razonable en vez de castigar el mensaje contra el validador del campo.
-  - Prompt: reconoce botones/listas ("Sí, autorizo", "No autorizo",
-    "Lo intento de nuevo", títulos de la lista de etapa), la petición de
-    pausa ("pausa", "un momento") y las correcciones de datos ya entregados.
-
-v8 — 1 llamada LLM por turno activo: decide el tipo de turno Y extrae los
-campos explícitos. Guardias estructurales deterministas; fallback clásico.
+v11 — Refactor:
+  - Usa graph.utils._recent_messages (rompe import cruzado con graph.nodes).
+  - Imports de .nodes movidos al tope (ya no hay ciclo).
 """
 import logging
 
@@ -28,9 +10,12 @@ from langchain_core.prompts import ChatPromptTemplate
 
 from core.contracts import AgentState
 from core.llm import with_structured_output
-from graph.nodes import _recent_messages
+from graph.utils import _recent_messages
 
 from .contracts import IntakeDecision
+from .nodes import (
+    QUESTIONS, RESPUESTAS_HUMANO, RESPUESTAS_REINTENTAR, _norm, _pendientes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +93,6 @@ def intake_planner(state: AgentState) -> AgentState:
 
     # --- guardia: botones de la oferta de salida activa (0 LLM) ---
     if state.get("intake_oferta_qid"):
-        from .nodes import RESPUESTAS_HUMANO, RESPUESTAS_REINTENTAR, _norm
         rn = _norm(state.get("query") or "")
         if rn in RESPUESTAS_HUMANO:
             return {"intake_decision": {"accion": "derivar_parcial"},
@@ -118,7 +102,6 @@ def intake_planner(state: AgentState) -> AgentState:
                     "intake_stage": "preguntando"}
 
     # --- turno activo: 1 LLM (decisión + extracción) ---
-    from .nodes import QUESTIONS, _pendientes  # import local (evita ciclo)
     pend = _pendientes(state, state.get("intake_respuestas") or {})
     if not pend:
         return {"intake_decision": {"accion": "procesar_respuesta"},
@@ -153,8 +136,6 @@ def intake_planner(state: AgentState) -> AgentState:
         "abandonar": "abandonar_ficha",
     }.get(dec.tipo, "procesar_respuesta")
 
-    # Umbral por reversibilidad: derivar/abandonar son irreversibles para
-    # el turno → exigen confianza; la pausa a FAQ es reversible y barata.
     if accion in ("derivar_parcial", "abandonar_ficha") and dec.confianza < 0.55:
         accion = "procesar_respuesta"
 

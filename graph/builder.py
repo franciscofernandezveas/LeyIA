@@ -1,13 +1,9 @@
 """graph/builder.py — Grafo padre con 3 sub-agentes especializados.
 
-v5.1 — FAQ puede derivar a intake (pedido de humano contextual) y, si la
-  ficha ya estaba completada, directo a handoff. También mantiene la
-  reanudación del intake tras duda lateral.
-
-v5 — Pausa lateral del intake:
-  - INTAKE → FAQ: el cliente hace una duda a mitad de ficha; FAQ responde.
-  - FAQ → INTAKE: tras la respuesta, intake re-anexa la pregunta pendiente.
-  Decisiones en graph.nodes.route_post_intake / route_post_faq.
+v5.2 — Compatibilidad con intake v13:
+  - route_post_intake puede devolver ROUTE_AGENDAR cuando el cierre del
+    intake ofrece el CTA de agendar.
+  - Mantiene FAQ → intake → handoff.
 """
 from langgraph.graph import END, START, StateGraph
 
@@ -58,11 +54,16 @@ def build_graph() -> StateGraph:
         workflow.add_edge(terminal, END)
 
     # Intake puede: pausar a FAQ (duda lateral), derivar a handoff
-    # (ficha completa o parcial) o terminar el turno.
+    # (ficha completa o parcial), pasar a agendar, o terminar el turno.
     workflow.add_conditional_edges(
         ROUTE_INTAKE,
         route_post_intake,
-        {ROUTE_FAQ: ROUTE_FAQ, ROUTE_HANDOFF: ROUTE_HANDOFF, END: END},
+        {
+            ROUTE_FAQ: ROUTE_FAQ,
+            ROUTE_AGENDAR: ROUTE_AGENDAR,
+            ROUTE_HANDOFF: ROUTE_HANDOFF,
+            END: END,
+        },
     )
 
     # FAQ: normalmente responde y cierra; si el intake estaba pausado, lo

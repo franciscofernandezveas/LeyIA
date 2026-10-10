@@ -1,8 +1,8 @@
-"""graph/intake/builder.py — Subgrafo especializado INTAKE (v9).
+"""graph/intake/builder.py — Subgrafo especializado INTAKE (v10).
 
 Flujo interno:
   START → intake_planner ─┬─ iniciar_ficha ─────── END
-                          ├─ procesar_respuesta ─ END      (padre: handoff)
+                          ├─ procesar_respuesta ─ END      (padre: handoff/agendar)
                           ├─ pausar_para_faq ──── END      (padre: FAQ → reanudar)
                           ├─ pausar_ficha ─────── END      (padre: espera próximo msg)
                           ├─ reanudar ─────────── END
@@ -21,36 +21,32 @@ from .nodes import (
 from .planner import intake_planner
 from .supervisor import route_intake
 
-_TERMINALES = (
-    "iniciar_ficha", "procesar_respuesta", "reanudar", "pausar_para_faq",
-    "pausar_ficha",
-    "derivar_parcial", "abandonar_ficha", "sin_consentimiento",
-)
+_NODOS = {
+    "iniciar_ficha": iniciar_ficha,
+    "procesar_respuesta": procesar_respuesta,
+    "reanudar": reanudar,
+    "pausar_para_faq": pausar_para_faq,
+    "pausar_ficha": pausar_ficha,
+    "derivar_parcial": derivar_parcial,
+    "abandonar_ficha": abandonar_ficha,
+    "sin_consentimiento": sin_consentimiento,
+}
 
 
 def build_intake_graph():
     b = StateGraph(AgentState)
 
     b.add_node("intake_planner", intake_planner)
-    for nombre in _TERMINALES:
-        b.add_node(nombre, {
-            "iniciar_ficha": iniciar_ficha,
-            "procesar_respuesta": procesar_respuesta,
-            "reanudar": reanudar,
-            "pausar_para_faq": pausar_para_faq,
-            "pausar_ficha": pausar_ficha,
-            "derivar_parcial": derivar_parcial,
-            "abandonar_ficha": abandonar_ficha,
-            "sin_consentimiento": sin_consentimiento,
-        }[nombre])
+    for nombre, fn in _NODOS.items():
+        b.add_node(nombre, fn)
 
     b.add_edge(START, "intake_planner")
     b.add_conditional_edges(
         "intake_planner",
         route_intake,
-        {nombre: nombre for nombre in _TERMINALES},
+        {nombre: nombre for nombre in _NODOS},
     )
-    for terminal in _TERMINALES:
+    for terminal in _NODOS:
         b.add_edge(terminal, END)
 
     return b.compile()

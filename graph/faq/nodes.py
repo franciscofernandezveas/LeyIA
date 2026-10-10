@@ -1,5 +1,6 @@
 """graph/faq/nodes.py — Acciones del sub-agente FAQ.
 
+v3.1 — Importa helpers desde graph/utils.py (rompe ciclo graph.nodes↔faq).
 v3 — Integración con intake v11 (multi-burbuja / one-shot):
   - Todos los emisores devuelven response_bubbles + response_interactive
     (None), para que ningún payload interactivo del intake sobreviva de un
@@ -22,7 +23,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from core.contracts import ROUTE_INTAKE, AgentState
 from core.llm import LLM
 from core.rag import retrieve
-from graph.nodes import _cfg, _guardar_ai, _recent_messages, _wa_link
+from graph.utils import _cfg, _guardar_ai, _recent_messages, _wa_link
 
 logger = logging.getLogger(__name__)
 

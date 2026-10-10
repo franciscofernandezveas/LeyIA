@@ -1,5 +1,12 @@
 """Contratos centrales: estado del grafo, thread_id y esquemas estructurados.
 
+v6.2 — Refactor intake:
+  - EMAIL_RE más estricto (rechaza TLD de 1 carácter y dominios mal formados).
+  - IntakeExtract marcado como deprecated (la extracción activa del intake ahora
+    usa IntakeDecision en graph/intake/contracts.py).
+  - Limpieza de comentarios duplicados en AgentState; intake_exit documenta
+    los nuevos valores "agendar" y "end".
+
 v6.1 — Booking signal/estado extendidos:
        + BookingSignalLabel incluye "tanda_repetida" (consultar_disponibilidad
          detectó propuesta idéntica → duda mal clasificada como navegación).
@@ -83,6 +90,9 @@ VALID_LABELS = {
 # ⚠️ Las 5 rutas DEBEN estar registradas como nodos en graph/builder.py
 #    (test de contrato: test_toda_ruta_tiene_nodo). ROUTE_AGENDAR es un
 #    subgrafo compilado registrado como nodo — el invariante no se toca.
+# ⚠️ Intake v13+ emite intake_exit="agendar" cuando la ficha se cierra con
+#    el CTA de agendamiento; el padre route_post_intake lo deriva a
+#    ROUTE_AGENDAR.
 # --------------------------------------------------------------------------
 ROUTE_HANDOFF: str = "handoff_humano"
 ROUTE_AGENDAR: str = "agendar_asesoria"
@@ -120,7 +130,9 @@ BookingSignalLabel = Literal[
 ]
 
 # Formato razonable de email (validación práctica, no RFC 5322 completa).
-EMAIL_RE = re.compile(r"^[\w.+-]+@[\w-]+(\.[\w-]+)+$")
+# v6.2: más estricto — requiere al menos un subdominio y TLD de 2+ caracteres,
+# rechazando casos como test@gmail.c o usuario@dominio-.
+EMAIL_RE = re.compile(r"^[\w.+-]+@[\w-]+(\.[\w-]+){1,}\.[a-zA-Z]{2,}$")
 
 
 class TipoHITL(str, Enum):
@@ -179,9 +191,6 @@ class AgentState(TypedDict, total=False):
     faq_decision: dict | None        # dump de FAQDecision (turno actual)
     faq_stage: str | None            # "respondiendo" | "clarificando"
 
-
-
-
     # --- Sub-flujo de BOOKING (subgrafo graph/booking/) ---
     # Ledger del sub-flujo: lo escriben/leen los nodos de graph/booking/;
     # analyze_sentiment solo lee booking_stage (short-circuit) y hace
@@ -204,10 +213,6 @@ class AgentState(TypedDict, total=False):
     booking: dict                             # cita creada (dump de EventoAsesoria)
 
     # --- Sub-flujo de intake / ficha de lead (nodo intake_lead) ---
-    
-    # Agregar dentro de AgentState, en el bloque "Sub-flujo de intake":
-
-    # --- Sub-flujo de intake / ficha de lead (nodo intake_lead) ---
     intake_activo: bool                       # ficha en curso
     intake_idx: int                           # índice de la pregunta actual (telemetría;
                                               # la fuente de verdad es _pendientes)
@@ -218,15 +223,14 @@ class AgentState(TypedDict, total=False):
                                               # {accion, tipo, confianza, razon, campos...}
     intake_stage: str | None                  # apertura|preguntando|pausado|completado|...
     intake_attempts: int                      # fallos de validación en la pregunta activa
-    intake_exit: str | None                   # None | "faq" (pausa) | "handoff" (parcial)
+    intake_exit: str | None                   # None | "faq" | "pausa" | "handoff" |
+                                              # "agendar" | "end"
     intake_resume: bool                       # tras FAQ lateral, intake re-pregunta pendiente
-               # ISO: inicio de ficha (TTL 24 h)
 
     # --- Escalamiento / cierre (nodo handoff_humano) ---
     closed: bool                              # hilo derivado/cerrado
     summary: str                              # resumen del caso para la ejecutiva
     notificacion_pendiente: bool              # WhatsApp falló; reintentar por job
-
 
     response_bubbles: NotRequired[list[str]]        # burbujas separadas (fallback: response)
     response_interactive: NotRequired[dict | None]  # {"kind": "buttons"|"list", ...} one-shot
@@ -238,38 +242,99 @@ class AgentState(TypedDict, total=False):
 class AnalisisResult(BaseModel):
     """Salida del clasificador unificado (nodo analyze_sentiment).
 
+    v7 — 'reason' ANTES de las etiquetas (el LLM genera en orden de campos:
+    razona primero, clasifica después) + descriptions operativas calibradas
+    con el golden set (umbrales explícitos del dominio Manzzo).
+
     ⚠️ Estas descriptions viajan al LLM: deben calzar con
-    classification.system_prompt de core/prompts.yaml.
+    classification.system_prompt de core/prompts.yaml (v3.0.0+).
+    ⚠️ El clasificador NO routea: la ruta la deriva compute_route()
+    (regla determinista). Aquí solo se etiqueta.
     """
+    reason: str = Field(
+        description=(
+            "Análisis en 1 línea, ANTES de clasificar: qué pide explícitamente "
+            "el cliente, qué emoción expresa y qué hecho legal vigente menciona."
+        )
+    )
     sentiment: SentimentLabel = Field(
-        description="Sentimiento dominante del mensaje del cliente."
+        description=(
+            "Emoción dominante hacia su situación o el servicio. "
+            "negativo: sufrimiento, frustración o enojo EXPRESADO — explícito "
+            "('desesperado', 'chato', 'injusto', garabatos, 'ayuda') o implícito "
+            "(sarcasmo, 'esperaba algo mejor de ustedes'). La cortesía de "
+            "envoltura ('hola buenas, disculpa la hora') NO lo atenúa. "
+            "neutro: consulta tranquila; INCLUYE preocupación hipotética o "
+            "moderada sin sufrimiento expresado ('¿me pueden embargar altiro?', "
+            "'ando justo de plata'). "
+            "positivo: gratitud o satisfacción explícita ('muchas gracias', "
+            "'excelente atención')."
+        )
     )
     urgency: UrgencyLabel = Field(
         description=(
-            "alta: demanda notificada, embargo vigente, medidas de apremio o "
-            "plazo judicial; media: quiere avanzar pronto sin coacción vigente; "
-            "baja: información general sin apuro explícito."
+            "La urgencia es del HECHO, no del tono: apremio vigente narrado "
+            "con calma sigue siendo alta. "
+            "alta: coacción judicial VIGENTE o plazo — demanda notificada, "
+            "embargo, medidas de apremio (licencia retenida, registro de "
+            "deudores), o inmediatez exclamada ('YA'). "
+            "media: pregunta sobre su propio caso (proceso, escenarios, "
+            "hipótesis legales), quiere avanzar pronto ('lo antes posible', "
+            "'esta semana', pide contacto humano), o ya ocurrió un evento "
+            "legal adverso sin coacción vigente (despido, no me deja ver a "
+            "mis hijos). "
+            "baja: preguntas sobre la FIRMA sin caso propio de por medio "
+            "(precios, contacto, cobertura, horarios, proceso de contratación, "
+            "servicios ofrecidos en abstracto)."
         )
     )
     intent: IntentLabel = Field(
         description=(
-            "'respuestas_faq': pregunta info general O describe su caso "
-            "buscando orientación (el agente orienta primero, siempre); "
-            "'agendar_asesoria': pide EXPLÍCITAMENTE agendar/reservar hora o "
-            "que un abogado tome su caso; "
-            "'hablar_humano': pide hablar con una persona/ejecutiva o ACEPTA "
-            "la oferta de contacto humano previa; "
-            "'fuera_de_dominio': no se relaciona con servicios legales."
+            "La emoción NO cambia la intención: una pregunta factual con "
+            "garabatos sigue siendo respuestas_faq. "
+            "'fuera_de_dominio': nada relacionado con servicios legales "
+            "(celulares, contador, psicólogo). "
+            "'hablar_humano': pide ser atendido por una persona/ejecutiva "
+            "('quiero hablar con alguien', 'que me atienda un abogado "
+            "directamente') o ACEPTA la oferta humana previa ('sí, que me "
+            "contacte la ejecutiva'). No confundir con pedir que un abogado "
+            "tome su caso. "
+            "'agendar_asesoria': (a) pide agendar/reservar hora; (b) pide "
+            "explícitamente ayuda profesional ('necesito abogado', 'quiero "
+            "que me ayuden', 'quiero que se termine'); (c) describe su caso "
+            "con ANGUSTIA AGUDA pidiendo auxilio ('estoy desesperado, ¿qué "
+            "hago?'); (d) pregunta por un servicio cubierto PERO no de "
+            "familia (laboral/civil/penal) describiendo su caso → lead "
+            "calificado. "
+            "'respuestas_faq': pregunta informativa O describe/pregunta sobre "
+            "su caso buscando orientación, SIN auxilio explícito ni angustia "
+            "aguda (el agente orienta primero)."
         )
     )
     category: CategoryLabel = Field(
-        description="Tema legal principal del mensaje (ver CategoryLabel)."
+        description=(
+            "Tema principal, INCLUSO si solo pide info de precios. "
+            "pension_alimentos: demanda, monto o pago de pensión (default en "
+            "causas de alimentos). rebaja_pension: bajar el monto vigente. "
+            "terminacion_pension: dejar de pagar. regimen_visitas: ver a los "
+            "hijos. medidas_apremio: embargo, licencia retenida, registro de "
+            "deudores. divorcio / compensacion_economica: según materia. "
+            "consulta_general: preguntas sobre la FIRMA (precios, contacto, "
+            "cobertura, horarios, proceso de contratación). otro: temas "
+            "no-familia sin categoría propia (laboral, civil, penal) o sin "
+            "tema identificable. Agradecimientos: la categoría del caso "
+            "mencionado; si no hay tema claro → consulta_general."
+        )
     )
-    reason: str = Field(description="Justificación breve (1 línea).")
+
 
 
 class IntakeExtract(BaseModel):
-    """Mapeo texto libre → campos de la ficha de intake (nodo intake_lead).
+    """DEPRECATED — v6.2: la extracción activa del intake usa IntakeDecision en
+    graph/intake/contracts.py. Se mantiene solo por compatibilidad con tests o
+    scripts legacy que aún importen este esquema; no usar en nodos nuevos.
+
+    Mapeo texto libre → campos de la ficha de intake (nodo intake_lead).
     Los validadores deterministas de graph/intake.py son la fuente de verdad;
     este esquema es solo la costura de lenguaje natural.
 
