@@ -34,7 +34,7 @@ from tools.google_calendar import (
     crear_evento_asesoria, horarios_disponibles,
 )
 
-from .contracts import (
+from core.contracts import (
     AGENDA_DIAS_POR_TANDA, AGENDA_HORAS_POR_DIA, AGENDA_SLOTS_VENTANA_DIAS,
     AGENDA_VENTANA_MAX_DIAS, FRANJA_HORAS, REQUIERE_APROBACION_AGENDAMIENTO,
 )
