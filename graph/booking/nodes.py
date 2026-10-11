@@ -1,18 +1,9 @@
 """graph/booking/nodes.py — Acciones del sub-agente BOOKING.
 
-v8.1 — Limpieza: se elimina `_slot_desde_raw`; el tap de botones/listas
-       ya lo resuelve `graph/slot_match.match_slot` (branch dm+hm, match
-       único y con degradado correcto ante tandas stale).
-v8 — Interactivos reales en WhatsApp:
-  - FIX P0: `_slot_button_label` rompía con miércoles/sábado (dias_abr sin
-    tilde vs _DIASEM con tilde → KeyError). Ahora usa tupla posicional.
-  - `_interactive_slots` numera títulos con índice ABSOLUTO respecto de
-    slots_propuestos ("3) Jue 17/09 16:00") para que el tap calce con el
-    texto numerado y el match sea determinista.
-  - Listas agrupadas por día (secciones nativas de Meta) + fix título ≤24.
-
-v7 — Botones interactivos de horarios (payload declarativo).
-v6 — Merge de updates encadenados + aviso de privacidad (FIX #1 + FIX #3).
+v8.2 — FIX import: constantes de booking desde .contracts
+       (graph/booking/contracts.py), no core.contracts.
+v8.1 — Limpieza: se elimina `_slot_desde_raw`.
+v8 — Interactivos reales en WhatsApp.
 """
 
 import logging
@@ -34,7 +25,7 @@ from tools.google_calendar import (
     crear_evento_asesoria, horarios_disponibles,
 )
 
-from core.contracts import (
+from .contracts import (
     AGENDA_DIAS_POR_TANDA, AGENDA_HORAS_POR_DIA, AGENDA_SLOTS_VENTANA_DIAS,
     AGENDA_VENTANA_MAX_DIAS, FRANJA_HORAS, REQUIERE_APROBACION_AGENDAMIENTO,
 )
