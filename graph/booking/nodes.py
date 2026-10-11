@@ -1,5 +1,8 @@
 """graph/booking/nodes.py — Acciones del sub-agente BOOKING.
 
+v8.1 — Limpieza: se elimina `_slot_desde_raw`; el tap de botones/listas
+       ya lo resuelve `graph/slot_match.match_slot` (branch dm+hm, match
+       único y con degradado correcto ante tandas stale).
 v8 — Interactivos reales en WhatsApp:
   - FIX P0: `_slot_button_label` rompía con miércoles/sábado (dias_abr sin
     tilde vs _DIASEM con tilde → KeyError). Ahora usa tupla posicional.
@@ -7,14 +10,12 @@ v8 — Interactivos reales en WhatsApp:
     slots_propuestos ("3) Jue 17/09 16:00") para que el tap calce con el
     texto numerado y el match sea determinista.
   - Listas agrupadas por día (secciones nativas de Meta) + fix título ≤24.
-  - Nuevo `_slot_desde_raw` para resolver el tap/texto a índice sin LLM.
 
 v7 — Botones interactivos de horarios (payload declarativo).
 v6 — Merge de updates encadenados + aviso de privacidad (FIX #1 + FIX #3).
 """
 
 import logging
-import re
 import unicodedata
 from datetime import datetime, timedelta
 
@@ -33,7 +34,7 @@ from tools.google_calendar import (
     crear_evento_asesoria, horarios_disponibles,
 )
 
-from .contracts import (
+from core.contracts import (
     AGENDA_DIAS_POR_TANDA, AGENDA_HORAS_POR_DIA, AGENDA_SLOTS_VENTANA_DIAS,
     AGENDA_VENTANA_MAX_DIAS, FRANJA_HORAS, REQUIERE_APROBACION_AGENDAMIENTO,
 )
@@ -65,7 +66,8 @@ def _interactive_slots(slots: list, idxs: list[int] | None = None) -> dict | Non
     """Botones nativos (≤3 opciones) o lista nativa agrupada por día (≤10).
 
     La numeración de título e id es ABSOLUTA respecto de slots_propuestos:
-    el tap en WhatsApp entrega "N) <slot>" y calza con el texto numerado.
+    el tap en WhatsApp entrega "N) <slot>" y calza con el texto numerado
+    (match_slot lo resuelve por fecha+hora exacta).
     """
     if not slots:
         return None
@@ -98,19 +100,6 @@ def _interactive_slots(slots: list, idxs: list[int] | None = None) -> dict | Non
     ]
     return {"kind": "list", "cta": "Ver horarios",
             "title": "Próximos horarios", "sections": sections}
-
-
-def _slot_desde_raw(raw: str, n_slots: int) -> int | None:
-    """Resuelve el tap/texto a índice 0-based de slots_propuestos.
-
-    Cubre: tap del botón/lista ("3) Jue 17/09 16:00"), texto libre ("3")
-    e ids por si el canal entrega id puro ("slot_3"). None si no aplica.
-    """
-    m = re.match(r"(?:slot_)?(\d+)", (raw or "").strip(), re.IGNORECASE)
-    if not m:
-        return None
-    i = int(m.group(1))
-    return (i - 1) if 1 <= i <= n_slots else None
 
 
 # ---------------------------------------------------------------------------
