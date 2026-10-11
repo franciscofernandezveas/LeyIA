@@ -12,6 +12,10 @@ MAX_WA_LEN = 4000
 MAX_INTERACTIVE_BODY = 1024   # body de un interactivo Meta
 MAX_BUTTON_TITLE = 20
 MAX_ROW_TITLE = 24
+MAX_ROW_DESC = 72
+MAX_LIST_ROWS = 10            # total de filas entre TODAS las secciones
+MAX_LIST_CTA = 20
+MAX_SECTION_TITLE = 24
 
 _BR_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
 
@@ -36,8 +40,22 @@ def _chunks(text: str):
         yield text
 
 
+def _row(o: dict) -> dict:
+    row = {"id": str(o["id"]), "title": _clip(o["title"], MAX_ROW_TITLE)}
+    if o.get("description"):
+        row["description"] = _clip(o["description"], MAX_ROW_DESC)
+    return row
+
+
 def _build_interactive(interactive: dict, body: str) -> dict:
-    """Convierte el formato interno del grafo al de Meta Cloud API."""
+    """Convierte el formato interno del grafo al de Meta Cloud API.
+
+    kind soportados:
+      - buttons: reply buttons nativos (máx 3)
+      - list:    lista nativa; acepta "options" (1 sección) o
+                 "sections" (varias, p.ej. agrupadas por día)
+      - cta:     botón call-to-action URL
+    """
     wa: dict = {"body": {"text": _clip(body, MAX_INTERACTIVE_BODY)}}
     kind = interactive.get("kind")
 
@@ -53,19 +71,49 @@ def _build_interactive(interactive: dict, body: str) -> dict:
         wa["action"] = {"buttons": buttons}
 
     elif kind == "list":
-        rows = [
-            {"id": str(o["id"]), "title": _clip(o["title"], MAX_ROW_TITLE)}
-            for o in interactive.get("options", [])[:10]
-        ]
-        if not rows:
+        if interactive.get("sections"):
+            sections = [
+                {"title": _clip(sec.get("title") or "Opciones", MAX_SECTION_TITLE),
+                 "rows": [_row(r) for r in sec.get("rows", [])]}
+                for sec in interactive["sections"]
+            ]
+        else:
+            sections = [{
+                "title": _clip(interactive.get("title") or "Opciones",
+                               MAX_SECTION_TITLE),
+                "rows": [_row(o) for o in interactive.get("options", [])],
+            }]
+
+        # Meta: máx 10 filas en TOTAL entre todas las secciones
+        cupos = MAX_LIST_ROWS
+        final = []
+        for s in sections:
+            rows = s["rows"][:cupos]
+            if rows:
+                final.append({"title": s["title"], "rows": rows})
+                cupos -= len(rows)
+            if cupos <= 0:
+                break
+        if not final:
             raise ValueError("interactive 'list' sin opciones")
+
         wa["type"] = "list"
         wa["action"] = {
-            "button": _clip(interactive.get("cta") or "Ver opciones", 20),
-            "sections": [{
-                "title": _clip(interactive.get("title") or "Opciones", 24),
-                "rows": rows,
-            }],
+            "button": _clip(interactive.get("cta") or "Ver opciones", MAX_LIST_CTA),
+            "sections": final,
+        }
+
+    elif kind == "cta":
+        url = str(interactive.get("url") or "").strip()
+        if not url.lower().startswith(("https://", "http://")):
+            raise ValueError(f"cta sin URL válida: {url!r}")
+        wa["type"] = "cta_url"
+        wa["action"] = {
+            "name": "cta_url",
+            "parameters": {
+                "display_text": _clip(interactive.get("text") or "Pincha aquí", 80),
+                "url": url,
+            },
         }
 
     else:

@@ -1,23 +1,16 @@
 """graph/booking/nodes.py — Acciones del sub-agente BOOKING.
 
-v7.1 — Importa helpers desde graph/utils.py (rompe ciclo graph.nodes↔booking).
-v7 — Botones interactivos de horarios:
-  - `_interactive_slots` genera payload declarativo (botones nativos si
-    ≤3 horarios, lista nativa si 4-10). Fallback visual para canales que
-    lo soporten; canales sin interactivo reciben solo el texto numerado.
-  - `proponer_slots`, `reintentar_eleccion` y `aclarar_eleccion` ahora
-    envían `response_interactive` con las opciones disponibles.
+v8 — Interactivos reales en WhatsApp:
+  - FIX P0: `_slot_button_label` rompía con miércoles/sábado (dias_abr sin
+    tilde vs _DIASEM con tilde → KeyError). Ahora usa tupla posicional.
+  - `_interactive_slots` numera títulos con índice ABSOLUTO respecto de
+    slots_propuestos ("3) Jue 17/09 16:00") para que el tap calce con el
+    texto numerado y el match sea determinista.
+  - Listas agrupadas por día (secciones nativas de Meta) + fix título ≤24.
+  - Nuevo `_slot_desde_raw` para resolver el tap/texto a índice sin LLM.
 
-v6 — FIX #1 + FIX #3 (aviso de privacidad):
-  - FIX #1: mergea explícitamente los updates intermedios en las llamadas
-    encadenadas (pedir_nombre → pedir_email → pedir_modalidad). Antes el
-    state solo retenía el retorno del último nodo llamado, perdiendo
-    lead_nombre, lead_email, lead_modalidad y slots_propuestos.
-  - FIX #3: aviso de uso de datos en el wizard de agendamiento DIRECTO
-    (cliente que no pasó por intake). Si viene del intake, no se repite
-    el aviso porque ya otorgó consentimiento en la ficha.
-  - v5: precarga desde intake, multi-burbuja, modalidad con botones y
-    merge de la ficha del intake en upsert_lead.
+v7 — Botones interactivos de horarios (payload declarativo).
+v6 — Merge de updates encadenados + aviso de privacidad (FIX #1 + FIX #3).
 """
 
 import logging
@@ -49,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 _DIASEM = ("lunes", "martes", "miércoles", "jueves",
            "viernes", "sábado", "domingo")
+_DIAS_ABR = ("Lun", "Mar", "Mie", "Jue", "Vie", "Sab", "Dom")
 
 # Botones nativos de modalidad.
 _BOTONES_MODALIDAD = {"kind": "buttons",
@@ -60,57 +54,69 @@ _PRECARGA_LABELS = {"lead_nombre": "su nombre", "lead_email": "su correo"}
 
 
 # ---------------------------------------------------------------------------
-# Payloads interactivos de horarios (fallback visual)
+# Payloads interactivos de horarios
 # ---------------------------------------------------------------------------
 def _slot_button_label(s) -> str:
-    """Etiqueta corta para botones/lista de WhatsApp (máx. ~16 chars)."""
-    dias_abr = {"lunes": "Lun", "martes": "Mar", "miercoles": "Mie",
-                "jueves": "Jue", "viernes": "Vie",
-                "sabado": "Sab", "domingo": "Dom"}
-    dia = dias_abr[_DIASEM[s.weekday()]]
-    return f"{dia} {s.strftime('%d/%m')} {s.strftime('%H:%M')}"
+    """Etiqueta corta para botones/lista de WhatsApp."""
+    return f"{_DIAS_ABR[s.weekday()]} {s.strftime('%d/%m')} {s.strftime('%H:%M')}"
 
 
-def _interactive_slots(slots: list) -> dict | None:
-    """Payload declarativo one-shot: botones (≤3) o lista nativa (≤10).
-    Si el canal no soporta interactivos, ignora este payload y muestra
-    solo el texto numerado."""
+def _interactive_slots(slots: list, idxs: list[int] | None = None) -> dict | None:
+    """Botones nativos (≤3 opciones) o lista nativa agrupada por día (≤10).
+
+    La numeración de título e id es ABSOLUTA respecto de slots_propuestos:
+    el tap en WhatsApp entrega "N) <slot>" y calza con el texto numerado.
+    """
     if not slots:
         return None
+    if idxs is None:
+        idxs = list(range(len(slots)))
+    idxs = [i for i in idxs if 0 <= i < len(slots)][:10]
+    if not idxs:
+        return None
 
-    options = []
-    for i, s in enumerate(slots, 1):
-        title = _slot_button_label(s)
-        options.append({
-            "id": f"slot_{i}",
-            "title": title,
-            "description": f"Asesoría a las {s.strftime('%H:%M')} hrs",
-        })
-
-    if len(options) > 10:
-        options = options[:10]
+    options = [
+        {"id": f"slot_{i + 1}",
+         "title": f"{i + 1}) {_slot_button_label(slots[i])}",
+         "description": f"Asesoría a las {slots[i].strftime('%H:%M')} hrs"}
+        for i in idxs
+    ]
 
     if len(options) <= 3:
-        return {
-            "kind": "buttons",
-            "buttons": [{"id": opt["id"], "title": opt["title"]} for opt in options],
-        }
+        return {"kind": "buttons",
+                "buttons": [{"id": o["id"], "title": o["title"]} for o in options]}
 
-    return {
-        "kind": "list",
-        "cta": "Ver horarios",
-        "title": "Próximos horarios disponibles",
-        "options": options,
-    }
+    # Lista nativa: una sección por día (Meta soporta secciones múltiples)
+    por_dia: dict = {}
+    for i, o in zip(idxs, options):
+        por_dia.setdefault(slots[i].date(), []).append(o)
+
+    sections = [
+        {"title": f"{_DIASEM[d.weekday()].capitalize()} {d.strftime('%d/%m')}",
+         "rows": rows}
+        for d, rows in sorted(por_dia.items())
+    ]
+    return {"kind": "list", "cta": "Ver horarios",
+            "title": "Próximos horarios", "sections": sections}
+
+
+def _slot_desde_raw(raw: str, n_slots: int) -> int | None:
+    """Resuelve el tap/texto a índice 0-based de slots_propuestos.
+
+    Cubre: tap del botón/lista ("3) Jue 17/09 16:00"), texto libre ("3")
+    e ids por si el canal entrega id puro ("slot_3"). None si no aplica.
+    """
+    m = re.match(r"(?:slot_)?(\d+)", (raw or "").strip(), re.IGNORECASE)
+    if not m:
+        return None
+    i = int(m.group(1))
+    return (i - 1) if 1 <= i <= n_slots else None
 
 
 # ---------------------------------------------------------------------------
-# Aviso de privacidad para agendamiento directo (FIX #3)
+# Aviso de privacidad para agendamiento directo
 # ---------------------------------------------------------------------------
 def _aviso_privacidad(state: AgentState) -> str | None:
-    """Aviso de uso de datos. Se muestra una sola vez, solo si el cliente
-    agenda DIRECTAMENTE sin haber pasado por el intake (donde ya dio
-    consentimiento explícito)."""
     if state.get("intake_respuestas"):
         return None
     if state.get("booking_privacidad_dicha"):
@@ -289,7 +295,7 @@ def proponer_slots(state: AgentState) -> AgentState:
     _guardar_ai(state, response)
     return {"response": response,
             "response_bubbles": [response],
-            "response_interactive": _interactive_slots(slots),   # ← fallback UI
+            "response_interactive": _interactive_slots(slots),
             "booking_stage": "propuesta",
             "booking_signal": None,
             "agenda_dia_sin_cupos": None,
@@ -300,7 +306,7 @@ def proponer_slots(state: AgentState) -> AgentState:
 
 
 # ---------------------------------------------------------------------------
-# Wizard de captura: cadena con skip por precarga (v6-FIX)
+# Wizard de captura: cadena con skip por precarga
 # ---------------------------------------------------------------------------
 def pedir_nombre(state: AgentState, _pre: dict | None = None) -> AgentState:
     pre = {**(_pre or {}), **_precargar_desde_intake(state)}
@@ -308,9 +314,7 @@ def pedir_nombre(state: AgentState, _pre: dict | None = None) -> AgentState:
 
     if pre.get("lead_nombre") or state.get("lead_nombre"):
         res = pedir_email({**state, **pre}, _pre=pre)
-        # FIX #1: mergear precarga + respuesta del siguiente eslabón
         out = {**pre, **res}
-        # FIX #3: inyectar aviso si aún no se mostró
         if aviso and not out.get("booking_privacidad_dicha"):
             out["response_bubbles"] = [aviso] + out.get("response_bubbles", [])
             out["response"] = aviso + "\n\n" + out.get("response", "")
@@ -391,16 +395,11 @@ def pedir_modalidad(state: AgentState, _pre: dict | None = None) -> AgentState:
 
 
 def procesar_captura(state: AgentState) -> AgentState:
-    """Nodo único de avance del wizard. Valida el campo de la etapa actual y
-    avanza ENCADENANDO por pedir_* (que aplican la precarga del intake);
-    si ya completó datos consulta disponibilidad + propone slots en el
-    mismo turno."""
     atn = _cfg()["atencion"]
     stage = state.get("booking_stage")
     decision = state.get("booking_decision") or {}
     raw = (state.get("query") or "").strip()
 
-    # Inicialización del ledger al primer ingreso
     init = {}
     if not state.get("agenda_started_en"):
         init = {"agenda_started_en": datetime.now(GCAL_TZ).isoformat(),
@@ -477,14 +476,14 @@ def reintentar_eleccion(state: AgentState) -> AgentState:
 def aclarar_eleccion(state: AgentState) -> AgentState:
     atn = _cfg()["atencion"]
     slots = _slots(state)
-    idxs = state.get("booking_match_candidatos") or []
-    candidatos = [slots[i] for i in idxs if 0 <= i < len(slots)]
+    idxs = [i for i in (state.get("booking_match_candidatos") or [])
+            if 0 <= i < len(slots)]
     response = atn["agenda_eleccion_ambigua"].format(
         opciones=_opciones_indexadas(slots, idxs))
     _guardar_ai(state, response)
     return {"response": response,
             "response_bubbles": [response],
-            "response_interactive": _interactive_slots(candidatos),
+            "response_interactive": _interactive_slots(slots, idxs),
             "booking_attempts": (state.get("booking_attempts") or 0) + 1,
             "messages": [AIMessage(content=response)]}
 
@@ -515,7 +514,6 @@ def responder_lateral(state: AgentState) -> AgentState:
 # Confirmación y creación
 # ---------------------------------------------------------------------------
 def confirmar_y_crear(state: AgentState) -> AgentState:
-    """Revalida el slot, crea el evento y persiste."""
     atn = _cfg()["atencion"]
 
     if not state.get("lead_nombre"):

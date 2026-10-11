@@ -135,26 +135,36 @@ async def run_agent(wa_id: str, text: str, name: str | None) -> dict:
 
 async def _deliver(to: str, reply: dict) -> None:
     text = (reply.get("text") or "").strip()
-    interactive = reply.get("interactive")
 
-    if not interactive:
+    interactives = reply.get("interactive")
+    if isinstance(interactives, dict):
+        interactives = [interactives]
+    interactives = [i for i in (interactives or []) if isinstance(i, dict)]
+
+    if not interactives:
         if text:
             await send_text(to, text)
         return
 
-    try:
-        # Body del interactivo: máx 1024 chars.
-        # Si la respuesta cabe, viaja como body; si no, texto previo + interactivo.
-        if text and len(text) <= MAX_INTERACTIVE_BODY:
-            await send_interactive(to, text, interactive)
+    # El texto completo viaja como body del PRIMER interactivo si cabe.
+    # Si no, va como mensaje de texto previo (Meta: max 1024 chars en body).
+    text_in_first = bool(text) and len(text) <= MAX_INTERACTIVE_BODY
+
+    if text and not text_in_first:
+        await send_text(to, text)
+
+    for idx, inter in enumerate(interactives):
+        if idx == 0 and text_in_first:
+            body = text
         else:
-            if text:
-                await send_text(to, text)
-            await send_interactive(to, "Elige una opción 👇", interactive)
-    except ValueError:
-        logger.warning("interactive inválido, fallback a texto", exc_info=True)
-        if text:
-            await send_text(to, text)
+            body = inter.get("body") or (
+                "Pincha aquí 👇" if inter.get("kind") == "cta"
+                else "Elige una opción 👇"
+            )
+        try:
+            await send_interactive(to, body, inter)
+        except ValueError:
+            logger.warning("interactive inválido ignorado: %r", inter, exc_info=True)
 
 
 async def reaper_loop() -> None:
