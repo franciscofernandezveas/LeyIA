@@ -20,8 +20,8 @@ async def ensure_conversation(thread_id: str, phone: str) -> None:
         await session.execute(
             text("""
                 INSERT INTO conversations (thread_id, channel, status, metadata, created_at, updated_at)
-                VALUES (:tid, 'wa', 'open',
-                        jsonb_build_object('origen', 'wa_webhook', 'telefono', :phone),
+                VALUES (CAST(:tid AS text), 'wa', 'open',
+                        jsonb_build_object('origen', 'wa_webhook', 'telefono', CAST(:phone AS text)),
                         now(), now())
                 ON CONFLICT (thread_id) DO UPDATE SET
                     channel = CASE
@@ -32,9 +32,10 @@ async def ensure_conversation(thread_id: str, phone: str) -> None:
                     END,
                     updated_at = now()
             """),
-            {"tid": thread_id, "phone": phone},
+            {"tid": thread_id, "phone": phone or ""},
         )
         await session.commit()
+
 
 
 async def register_message(message: WhatsAppMessage) -> str:
