@@ -156,7 +156,6 @@ def insert_message(
     except Exception as e:
         logger.exception("[db] insert_message falló: %s", e)
 
-
 def upsert_lead(
     thread_id: str,
     intake_respuestas: dict,
@@ -173,6 +172,13 @@ def upsert_lead(
         consent_bool = consent if isinstance(consent, bool) else None
 
         with _get_engine().connect() as conn:
+            # --- NUEVO: saber si este lead YA estaba completo (evita notif. duplicadas)
+            prev = conn.execute(
+                text("select completed_at from leads where thread_id = :thread_id"),
+                {"thread_id": thread_id},
+            ).fetchone()
+            ya_notificado = prev is not None and prev.completed_at is not None
+
             conn.execute(
                 text("""
                 insert into leads (conversation_id, thread_id, nombre, email, telefono, situacion, etapa_proceso, categoria, consentimiento, completed_at, metadata)
@@ -205,9 +211,20 @@ def upsert_lead(
                 },
             )
             conn.commit()
+
+        # --- NUEVO: notificar solo la primera vez que se completa
+        if completed and not ya_notificado:
+            from integrations.whatsapp.notify import notify_new_lead
+            notify_new_lead({
+                "nombre": r.get("nombre"),
+                "telefono": r.get("telefono"),
+                "email": r.get("email"),
+                "categoria": category,
+                "situacion": r.get("situacion_actual"),
+                "etapa_proceso": r.get("etapa_proceso"),
+            })
     except Exception as e:
         logger.exception("[db] upsert_lead falló: %s", e)
-
 
 def insert_escalation(
     thread_id: str,
@@ -233,9 +250,40 @@ def insert_escalation(
                     "notificado": notificado_whatsapp,
                 },
             )
+
+            # --- NUEVO: ¿ya fue notificado antes? (evita duplicados en re-escalamiento)
+            prev = conn.execute(
+                text("select notificado_whatsapp from escalations where thread_id = :thread_id"),
+                {"thread_id": thread_id},
+            ).fetchone()
+            ya_notificado = bool(prev and prev[0]) or notificado_whatsapp
+
             conn.commit()
+
+        if not ya_notificado:
+            from integrations.whatsapp.notify import notify_escalation
+            # buscar teléfono del cliente para el mensaje
+            try:
+                with _get_engine().connect() as conn2:
+                    row = conn2.execute(
+                        text("select telefono from leads where thread_id = :t"),
+                        {"t": thread_id},
+                    ).fetchone()
+                telefono = row[0] if row else None
+            except Exception:
+                telefono = None
+
+            ok = notify_escalation(thread_id, summary or "", telefono)
+            if ok:
+                with _get_engine().connect() as conn3:
+                    conn3.execute(
+                        text("update escalations set notificado_whatsapp = true where thread_id = :t"),
+                        {"t": thread_id},
+                    )
+                    conn3.commit()
     except Exception as e:
         logger.exception("[db] insert_escalation falló: %s", e)
+
 
 
 def insert_booking(
@@ -245,6 +293,15 @@ def insert_booking(
     try:
         b = booking or {}
         with _get_engine().connect() as conn:
+            # --- NUEVO: ¿ya existía booking para este hilo? (true = re-agenda)
+            ya_existia = (
+                conn.execute(
+                    text("select 1 from bookings where thread_id = :thread_id"),
+                    {"thread_id": thread_id},
+                ).fetchone()
+                is not None
+            )
+
             conn.execute(
                 text("""
                 insert into bookings (conversation_id, thread_id, lead_id, evento_id, fecha, hora_inicio, hora_fin, modalidad, meet_link, html_link, cliente_nombre, cliente_email, inicio_cita, created_at)
@@ -280,5 +337,10 @@ def insert_booking(
                 },
             )
             conn.commit()
+
+        # --- NUEVO: solo citas nuevas (las re-agendas ya las ve la abogada en Calendar)
+        if not ya_existia:
+            from integrations.whatsapp.notify import notify_booking
+            notify_booking(b)
     except Exception as e:
         logger.exception("[db] insert_booking falló: %s", e)
