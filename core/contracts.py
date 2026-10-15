@@ -132,7 +132,7 @@ BookingSignalLabel = Literal[
 # Formato razonable de email (validación práctica, no RFC 5322 completa).
 # v6.2: más estricto — requiere al menos un subdominio y TLD de 2+ caracteres,
 # rechazando casos como test@gmail.c o usuario@dominio-.
-EMAIL_RE = re.compile(r"^[\w.+-]+@[\w-]+(\.[\w-]+){1,}\.[a-zA-Z]{2,}$")
+EMAIL_RE = re.compile(r"^[\w.+-]+@[\w-]+(\.[\w-]+)*\.[a-zA-Z]{2,}$")
 
 
 class TipoHITL(str, Enum):
