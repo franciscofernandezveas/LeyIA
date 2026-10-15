@@ -37,7 +37,6 @@ def _get_engine() -> Engine:
         if not raw:
             raise RuntimeError("DATABASE_URL no está configurada")
 
-        # Supabase añade ?pgbouncer=true en la URL del pooler; psycopg no lo entiende.
         cleaned = raw.replace("?pgbouncer=true", "").replace("&pgbouncer=true", "")
         if cleaned.endswith("?"):
             cleaned = cleaned[:-1]
@@ -49,9 +48,6 @@ def _get_engine() -> Engine:
             max_overflow=10,
             pool_pre_ping=True,
             pool_recycle=3600,
-            # psycopg3: nunca preparar statements en el servidor; tras el
-            # pooler (modo transacción) los backends compartidos ya tienen
-            # nombres como _pg3_0 ocupados → DuplicatePreparedStatement.
             connect_args={"prepare_threshold": None},
         )
     return _engine
@@ -91,6 +87,12 @@ def upsert_conversation(
                 insert into conversations (thread_id, channel, status, intent_first, category, summary, metadata, created_at, updated_at)
                 values (:thread_id, :channel, :status, :intent, :category, :summary, CAST(:metadata_json AS jsonb), now(), now())
                 on conflict (thread_id) do update set
+                    channel = case
+                        when conversations.channel is null
+                          or conversations.channel in ('desconocido', 'sin_canal')
+                        then coalesce(:channel, conversations.channel)
+                        else conversations.channel
+                    end,
                     status = coalesce(:status, conversations.status),
                     intent_first = coalesce(conversations.intent_first, excluded.intent_first),
                     category = case
@@ -119,7 +121,6 @@ def upsert_conversation(
             conn.commit()
     except Exception as e:
         logger.exception("[db] upsert_conversation falló: %s", e)
-
 
 
 def insert_message(
@@ -156,9 +157,6 @@ def insert_message(
         logger.exception("[db] insert_message falló: %s", e)
 
 
-# ---------------------------------------------------------------------------
-# LEADS / INTAKE
-# ---------------------------------------------------------------------------
 def upsert_lead(
     thread_id: str,
     intake_respuestas: dict,
@@ -211,9 +209,6 @@ def upsert_lead(
         logger.exception("[db] upsert_lead falló: %s", e)
 
 
-# ---------------------------------------------------------------------------
-# ESCALAMIENTOS
-# ---------------------------------------------------------------------------
 def insert_escalation(
     thread_id: str,
     summary: str,
@@ -243,9 +238,6 @@ def insert_escalation(
         logger.exception("[db] insert_escalation falló: %s", e)
 
 
-# ---------------------------------------------------------------------------
-# BOOKINGS / AGENDA
-# ---------------------------------------------------------------------------
 def insert_booking(
     thread_id: str,
     booking: dict,

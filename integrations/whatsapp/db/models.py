@@ -35,3 +35,10 @@ class MessageRecord(Base):
         DateTime(timezone=True), nullable=True
     )
     failed_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # -------------------------------------------------
+    # Link hacia el hilo conversacional del grafo/agente
+    # -------------------------------------------------
+    thread_id: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True, index=True
+    )
