@@ -4,20 +4,15 @@ Persiste:
   - conversations: hilo completo (una fila por SESIÓN de 24h)
   - messages: cada mensaje humano/AI
   - leads: fichas de intake (una por thread_id)
-  - escalations: handoffs a ejecutiva (una por thread_id)
+  - escalations: handoffs a ejecutiva (una por thread_id, con motivo)
   - bookings: citas creadas en Google Calendar (una por thread_id)
 
+Escalations: una fila por cliente sirve de "cola de trabajo" del abogado.
+  motivo='ficha_completada'   → el cliente completó la ficha (SILENCIOSO)
+  motivo='hablar_abogada'     → pidió hablar con humano (NOTIFICA)
+  motivo='derivacion_parcial' → handoff tras agotar reintentos (NOTIFICA)
+
 Todas las operaciones son best-effort: no lanzan excepción hacia el grafo.
-
-Sesiones: `conversations` ya no tiene UNIQUE(thread_id); cada 24h de
-inactividad se cierra y se crea una nueva. Los INSERTs usan un COALESCE
-que prioriza la sesión ACTIVA (closed_at IS NULL), con fallback a la
-última para no perder linkage histórico.
-
-Status normalizado a vocabulario cerrado:
-  'open'       → sesión activa (closed_at IS NULL)
-  'closed'     → cerrada por cierre normal o TTL
-  'escalado'   → derivada a ejecutiva humana
 
 Nota driver: psycopg3. Tras el pooler en modo transacción los prepared
  statements colisionan entre sesiones (DuplicatePreparedStatement), por eso
@@ -41,11 +36,9 @@ logger = logging.getLogger(__name__)
 DATABASE_URL = os.getenv("DATABASE_URL")
 _engine: Engine | None = None
 
-
 # Subquery que devuelve el conversation_id "correspondiente":
 #   - La sesión ACTIVA si existe (caso normal).
-#   - Fallback: la última sesión conocida (por si algún flujo llama fuera de turno).
-# Nunca devuelve una fila arbitraria.
+#   - Fallback: la última sesión conocida.
 _CONV_ID_SQL = """
     COALESCE(
         (SELECT c.id FROM conversations c
@@ -108,13 +101,10 @@ def upsert_conversation(
 ) -> None:
     """
     Actualiza la conversación ACTIVA (si existe) o crea una nueva.
-
     Reglas de status:
-      - Si `closed=True` y no se pasa `status` explícito → 'closed'.
-      - Si no, se respeta el `status` que venga (o el actual).
+      - closed=True sin status explícito → 'closed'.
+      - Si no, se respeta el status que venga (o el actual).
       - INSERT fallback: default 'open'.
-
-    Ya no usa ON CONFLICT porque puede haber varias filas por thread_id.
     """
     try:
         thread_id = normalize_thread_id(thread_id)
@@ -124,7 +114,6 @@ def upsert_conversation(
             meta["closed_at"] = _now()
 
         with _get_engine().connect() as conn:
-            # 1) Actualizar la conversación ACTIVA
             updated = conn.execute(
                 text("""
                 UPDATE conversations SET
@@ -170,7 +159,6 @@ def upsert_conversation(
                 },
             )
 
-            # 2) Si no había ninguna activa, crear una nueva
             if updated.rowcount == 0:
                 conn.execute(
                     text("""
@@ -267,7 +255,6 @@ def upsert_lead(
         consent_bool = consent if isinstance(consent, bool) else None
 
         with _get_engine().connect() as conn:
-            # ¿Ya estaba completo este lead? (evita notificación duplicada)
             prev = conn.execute(
                 text("select completed_at from leads where thread_id = :thread_id"),
                 {"thread_id": thread_id},
@@ -315,7 +302,7 @@ def upsert_lead(
             )
             conn.commit()
 
-        # Notificar a la abogada solo la primera vez que se completa la ficha
+        # Primera vez que se completa la ficha: notificar + registrar escalación silenciosa
         if completed and not ya_notificado:
             from integrations.whatsapp.notify import notify_new_lead
             notify_new_lead({
@@ -326,6 +313,16 @@ def upsert_lead(
                 "situacion": r.get("situacion_actual"),
                 "etapa_proceso": r.get("etapa_proceso"),
             })
+
+            # Registro silencioso: si el cliente desaparece sin decidir,
+            # la abogada aún lo ve en su cola de trabajo.
+            insert_escalation(
+                thread_id=thread_id,
+                summary="Cliente completó la ficha y está considerando "
+                        "agendar o hablar con la abogada.",
+                motivo="ficha_completada",
+                notificar=False,   # silencioso — la notif de lead ya avisó
+            )
     except Exception as e:
         logger.exception("[db] upsert_lead falló: %s", e)
 
@@ -335,67 +332,87 @@ def upsert_lead(
 # ---------------------------------------------------------------------------
 def insert_escalation(
     thread_id: str,
-    summary: str,
-    notificado_whatsapp: bool = False,
-) -> None:
+    summary: str | None = None,
+    motivo: str = "hablar_abogada",
+    notificar: bool = True,
+) -> bool:
+    """
+    Upsert de escalación. Devuelve True si la notif quedó enviada (o no hacía falta).
+
+    Args:
+        summary:  Texto para la abogada.
+        motivo:   'ficha_completada' | 'hablar_abogada' | 'derivacion_parcial'.
+        notificar: si True, envía WhatsApp si no fue notificado antes.
+                   si False, solo upserta la fila (silencioso).
+    """
     try:
         thread_id = normalize_thread_id(thread_id)
         with _get_engine().connect() as conn:
             conn.execute(
                 text(f"""
                 INSERT INTO escalations
-                    (conversation_id, thread_id, lead_id, summary,
+                    (conversation_id, thread_id, lead_id, summary, motivo,
                      notificado_whatsapp, created_at)
                 SELECT
                     ({_CONV_ID_SQL}),
                     :thread_id,
                     (SELECT l.id FROM leads l
                      WHERE l.thread_id = :thread_id LIMIT 1),
-                    :summary, :notificado, now()
+                    :summary, :motivo, FALSE, now()
                 ON CONFLICT (thread_id) DO UPDATE SET
-                    summary = :summary,
-                    notificado_whatsapp = :notificado
+                    summary = COALESCE(:summary, escalations.summary),
+                    motivo  = :motivo
                 """),
                 {
                     "thread_id": thread_id,
                     "summary": _safe(summary),
-                    "notificado": notificado_whatsapp,
+                    "motivo": motivo,
                 },
             )
-
-            prev = conn.execute(
-                text("select notificado_whatsapp from escalations "
-                     "where thread_id = :thread_id"),
-                {"thread_id": thread_id},
-            ).fetchone()
-            ya_notificado = bool(prev and prev[0]) or notificado_whatsapp
-
             conn.commit()
 
-        # Fallback: si el handoff no notificó por su canal, avisamos aquí
-        if not ya_notificado:
-            from integrations.whatsapp.notify import notify_escalation
-            try:
-                with _get_engine().connect() as conn2:
-                    row = conn2.execute(
-                        text("select telefono from leads where thread_id = :t"),
-                        {"t": thread_id},
-                    ).fetchone()
-                telefono = row[0] if row else None
-            except Exception:
-                telefono = None
+        if not notificar:
+            return True
 
-            ok = notify_escalation(thread_id, summary or "", telefono)
-            if ok:
-                with _get_engine().connect() as conn3:
-                    conn3.execute(
-                        text("update escalations set notificado_whatsapp = true "
-                             "where thread_id = :t"),
-                        {"t": thread_id},
-                    )
-                    conn3.commit()
+        # ¿Ya fue notificado antes?
+        with _get_engine().connect() as conn:
+            row = conn.execute(
+                text("SELECT notificado_whatsapp FROM escalations WHERE thread_id = :tid"),
+                {"tid": thread_id},
+            ).fetchone()
+        if row and row[0]:
+            return True  # nothing pending
+
+        # Buscar teléfono del cliente (best-effort)
+        try:
+            with _get_engine().connect() as conn:
+                row = conn.execute(
+                    text("SELECT telefono FROM leads WHERE thread_id = :tid"),
+                    {"tid": thread_id},
+                ).fetchone()
+            telefono = row[0] if row else None
+        except Exception:
+            telefono = None
+
+        from integrations.whatsapp.notify import notify_escalation
+        ok = notify_escalation(
+            thread_id=thread_id,
+            summary=summary or "",
+            telefono=telefono,
+            motivo=motivo,
+        )
+        if ok:
+            with _get_engine().connect() as conn:
+                conn.execute(
+                    text("UPDATE escalations SET notificado_whatsapp = true "
+                         "WHERE thread_id = :tid"),
+                    {"tid": thread_id},
+                )
+                conn.commit()
+        return ok
     except Exception as e:
         logger.exception("[db] insert_escalation falló: %s", e)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -409,7 +426,6 @@ def insert_booking(
         thread_id = normalize_thread_id(thread_id)
         b = booking or {}
         with _get_engine().connect() as conn:
-            # ¿Ya existía booking para este hilo? (true = re-agenda)
             ya_existia = (
                 conn.execute(
                     text("select 1 from bookings where thread_id = :thread_id"),
@@ -462,7 +478,6 @@ def insert_booking(
             )
             conn.commit()
 
-        # Notificar a la abogada solo citas nuevas
         if not ya_existia:
             from integrations.whatsapp.notify import notify_booking
             notify_booking(b)

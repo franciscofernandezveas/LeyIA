@@ -295,19 +295,13 @@ def handoff_humano(state: AgentState) -> AgentState:
             completed=bool(state.get("intake_completado")),
         )
 
-    notificacion_ok = True
-    try:
-        notificar_escalamiento(
-            thread_id=tid or "sin-id",
-            resumen=summary,
-            telefono_cliente=_telefono_cliente(state),
-        )
-    except Exception as e:
-        logger.exception("notificación WhatsApp falló: %s", e)
-        notificacion_ok = False
+    notificacion_ok = insert_escalation(
+        thread_id=tid,
+        summary=summary,
+        motivo="hablar_abogada",
+        notificar=True,
+    )
 
-    insert_escalation(thread_id=tid, summary=summary,
-                      notificado_whatsapp=notificacion_ok)
 
     _persist_escalation(state, summary)
 

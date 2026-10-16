@@ -2,21 +2,30 @@
 
 Envía WhatsApp al número de la abogada cuando ocurren eventos de negocio:
   - Nuevo lead completo
-  - Escalamiento
+  - Escalamiento (explicito o pendiente)
   - Cita agendada
 
 Best-effort: nunca lanza excepción al grafo.
 Módulo SINCRÓNICO: pensado para ser llamado desde core.db_client (psycopg3).
 """
 import logging
+import os
 
 import httpx
 
-from .config import ACCESS_TOKEN, API_VERSION, LAWYER_WHATSAPP_TO, PHONE_NUMBER_ID
+from .config import ACCESS_TOKEN, API_VERSION, PHONE_NUMBER_ID
 
 logger = logging.getLogger("leyia-notify")
 API_BASE = "https://graph.facebook.com"
 MAX_LEN = 3500
+
+# Destinataria de las notificaciones (la abogada). Reutiliza la env var
+# existente del operador si LAWYER_WHATSAPP_TO no está definida.
+LAWYER_WHATSAPP_TO = (
+    os.getenv("LAWYER_WHATSAPP_TO")
+    or os.getenv("WHATSAPP_OPERATOR_NUMBER")
+    or ""
+).replace("+", "").strip()
 
 
 def _clip(text: str, limit: int = 900) -> str:
@@ -74,9 +83,21 @@ def notify_new_lead(lead: dict) -> bool:
     return send_text_sync(LAWYER_WHATSAPP_TO, body)
 
 
-def notify_escalation(thread_id: str, summary: str, telefono: str | None = None) -> bool:
+def notify_escalation(
+    thread_id: str,
+    summary: str,
+    telefono: str | None = None,
+    motivo: str = "hablar_abogada",
+) -> bool:
+    """Notificación de escalamiento. El texto depende del motivo."""
+    icon, titulo = {
+        "ficha_completada":   ("📋", "Ficha completada — esperando decisión"),
+        "hablar_abogada":     ("🚨", "Cliente quiere hablar contigo"),
+        "derivacion_parcial": ("⚠️", "Derivación parcial por reintentos"),
+    }.get(motivo, ("🚨", "Escalamiento"))
+
     body = (
-        "🚨 *Escalamiento a ejecutiva*\n"
+        f"{icon} *{titulo}*\n"
         f"🧵 Hilo: {thread_id}\n"
         f"📞 Cliente: {_clip(telefono or 'sin teléfono', 30)}\n"
         f"📝 Resumen: {_clip(summary, 1200)}"
