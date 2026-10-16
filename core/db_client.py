@@ -7,10 +7,10 @@ Persiste:
   - escalations: handoffs a ejecutiva (una por thread_id, con motivo)
   - bookings: citas creadas en Google Calendar (una por thread_id)
 
-Escalations: una fila por cliente sirve de "cola de trabajo" del abogado.
-  motivo='ficha_completada'   → el cliente completó la ficha (SILENCIOSO)
-  motivo='hablar_abogada'     → pidió hablar con humano (NOTIFICA)
-  motivo='derivacion_parcial' → handoff tras agotar reintentos (NOTIFICA)
+Regla de oro SQL (psycopg3): un parámetro NUNCA debe aparecer más de una
+vez en la misma sentencia sin CAST, o PostgreSQL lanza AmbiguousParameter.
+Por eso las banderas derivadas (effective_status / category_is_specific)
+se computan en Python y se pasan como parámetros distintos.
 
 Todas las operaciones son best-effort: no lanzan excepción hacia el grafo.
 
@@ -100,10 +100,11 @@ def upsert_conversation(
     metadata: dict | None = None,
 ) -> None:
     """
-    Actualiza la conversación ACTIVA (si existe) o crea una nueva.
+    Actualiza la conversación ACTIVA (o crea una nueva).
+
     Reglas de status:
       - closed=True sin status explícito → 'closed'.
-      - Si no, se respeta el status que venga (o el actual).
+      - Caso contrario → se respeta el status que venga (o el actual).
       - INSERT fallback: default 'open'.
     """
     try:
@@ -112,6 +113,17 @@ def upsert_conversation(
         meta["updated_at"] = _now()
         if closed:
             meta["closed_at"] = _now()
+
+        # --- Cómputo en Python (evita AmbiguousParameter de psycopg3) ---
+        effective_status = status
+        if closed and status is None:
+            effective_status = "closed"
+
+        # Bandera "la categoría nueva es específica" (≠ 'otro'/'consulta_general')
+        category_is_specific = (
+            category is not None
+            and category not in ("otro", "consulta_general")
+        )
 
         with _get_engine().connect() as conn:
             updated = conn.execute(
@@ -123,16 +135,12 @@ def upsert_conversation(
                         THEN COALESCE(:channel, channel)
                         ELSE channel
                     END,
-                    status = CASE
-                        WHEN :closed AND :status IS NULL THEN 'closed'
-                        ELSE COALESCE(:status, status)
-                    END,
+                    status = COALESCE(:status, status),
                     intent_first = COALESCE(intent_first, :intent),
                     category = CASE
                         WHEN category IS NULL
                           OR category IN ('otro','consulta_general')
-                          OR (:category IS NOT NULL
-                              AND :category NOT IN ('otro','consulta_general'))
+                          OR :category_is_specific
                         THEN COALESCE(:category, category)
                         ELSE category
                     END,
@@ -150,15 +158,17 @@ def upsert_conversation(
                 {
                     "thread_id": thread_id,
                     "channel": _safe(channel),
-                    "status": _safe(status),
+                    "status": _safe(effective_status),
                     "intent": _safe(intent),
                     "category": _safe(category),
+                    "category_is_specific": category_is_specific,
                     "summary": _safe(summary),
                     "metadata_json": json.dumps(meta, ensure_ascii=False),
                     "closed": bool(closed),
                 },
             )
 
+            # Sin sesión activa → crear una nueva
             if updated.rowcount == 0:
                 conn.execute(
                     text("""
@@ -174,7 +184,7 @@ def upsert_conversation(
                     {
                         "thread_id": thread_id,
                         "channel": _safe(channel),
-                        "status": _safe(status),
+                        "status": _safe(effective_status),
                         "intent": _safe(intent),
                         "category": _safe(category),
                         "summary": _safe(summary),
@@ -226,8 +236,7 @@ def insert_message(
             )
             if result.rowcount == 0:
                 logger.warning(
-                    "[db] insert_message: NO hay conversación para thread_id=%r. "
-                    "¿Falta ensure_conversation() antes del primer mensaje?",
+                    "[db] insert_message: NO hay conversación para thread_id=%r.",
                     thread_id,
                 )
             conn.commit()
@@ -302,7 +311,7 @@ def upsert_lead(
             )
             conn.commit()
 
-        # Primera vez que se completa la ficha: notificar + registrar escalación silenciosa
+        # Primera vez que se completa → notificar + registrar escalación silenciosa
         if completed and not ya_notificado:
             from integrations.whatsapp.notify import notify_new_lead
             notify_new_lead({
@@ -321,7 +330,7 @@ def upsert_lead(
                 summary="Cliente completó la ficha y está considerando "
                         "agendar o hablar con la abogada.",
                 motivo="ficha_completada",
-                notificar=False,   # silencioso — la notif de lead ya avisó
+                notificar=False,
             )
     except Exception as e:
         logger.exception("[db] upsert_lead falló: %s", e)
@@ -339,51 +348,81 @@ def insert_escalation(
     """
     Upsert de escalación. Devuelve True si la notif quedó enviada (o no hacía falta).
 
-    Args:
-        summary:  Texto para la abogada.
-        motivo:   'ficha_completada' | 'hablar_abogada' | 'derivacion_parcial'.
-        notificar: si True, envía WhatsApp si no fue notificado antes.
-                   si False, solo upserta la fila (silencioso).
+    motivo:      'ficha_completada' | 'hablar_abogada' | 'derivacion_parcial'
+    notificar:   True → envía WhatsApp si no fue notificado antes.
+                 False → solo upserta la fila (silencioso).
     """
     try:
         thread_id = normalize_thread_id(thread_id)
+
+        # Compatibilidad con esquema sin columna `motivo`
         with _get_engine().connect() as conn:
-            conn.execute(
-                text(f"""
-                INSERT INTO escalations
-                    (conversation_id, thread_id, lead_id, summary, motivo,
-                     notificado_whatsapp, created_at)
-                SELECT
-                    ({_CONV_ID_SQL}),
-                    :thread_id,
-                    (SELECT l.id FROM leads l
-                     WHERE l.thread_id = :thread_id LIMIT 1),
-                    :summary, :motivo, FALSE, now()
-                ON CONFLICT (thread_id) DO UPDATE SET
-                    summary = COALESCE(:summary, escalations.summary),
-                    motivo  = :motivo
-                """),
-                {
-                    "thread_id": thread_id,
-                    "summary": _safe(summary),
-                    "motivo": motivo,
-                },
-            )
+            tiene_motivo = conn.execute(text("""
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'escalations'
+                  AND column_name = 'motivo'
+            """)).fetchone() is not None
+
+        with _get_engine().connect() as conn:
+            if tiene_motivo:
+                conn.execute(
+                    text(f"""
+                    INSERT INTO escalations
+                        (conversation_id, thread_id, lead_id, summary, motivo,
+                         notificado_whatsapp, created_at)
+                    SELECT
+                        ({_CONV_ID_SQL}),
+                        :thread_id,
+                        (SELECT l.id FROM leads l
+                         WHERE l.thread_id = :thread_id LIMIT 1),
+                        :summary, :motivo, FALSE, now()
+                    ON CONFLICT (thread_id) DO UPDATE SET
+                        summary = COALESCE(:summary, escalations.summary),
+                        motivo  = :motivo
+                    """),
+                    {
+                        "thread_id": thread_id,
+                        "summary": _safe(summary),
+                        "motivo": motivo or "hablar_abogada",
+                    },
+                )
+            else:
+                conn.execute(
+                    text(f"""
+                    INSERT INTO escalations
+                        (conversation_id, thread_id, lead_id, summary,
+                         notificado_whatsapp, created_at)
+                    SELECT
+                        ({_CONV_ID_SQL}),
+                        :thread_id,
+                        (SELECT l.id FROM leads l
+                         WHERE l.thread_id = :thread_id LIMIT 1),
+                        :summary, FALSE, now()
+                    ON CONFLICT (thread_id) DO UPDATE SET
+                        summary = COALESCE(:summary, escalations.summary)
+                    """),
+                    {
+                        "thread_id": thread_id,
+                        "summary": _safe(summary),
+                    },
+                )
             conn.commit()
 
         if not notificar:
             return True
 
-        # ¿Ya fue notificado antes?
+        # ¿Ya fue notificado?
         with _get_engine().connect() as conn:
             row = conn.execute(
-                text("SELECT notificado_whatsapp FROM escalations WHERE thread_id = :tid"),
+                text("SELECT notificado_whatsapp FROM escalations "
+                     "WHERE thread_id = :tid"),
                 {"tid": thread_id},
             ).fetchone()
         if row and row[0]:
-            return True  # nothing pending
+            return True
 
-        # Buscar teléfono del cliente (best-effort)
+        # Teléfono del cliente (best-effort)
         try:
             with _get_engine().connect() as conn:
                 row = conn.execute(
