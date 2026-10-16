@@ -241,6 +241,7 @@ class AgentState(TypedDict, total=False):
 
     response_bubbles: NotRequired[list[str]]        # burbujas separadas (fallback: response)
     response_interactive: NotRequired[dict | None]  # {"kind": "buttons"|"list", ...} one-shot
+    response_cta: NotRequired[dict | None] 
     intake_oferta_qid: NotRequired[str | None]      # campo para el que ya se ofreció salida
 
 # --------------------------------------------------------------------------

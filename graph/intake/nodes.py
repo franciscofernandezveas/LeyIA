@@ -1,13 +1,14 @@
 """graph/intake/nodes.py — Acciones del sub-agente INTAKE.
 
-v14 — Cierre dual post-ficha:
-  - El cliente ya NO es arrastrado al wizard de booking.
-  - Al completar la ficha ve dos botones: Agendar / Hablar con abogada.
-  - El padre (graph/nodes.py) decide determinísticamente la ruta siguiente.
+v15 — Cierre dual con dos mensajes:
+  - Mensaje 1: cierre con botón "Agendar una hora" (reply button).
+  - Mensaje 2: CTA URL "Pincha aquí" que abre wa.me con la ficha prellenada.
+  - El cliente elige; nada se fuerza.
 """
-
+import os
 import logging
 import unicodedata
+from urllib.parse import quote
 
 from langchain_core.messages import AIMessage
 
@@ -57,12 +58,16 @@ DEFAULT_CIERRE_SLA = ("Una ejecutiva revisará tu caso y te contactará *hoy "
                       "dentro del horario hábil* (09:00–18:30). Quedó todo "
                       "anotado a tu nombre.")
 DEFAULT_CIERRE_CTAS = (
-    "Tienes dos caminos desde aquí 👇\n"
-    "• *Agendar una hora* al tiro con la abogada, o\n"
-    "• *Hablar directamente* con ella — te derivo con tu ficha ya lista."
+    "¿Quieres asegurarte más pronto? Agenda la asesoría ahora mismo 👇"
+)
+DEFAULT_CIERRE_CTA = (
+    "Si prefieres que el equipo te contacte directamente, pincha aquí:"
 )
 DEFAULT_DERIVA = ("Ningún problema{nombre} — te paso directamente con una "
                   "ejecutiva para que lo vean contigo 🤝\n{wa_link}")
+
+# Número de la ejecutiva para el CTA wa.me (override vía env var).
+WA_EJECUTIVA = os.getenv("WA_EJECUTIVA", "56942313989")
 
 
 def _sin_tildes(s: str) -> str:
@@ -141,11 +146,8 @@ _INTERACTIVE_CONSENTIMIENTO = _botones(("si", "Sí, autorizo"),
 _BOTONES_OFERTA = _botones(("humano", "Hablar con humano"),
                            ("retry", "Lo intento de nuevo"))
 
-# v14: cierre dual — el cliente elige, no el bot.
-_BOTONES_CIERRE = _botones(
-    ("agendar", "Agendar una hora"),
-    ("hablar_abogada", "Hablar con abogada"),
-)
+# v15: botón Agendar para el primer mensaje del cierre.
+_BOTON_AGENDAR = _botones(("agendar", "Agendar una hora"))
 
 _ETAPA_TITULOS = ["Aún no inicio nada", "Me demandaron / avisaron",
                   "Causa en curso", "Hay sentencia previa"]
@@ -342,6 +344,42 @@ def _persistir_parcial(state: AgentState, respuestas: dict) -> None:
         logger.warning("upsert_lead parcial falló (best-effort): %s", e)
 
 
+def _texto_ficha_wa(respuestas: dict, thread_id: str) -> str:
+    """Corta el texto de la ficha para que quepa en la URL de wa.me."""
+    nombre = respuestas.get("nombre") or ""
+    email = respuestas.get("email") or ""
+    situacion = respuestas.get("situacion_actual") or ""
+    etapa = respuestas.get("etapa_proceso") or ""
+    telefono = respuestas.get("telefono") or ""
+    categoria = respuestas.get("categoria") or "consulta_general"
+
+    return (
+        f"Hola, soy {nombre}. Acabo de completar mi registro. "
+        f"Resumen de mi caso:\n"
+        f"• Área: {categoria}\n"
+        f"• Correo: {email}\n"
+        f"• Teléfono: {telefono}\n"
+        f"• Mi situación: {situacion}\n"
+        f"• Etapa de mi caso: {etapa}\n"
+        f"(ID de mi atención: {thread_id})"
+    )
+
+
+def _cta_humano_con_ficha(respuestas: dict, thread_id: str) -> dict:
+    """CTA URL 'Pincha aquí' que abre wa.me con la ficha prellenada."""
+    texto = _texto_ficha_wa(respuestas, thread_id)
+    url = f"https://wa.me/{WA_EJECUTIVA}?text={quote(texto)}"
+
+    return {
+        "text": DEFAULT_CIERRE_CTA,
+        "interactive": {
+            "kind": "cta",
+            "text": "Pincha aquí",
+            "url": url,
+        },
+    }
+
+
 def iniciar_ficha(state: AgentState) -> AgentState:
     sec = _cfg()["intake"]
     respuestas: dict = {}
@@ -491,23 +529,27 @@ def procesar_respuesta(state: AgentState) -> AgentState:
 
 def _completar_ficha(state: AgentState, respuestas: dict) -> AgentState:
     sec = _cfg()["intake"]
-    state_con_ficha = {
-        **state, "intake_respuestas": respuestas, "intake_completado": True,
-    }
+    state_con_ficha = {**state, "intake_respuestas": respuestas,
+                       "intake_completado": True}
     nombre = _primer_nombre(respuestas.get("nombre"))
-    link_humano = _wa_link_diagnostico(state_con_ficha)
+    tid = state.get("thread_id", "")
 
     burbujas = [
         sec.get("cierre_listo", DEFAULT_CIERRE_LISTO).format(
             nombre=f", {nombre}" if nombre else ""),
         sec.get("cierre_sla", DEFAULT_CIERRE_SLA),
-        sec.get("cierre_ctas", DEFAULT_CIERRE_CTAS).format(wa_link=link_humano),
+        sec.get("cierre_ctas", DEFAULT_CIERRE_CTAS),
     ]
-    pack = _pack(burbujas, interactive=_BOTONES_CIERRE)  # v14: cierre dual
+
+    pack = _pack(burbujas, interactive=_BOTON_AGENDAR)
+
+    # Segundo mensaje: CTA "Pincha aquí" con la ficha comprimida en URL
+    cta = _cta_humano_con_ficha(respuestas, tid)
+    pack["response_cta"] = cta
 
     try:
         upsert_lead(
-            thread_id=state.get("thread_id", ""),
+            thread_id=tid,
             intake_respuestas=respuestas,
             category=state.get("category"),
             completed=True,
@@ -524,7 +566,7 @@ def _completar_ficha(state: AgentState, respuestas: dict) -> AgentState:
         "intake_activo": False,
         "intake_completado": True,
         "intake_respuestas": respuestas,
-        "intake_exit": "cta_cierre",  # v14: termina turno; padre espera elección
+        "intake_exit": "cta_cierre",  # v15: termina turno; padre espera elección
         "intake_decision": None,
         "intake_stage": "completado",
         "intake_oferta_qid": None,

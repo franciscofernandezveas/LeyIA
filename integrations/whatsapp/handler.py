@@ -105,13 +105,13 @@ async def process_message(msg: WhatsAppMessage) -> None:
 
 async def run_agent(wa_id: str, text: str, name: str | None) -> dict:
     if not AGENT_AVAILABLE:
-        return {"text": MSG_ERROR, "interactive": None}
+        return {"text": MSG_ERROR, "interactive": None, "cta": None}
 
     thread_id = f"wa-{wa_id}"
     config = graph_config(thread_id, user_id=wa_id, channel="whatsapp")
 
     if await in_executor(pending_interrupts, config):
-        return {"text": MSG_HITL, "interactive": None}
+        return {"text": MSG_HITL, "interactive": None, "cta": None}
 
     payload = {"messages": [("human", text)], "thread_id": thread_id}
     await in_executor(invoke_sync, payload, config)
@@ -123,13 +123,14 @@ async def run_agent(wa_id: str, text: str, name: str | None) -> dict:
                 OPERATOR_NUMBER,
                 f"⚖️ HITL de {name or wa_id} ({thread_id}). Revísalo en el dashboard.",
             )
-        return {"text": MSG_HITL, "interactive": None}
+        return {"text": MSG_HITL, "interactive": None, "cta": None}
 
     values = await in_executor(state_values, config)
     return {
         "text": values.get("response")
                 or "No pude generar una respuesta, ¿puedes repetir tu consulta?",
         "interactive": values.get("response_interactive"),
+        "cta": values.get("response_cta"),          # NUEVO: segundo paquete (texto + CTA URL)
     }
 
 
@@ -141,7 +142,14 @@ async def _deliver(to: str, reply: dict) -> None:
         interactives = [interactives]
     interactives = [i for i in (interactives or []) if isinstance(i, dict)]
 
-    if not interactives:
+    # NUEVO: paquete CTA opcional (ej. "Pincha aquí" post-ficha)
+    cta = reply.get("cta") if isinstance(reply.get("cta"), dict) else {}
+    cta_text = (cta.get("text") or "").strip()
+    cta_inter = cta.get("interactive")
+    if not isinstance(cta_inter, dict):
+        cta_inter = None
+
+    if not interactives and not cta_inter:
         if text:
             await send_text(to, text)
         return
@@ -150,7 +158,7 @@ async def _deliver(to: str, reply: dict) -> None:
     # Si no, va como mensaje de texto previo (Meta: max 1024 chars en body).
     text_in_first = bool(text) and len(text) <= MAX_INTERACTIVE_BODY
 
-    if text and not text_in_first:
+    if text and not (interactives and text_in_first):
         await send_text(to, text)
 
     for idx, inter in enumerate(interactives):
@@ -165,6 +173,13 @@ async def _deliver(to: str, reply: dict) -> None:
             await send_interactive(to, body, inter)
         except ValueError:
             logger.warning("interactive inválido ignorado: %r", inter, exc_info=True)
+
+    # NUEVO: se envía AL FINAL, como mensaje aparte con su propio botón URL
+    if cta_inter:
+        try:
+            await send_interactive(to, cta_text or "Pincha aquí 👇", cta_inter)
+        except ValueError:
+            logger.warning("cta inválido ignorado: %r", cta_inter, exc_info=True)
 
 
 async def reaper_loop() -> None:
