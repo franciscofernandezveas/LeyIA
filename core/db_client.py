@@ -1,18 +1,18 @@
 """core/db_client.py — Cliente PostgreSQL/Supabase para datos de negocio.
 
 Persiste:
-  - conversations: hilo completo
+  - conversations: hilo completo (una fila por SESIÓN de 24h)
   - messages: cada mensaje humano/AI
-  - leads: fichas de intake
-  - escalations: handoffs a ejecutiva
-  - bookings: citas creadas en Google Calendar
+  - leads: fichas de intake (una por thread_id)
+  - escalations: handoffs a ejecutiva (una por thread_id)
+  - bookings: citas creadas en Google Calendar (una por thread_id)
 
 Todas las operaciones son best-effort: no lanzan excepción hacia el grafo.
 
-Nota driver: psycopg3. Tras el pooler en modo transacción los prepared
- statements colisionan entre sesiones (DuplicatePreparedStatement), por eso
-el engine se crea con prepare_threshold=None — mismo criterio que
-core.persistence.build_postgres_checkpointer.
+Sesión: `conversations` ya no tiene UNIQUE(thread_id); cada 24h de inactividad
+se cierra y se crea una nueva. Los INSERTs usan un COALESCE que prioriza
+la sesión ACTIVA (closed_at IS NULL), con fallback a la última para no perder
+linkage histórico.
 """
 import json
 import logging
@@ -24,10 +24,28 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.pool import QueuePool
 
+from core.threads import normalize_thread_id
+
 logger = logging.getLogger(__name__)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 _engine: Engine | None = None
+
+
+# Subquery que devuelve el conversation_id "correspondiente":
+#   - La sesión ACTIVA si existe (caso normal).
+#   - Fallback: la última sesión conocida (por si el flujo llama fuera de turno).
+# Nunca devuelve una fila arbitraria.
+_CONV_ID_SQL = """
+    COALESCE(
+        (SELECT c.id FROM conversations c
+         WHERE c.thread_id = :thread_id AND c.closed_at IS NULL
+         ORDER BY c.created_at DESC LIMIT 1),
+        (SELECT c.id FROM conversations c
+         WHERE c.thread_id = :thread_id
+         ORDER BY c.created_at DESC LIMIT 1)
+    )
+"""
 
 
 def _get_engine() -> Engine:
@@ -75,37 +93,48 @@ def upsert_conversation(
     closed: bool | None = None,
     metadata: dict | None = None,
 ) -> None:
+    """
+    Actualiza la conversación ACTIVA (si existe) o crea una nueva.
+    Ya no usa ON CONFLICT porque puede haber varias filas por thread_id.
+    """
     try:
+        thread_id = normalize_thread_id(thread_id)
         meta = metadata or {}
         meta["updated_at"] = _now()
         if closed:
             meta["closed_at"] = _now()
 
         with _get_engine().connect() as conn:
-            conn.execute(
-                text("""
-                insert into conversations (thread_id, channel, status, intent_first, category, summary, metadata, created_at, updated_at)
-                values (:thread_id, :channel, :status, :intent, :category, :summary, CAST(:metadata_json AS jsonb), now(), now())
-                on conflict (thread_id) do update set
-                    channel = case
-                        when conversations.channel is null
-                          or conversations.channel in ('desconocido', 'sin_canal')
-                        then coalesce(:channel, conversations.channel)
-                        else conversations.channel
-                    end,
-                    status = coalesce(:status, conversations.status),
-                    intent_first = coalesce(conversations.intent_first, excluded.intent_first),
-                    category = case
-                        when conversations.category is null
-                             or conversations.category in ('otro', 'consulta_general')
-                             or excluded.category not in ('otro', 'consulta_general')
-                        then excluded.category
-                        else conversations.category
-                    end,
-                    summary = coalesce(:summary, conversations.summary),
-                    metadata = coalesce(conversations.metadata, '{}'::jsonb) || CAST(:metadata_json AS jsonb),
+            # 1) Intentar actualizar la conversación ACTIVA
+            updated = conn.execute(
+                text(f"""
+                UPDATE conversations SET
+                    channel = CASE
+                        WHEN channel IS NULL
+                          OR channel IN ('desconocido','sin_canal')
+                        THEN COALESCE(:channel, channel)
+                        ELSE channel
+                    END,
+                    status = COALESCE(:status, status),
+                    intent_first = COALESCE(intent_first, :intent),
+                    category = CASE
+                        WHEN category IS NULL
+                          OR category IN ('otro','consulta_general')
+                          OR (:category IS NOT NULL
+                              AND :category NOT IN ('otro','consulta_general'))
+                        THEN COALESCE(:category, category)
+                        ELSE category
+                    END,
+                    summary = COALESCE(:summary, summary),
+                    metadata = COALESCE(metadata, '{{}}'::jsonb)
+                               || CAST(:metadata_json AS jsonb),
                     updated_at = now(),
-                    closed_at = case when :closed then now() else conversations.closed_at end
+                    closed_at = CASE WHEN :closed THEN now() ELSE closed_at END
+                WHERE id = (
+                    SELECT c.id FROM conversations c
+                    WHERE c.thread_id = :thread_id AND c.closed_at IS NULL
+                    ORDER BY c.created_at DESC LIMIT 1
+                )
                 """),
                 {
                     "thread_id": thread_id,
@@ -118,6 +147,29 @@ def upsert_conversation(
                     "closed": bool(closed),
                 },
             )
+
+            # 2) Si no había ninguna activa, crear una nueva
+            if updated.rowcount == 0:
+                conn.execute(
+                    text("""
+                    INSERT INTO conversations
+                        (thread_id, channel, status, intent_first, category,
+                         summary, metadata, created_at, updated_at)
+                    VALUES (:thread_id, :channel, :status, :intent, :category,
+                            :summary, CAST(:metadata_json AS jsonb),
+                            now(), now())
+                    """),
+                    {
+                        "thread_id": thread_id,
+                        "channel": _safe(channel),
+                        "status": _safe(status),
+                        "intent": _safe(intent),
+                        "category": _safe(category),
+                        "summary": _safe(summary),
+                        "metadata_json": json.dumps(meta, ensure_ascii=False),
+                    },
+                )
+
             conn.commit()
     except Exception as e:
         logger.exception("[db] upsert_conversation falló: %s", e)
@@ -134,12 +186,17 @@ def insert_message(
     category: str | None = None,
 ) -> None:
     try:
+        thread_id = normalize_thread_id(thread_id)
         with _get_engine().connect() as conn:
-            conn.execute(
-                text("""
-                insert into messages (conversation_id, thread_id, role, content, route, sentiment, urgency, intent, category, created_at)
-                select c.id, :thread_id, :role, :content, :route, :sentiment, :urgency, :intent, :category, now()
-                from conversations c where c.thread_id = :thread_id
+            result = conn.execute(
+                text(f"""
+                INSERT INTO messages
+                    (conversation_id, thread_id, role, content, route,
+                     sentiment, urgency, intent, category, created_at)
+                SELECT
+                    ({_CONV_ID_SQL}),
+                    :thread_id, :role, :content, :route, :sentiment,
+                    :urgency, :intent, :category, now()
                 """),
                 {
                     "thread_id": thread_id,
@@ -152,9 +209,16 @@ def insert_message(
                     "category": _safe(category),
                 },
             )
+            if result.rowcount == 0:
+                logger.warning(
+                    "[db] insert_message: NO hay conversación para thread_id=%r. "
+                    "¿Falta ensure_conversation() antes del primer mensaje?",
+                    thread_id,
+                )
             conn.commit()
     except Exception as e:
         logger.exception("[db] insert_message falló: %s", e)
+
 
 def upsert_lead(
     thread_id: str,
@@ -163,6 +227,7 @@ def upsert_lead(
     completed: bool = False,
 ) -> None:
     try:
+        thread_id = normalize_thread_id(thread_id)
         r = intake_respuestas or {}
         meta = {}
         if completed:
@@ -172,7 +237,7 @@ def upsert_lead(
         consent_bool = consent if isinstance(consent, bool) else None
 
         with _get_engine().connect() as conn:
-            # --- NUEVO: saber si este lead YA estaba completo (evita notif. duplicadas)
+            # ¿Ya estaba completo este lead? (evita notificación duplicada)
             prev = conn.execute(
                 text("select completed_at from leads where thread_id = :thread_id"),
                 {"thread_id": thread_id},
@@ -180,22 +245,30 @@ def upsert_lead(
             ya_notificado = prev is not None and prev.completed_at is not None
 
             conn.execute(
-                text("""
-                insert into leads (conversation_id, thread_id, nombre, email, telefono, situacion, etapa_proceso, categoria, consentimiento, completed_at, metadata)
-                select c.id, :thread_id, :nombre, :email, :telefono, :situacion, :etapa, :categoria, :consentimiento,
-                       case when :completed then now() else null end,
-                       CAST(:metadata_json AS jsonb)
-                from conversations c where c.thread_id = :thread_id
-                on conflict (thread_id) do update set
-                    nombre = coalesce(:nombre, leads.nombre),
-                    email = coalesce(:email, leads.email),
-                    telefono = coalesce(:telefono, leads.telefono),
-                    situacion = coalesce(:situacion, leads.situacion),
-                    etapa_proceso = coalesce(:etapa, leads.etapa_proceso),
-                    categoria = coalesce(:categoria, leads.categoria),
-                    consentimiento = coalesce(:consentimiento, leads.consentimiento),
-                    completed_at = case when :completed and leads.completed_at is null then now() else leads.completed_at end,
-                    metadata = coalesce(leads.metadata, '{}'::jsonb) || CAST(:metadata_json AS jsonb)
+                text(f"""
+                INSERT INTO leads
+                    (conversation_id, thread_id, nombre, email, telefono,
+                     situacion, etapa_proceso, categoria, consentimiento,
+                     completed_at, metadata)
+                SELECT
+                    ({_CONV_ID_SQL}),
+                    :thread_id, :nombre, :email, :telefono, :situacion,
+                    :etapa, :categoria, :consentimiento,
+                    CASE WHEN :completed THEN now() ELSE NULL END,
+                    CAST(:metadata_json AS jsonb)
+                ON CONFLICT (thread_id) DO UPDATE SET
+                    nombre = COALESCE(:nombre, leads.nombre),
+                    email = COALESCE(:email, leads.email),
+                    telefono = COALESCE(:telefono, leads.telefono),
+                    situacion = COALESCE(:situacion, leads.situacion),
+                    etapa_proceso = COALESCE(:etapa, leads.etapa_proceso),
+                    categoria = COALESCE(:categoria, leads.categoria),
+                    consentimiento = COALESCE(:consentimiento, leads.consentimiento),
+                    completed_at = CASE
+                        WHEN :completed AND leads.completed_at IS NULL
+                        THEN now() ELSE leads.completed_at END,
+                    metadata = COALESCE(leads.metadata, '{{}}'::jsonb)
+                               || CAST(:metadata_json AS jsonb)
                 """),
                 {
                     "thread_id": thread_id,
@@ -212,7 +285,7 @@ def upsert_lead(
             )
             conn.commit()
 
-        # --- NUEVO: notificar solo la primera vez que se completa
+        # Notificar solo la primera vez que se completa
         if completed and not ya_notificado:
             from integrations.whatsapp.notify import notify_new_lead
             notify_new_lead({
@@ -226,21 +299,26 @@ def upsert_lead(
     except Exception as e:
         logger.exception("[db] upsert_lead falló: %s", e)
 
+
 def insert_escalation(
     thread_id: str,
     summary: str,
     notificado_whatsapp: bool = False,
 ) -> None:
     try:
+        thread_id = normalize_thread_id(thread_id)
         with _get_engine().connect() as conn:
             conn.execute(
-                text("""
-                insert into escalations (conversation_id, thread_id, lead_id, summary, notificado_whatsapp, created_at)
-                select c.id, :thread_id, l.id, :summary, :notificado, now()
-                from conversations c
-                left join leads l on l.thread_id = :thread_id
-                where c.thread_id = :thread_id
-                on conflict (thread_id) do update set
+                text(f"""
+                INSERT INTO escalations
+                    (conversation_id, thread_id, lead_id, summary,
+                     notificado_whatsapp, created_at)
+                SELECT
+                    ({_CONV_ID_SQL}),
+                    :thread_id,
+                    (SELECT l.id FROM leads l WHERE l.thread_id = :thread_id LIMIT 1),
+                    :summary, :notificado, now()
+                ON CONFLICT (thread_id) DO UPDATE SET
                     summary = :summary,
                     notificado_whatsapp = :notificado
                 """),
@@ -251,7 +329,6 @@ def insert_escalation(
                 },
             )
 
-            # --- NUEVO: ¿ya fue notificado antes? (evita duplicados en re-escalamiento)
             prev = conn.execute(
                 text("select notificado_whatsapp from escalations where thread_id = :thread_id"),
                 {"thread_id": thread_id},
@@ -262,7 +339,6 @@ def insert_escalation(
 
         if not ya_notificado:
             from integrations.whatsapp.notify import notify_escalation
-            # buscar teléfono del cliente para el mensaje
             try:
                 with _get_engine().connect() as conn2:
                     row = conn2.execute(
@@ -285,15 +361,15 @@ def insert_escalation(
         logger.exception("[db] insert_escalation falló: %s", e)
 
 
-
 def insert_booking(
     thread_id: str,
     booking: dict,
 ) -> None:
     try:
+        thread_id = normalize_thread_id(thread_id)
         b = booking or {}
         with _get_engine().connect() as conn:
-            # --- NUEVO: ¿ya existía booking para este hilo? (true = re-agenda)
+            # ¿Ya existía booking para este hilo? (true = re-agenda)
             ya_existia = (
                 conn.execute(
                     text("select 1 from bookings where thread_id = :thread_id"),
@@ -303,13 +379,19 @@ def insert_booking(
             )
 
             conn.execute(
-                text("""
-                insert into bookings (conversation_id, thread_id, lead_id, evento_id, fecha, hora_inicio, hora_fin, modalidad, meet_link, html_link, cliente_nombre, cliente_email, inicio_cita, created_at)
-                select c.id, :thread_id, l.id, :evento_id, :fecha, :hora_inicio, :hora_fin, :modalidad, :meet_link, :html_link, :cliente_nombre, :cliente_email, CAST(:inicio_cita AS timestamptz), now()
-                from conversations c
-                left join leads l on l.thread_id = :thread_id
-                where c.thread_id = :thread_id
-                on conflict (thread_id) do update set
+                text(f"""
+                INSERT INTO bookings
+                    (conversation_id, thread_id, lead_id, evento_id, fecha,
+                     hora_inicio, hora_fin, modalidad, meet_link, html_link,
+                     cliente_nombre, cliente_email, inicio_cita, created_at)
+                SELECT
+                    ({_CONV_ID_SQL}),
+                    :thread_id,
+                    (SELECT l.id FROM leads l WHERE l.thread_id = :thread_id LIMIT 1),
+                    :evento_id, :fecha, :hora_inicio, :hora_fin, :modalidad,
+                    :meet_link, :html_link, :cliente_nombre, :cliente_email,
+                    CAST(:inicio_cita AS timestamptz), now()
+                ON CONFLICT (thread_id) DO UPDATE SET
                     evento_id = :evento_id,
                     fecha = :fecha,
                     hora_inicio = :hora_inicio,
@@ -317,10 +399,11 @@ def insert_booking(
                     modalidad = :modalidad,
                     meet_link = :meet_link,
                     html_link = :html_link,
-                    cliente_nombre = coalesce(:cliente_nombre, bookings.cliente_nombre),
-                    cliente_email = coalesce(:cliente_email, bookings.cliente_email),
-                    inicio_cita = coalesce(CAST(:inicio_cita AS timestamptz), bookings.inicio_cita),
-                    lead_id = coalesce(bookings.lead_id, excluded.lead_id)
+                    cliente_nombre = COALESCE(:cliente_nombre, bookings.cliente_nombre),
+                    cliente_email = COALESCE(:cliente_email, bookings.cliente_email),
+                    inicio_cita = COALESCE(CAST(:inicio_cita AS timestamptz),
+                                           bookings.inicio_cita),
+                    lead_id = COALESCE(bookings.lead_id, EXCLUDED.lead_id)
                 """),
                 {
                     "thread_id": thread_id,
@@ -338,7 +421,6 @@ def insert_booking(
             )
             conn.commit()
 
-        # --- NUEVO: solo citas nuevas (las re-agendas ya las ve la abogada en Calendar)
         if not ya_existia:
             from integrations.whatsapp.notify import notify_booking
             notify_booking(b)

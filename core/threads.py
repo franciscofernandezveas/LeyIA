@@ -3,9 +3,25 @@ import re
 def wa_thread_id(phone: str) -> str:
     """
     thread_id determinista para WhatsApp.
-    Respeta la convención ya existente: 'wa-<teléfono>' (guión medio).
+    Convención: 'wa-<teléfono>' (guión medio, NO underscore).
     """
     return "wa-" + re.sub(r"\D", "", phone or "")
+
+
+def normalize_thread_id(thread_id: str) -> str:
+    """
+    Normaliza variantes históricas de thread_id a la convención actual.
+    Sirve de red de seguridad si algún script/backfill introduce el
+    formato antiguo con underscore.
+    """
+    if not thread_id:
+        return thread_id
+
+    # wa_12345678 → wa-12345678
+    if thread_id.startswith("wa_"):
+        return "wa-" + thread_id[3:]
+
+    return thread_id
 
 
 def channel_from_thread(thread_id: str) -> str:
