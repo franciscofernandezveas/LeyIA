@@ -1,3 +1,10 @@
+"""integrations/whatsapp/db/repository.py — Persistencia de mensajes WA.
+
+Convención de thread_id: 'wa-<teléfono>' (guión medio).
+Sesiones: cada 24h de inactividad se cierra la conversación activa y se
+crea una nueva al recibir el siguiente mensaje. Se controla con la env var
+CONVERSATION_TTL_HORAS (default 24).
+"""
 import logging
 import os
 
@@ -19,7 +26,8 @@ SESSION_TTL_HORAS = int(os.getenv("CONVERSATION_TTL_HORAS", "24"))
 async def ensure_conversation(thread_id: str, phone: str) -> None:
     """
     Garantiza que exista una conversación ABIERTA para este thread_id:
-      1. Cierra la sesión activa si expiró por TTL (> SESSION_TTL_HORAS).
+
+      1. Cierra la sesión activa si expiró por TTL (updated_at antiguo).
       2. Crea una sesión nueva si no hay ninguna activa.
       3. Actualiza el heartbeat (updated_at) de la sesión activa.
 
@@ -33,7 +41,7 @@ async def ensure_conversation(thread_id: str, phone: str) -> None:
             text("""
                 UPDATE conversations
                 SET closed_at = updated_at,
-                    status = 'session_expired'
+                    status = 'closed'
                 WHERE thread_id = :tid
                   AND closed_at IS NULL
                   AND updated_at < now() - make_interval(hours => :ttl)
@@ -83,10 +91,11 @@ async def register_message(message: WhatsAppMessage) -> str:
     tid = wa_thread_id(message.customer_phone)
 
     # 1) Conversación primero (con rotación de sesión por TTL).
-    #    Sin esto insert_message() del agente podría insertar 0 filas.
+    #    Sin esto, insert_message() del agente podría insertar 0 filas
+    #    silenciosamente.
     await ensure_conversation(tid, message.customer_phone)
 
-    # 2) Registrar el mensaje entrante.
+    # 2) Registrar el mensaje entrante (idempotente por whatsapp_message_id).
     stmt = (
         insert(MessageRecord)
         .values(
