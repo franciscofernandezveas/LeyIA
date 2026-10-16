@@ -1,11 +1,16 @@
 """Contratos centrales: estado del grafo, thread_id y esquemas estructurados.
 
+v6.3 — Cierre dual post-intake + fix EMAIL_RE:
+  - EMAIL_RE acepta dominios con un solo punto (gmail.com, yahoo.cl);
+    el patrón anterior exigía doble punto (mail.empresa.co.cl).
+  - intake_exit incluye nuevos valores "cta_cierre" y "cta_escala"
+    para el cierre dual: Agendar / Hablar con abogada.
+
 v6.2 — Refactor intake:
-  - EMAIL_RE más estricto (rechaza TLD de 1 carácter y dominios mal formados).
   - IntakeExtract marcado como deprecated (la extracción activa del intake ahora
     usa IntakeDecision en graph/intake/contracts.py).
   - Limpieza de comentarios duplicados en AgentState; intake_exit documenta
-    los nuevos valores "agendar" y "end".
+    los valores "agendar" y "end".
 
 v6.1 — Booking signal/estado extendidos:
        + BookingSignalLabel incluye "tanda_repetida" (consultar_disponibilidad
@@ -130,8 +135,9 @@ BookingSignalLabel = Literal[
 ]
 
 # Formato razonable de email (validación práctica, no RFC 5322 completa).
-# v6.2: más estricto — requiere al menos un subdominio y TLD de 2+ caracteres,
-# rechazando casos como test@gmail.c o usuario@dominio-.
+# v6.3: dominio de subdominio opcional — gmail.com/x@gmail.cl vuelven a pasar.
+#       Sigue rechazando TLD de 1 carácter (test@gmail.c) y dominios
+#       mal formados (usuario@dominio-).
 EMAIL_RE = re.compile(r"^[\w.+-]+@[\w-]+(\.[\w-]+)*\.[a-zA-Z]{2,}$")
 
 
@@ -224,7 +230,8 @@ class AgentState(TypedDict, total=False):
     intake_stage: str | None                  # apertura|preguntando|pausado|completado|...
     intake_attempts: int                      # fallos de validación en la pregunta activa
     intake_exit: str | None                   # None | "faq" | "pausa" | "handoff" |
-                                              # "agendar" | "end"
+                                              # "agendar" | "end" |
+                                              # "cta_cierre" | "cta_escala"
     intake_resume: bool                       # tras FAQ lateral, intake re-pregunta pendiente
 
     # --- Escalamiento / cierre (nodo handoff_humano) ---

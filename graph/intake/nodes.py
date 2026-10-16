@@ -1,13 +1,9 @@
 """graph/intake/nodes.py — Acciones del sub-agente INTAKE.
 
-v13 — Refactor crítico:
-  - Rompe ciclo de importación (usa graph.utils en vez de graph.nodes).
-  - Elimina _CAMPOS_SOLO_EXTRACCION; todo campo acepta extracción LLM + fallback
-    validador directo (nombre ya no depende solo del LLM).
-  - intake_exit: 'agendar' alinea CTA de cierre con routing del padre.
-  - abandono/sin_consentimiento terminan el turno (intake_exit='end', closed=True).
-  - Eventos de negocio estructurados.
-  - Truncado defensivo de burbujas contra WA_TEXTO_MAX.
+v14 — Cierre dual post-ficha:
+  - El cliente ya NO es arrastrado al wizard de booking.
+  - Al completar la ficha ve dos botones: Agendar / Hablar con abogada.
+  - El padre (graph/nodes.py) decide determinísticamente la ruta siguiente.
 """
 
 import logging
@@ -60,9 +56,11 @@ DEFAULT_CIERRE_LISTO = "🎉 ¡Listo{nombre}! Tu ficha quedó registrada."
 DEFAULT_CIERRE_SLA = ("Una ejecutiva revisará tu caso y te contactará *hoy "
                       "dentro del horario hábil* (09:00–18:30). Quedó todo "
                       "anotado a tu nombre.")
-DEFAULT_CIERRE_CTAS = ("¿Quieres asegurar la hora? Agenda ahora mismo 👇\n"
-                       "Si prefieres que te contactemos nosotros, escríbele "
-                       "directo a la ejecutiva: {wa_link}")
+DEFAULT_CIERRE_CTAS = (
+    "Tienes dos caminos desde aquí 👇\n"
+    "• *Agendar una hora* al tiro con la abogada, o\n"
+    "• *Hablar directamente* con ella — te derivo con tu ficha ya lista."
+)
 DEFAULT_DERIVA = ("Ningún problema{nombre} — te paso directamente con una "
                   "ejecutiva para que lo vean contigo 🤝\n{wa_link}")
 
@@ -142,7 +140,12 @@ _INTERACTIVE_CONSENTIMIENTO = _botones(("si", "Sí, autorizo"),
                                        ("no", "No autorizo"))
 _BOTONES_OFERTA = _botones(("humano", "Hablar con humano"),
                            ("retry", "Lo intento de nuevo"))
-_BOTON_AGENDAR = _botones(("agendar", "Agendar una hora"))
+
+# v14: cierre dual — el cliente elige, no el bot.
+_BOTONES_CIERRE = _botones(
+    ("agendar", "Agendar una hora"),
+    ("hablar_abogada", "Hablar con abogada"),
+)
 
 _ETAPA_TITULOS = ["Aún no inicio nada", "Me demandaron / avisaron",
                   "Causa en curso", "Hay sentencia previa"]
@@ -194,7 +197,7 @@ QUESTIONS: list[dict] = [
                       "ocurrió*, *quiénes* están involucrados y *desde "
                       "cuándo*?"),
      "ack": None,
-     "validate": _v_text(20)},
+     "validate": _v_text(8)},  # v14: bajado de 20 para no expulsar relatos cortos
 
     {"id": "etapa_proceso", "requerida": False,
      "label": "la etapa del caso",
@@ -500,7 +503,7 @@ def _completar_ficha(state: AgentState, respuestas: dict) -> AgentState:
         sec.get("cierre_sla", DEFAULT_CIERRE_SLA),
         sec.get("cierre_ctas", DEFAULT_CIERRE_CTAS).format(wa_link=link_humano),
     ]
-    pack = _pack(burbujas, interactive=_BOTON_AGENDAR)
+    pack = _pack(burbujas, interactive=_BOTONES_CIERRE)  # v14: cierre dual
 
     try:
         upsert_lead(
@@ -521,7 +524,7 @@ def _completar_ficha(state: AgentState, respuestas: dict) -> AgentState:
         "intake_activo": False,
         "intake_completado": True,
         "intake_respuestas": respuestas,
-        "intake_exit": "agendar",
+        "intake_exit": "cta_cierre",  # v14: termina turno; padre espera elección
         "intake_decision": None,
         "intake_stage": "completado",
         "intake_oferta_qid": None,
