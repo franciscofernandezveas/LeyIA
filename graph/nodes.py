@@ -1,5 +1,9 @@
 """graph/nodes.py — Nodos transversales del agente (Manzzo y Cía).
 
+v19 — Añade handoff_choice: bifurcación previa a handoff/intake que pregunta
+       al usuario si prefiere rellenar una ficha breve o recibir contacto
+       directo, reduciendo la fricción de forzar siempre el intake completo.
+
 v18 — FIX import: verificado, sin constantes de booking en core.contracts.
        Este archivo solo importa AgentState, AnalisisResult, rutas y
        fallback_analisis del módulo central.
@@ -24,6 +28,7 @@ from langgraph.graph import END
 from core.contracts import (
     AgentState, AnalisisResult,
     ROUTE_AGENDAR, ROUTE_FAQ, ROUTE_FUERA_DOMINIO, ROUTE_HANDOFF, ROUTE_INTAKE,
+    ROUTE_HANDOFF_CHOICE,
     VALID_ROUTES, fallback_analisis,
 )
 from core.db_client import (
@@ -52,7 +57,6 @@ _AGENDAR_CTA = ("agendar una hora", "agendar", "agendar ahora",
                 "agendar hora", "quiero agendar", "quiero agendar una hora")
 
 
-
 _EMAIL_BUSCA = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 _NOMBRE_RE = re.compile(
     r"(?:soy|me llamo|mi nombre es)\s+"
@@ -60,6 +64,51 @@ _NOMBRE_RE = re.compile(
     r"(?:\s+[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]{2,}){0,3})",
     re.IGNORECASE,
 )
+
+
+_RESET_INTAKE = {
+    "intake_activo": False, "intake_idx": 0, "intake_respuestas": {},
+    "intake_attempts": 0, "intake_exit": None, "intake_resume": False,
+    "intake_decision": None, "intake_stage": None, "intake_started_en": None,
+    "intake_completado": False, "intake_oferta_qid": None,
+}
+
+_RESET_HANDOFF_CHOICE = {
+    "handoff_choice_pending": False,
+    "handoff_choice_attempts": 0,
+    "handoff_choice_en": None,
+}
+
+# Normalizadas con _norm_simple para el parser 0-LLM.
+_ELECCION_FICHA_RAW = (
+    "ficha", "rellenar", "relleno", "formulario", "breve", "agilizar",
+    "opcion 1", "hc_ficha",
+)
+_ELECCION_DIRECTO_RAW = (
+    "directo", "directa", "contacto", "numero", "número", "telefono",
+    "teléfono", "llamar", "llamada", "whatsapp", "ejecutiva", "abogada",
+    "correo", "opcion 2", "hc_directo",
+)
+_ELECCION_FICHA = tuple(_norm_simple(k) for k in _ELECCION_FICHA_RAW)
+_ELECCION_DIRECTO = tuple(_norm_simple(k) for k in _ELECCION_DIRECTO_RAW)
+_DIGITO_RE = re.compile(r"(?<!\d)([12])(?!\d)")
+
+
+def _interpretar_eleccion_handoff(q: str) -> str | None:
+    """Interpreta la respuesta a '¿ficha breve o contacto directo?'.
+    Devuelve 'ficha', 'directo' o None si es ambigua."""
+    t = _norm_simple(q)
+    if not t:
+        return None
+    if m := _DIGITO_RE.search(t):
+        return "ficha" if m.group(1) == "1" else "directo"
+    # "directo" primero: frases como "no quiero ficha, dame el número"
+    # contienen ambas keywords y deben ir por la vía de menor fricción.
+    if any(k in t for k in _ELECCION_DIRECTO):
+        return "directo"
+    if any(k in t for k in _ELECCION_FICHA):
+        return "ficha"
+    return None
 
 
 def _precaptura_contacto(state: AgentState) -> dict | None:
@@ -77,14 +126,6 @@ def _precaptura_contacto(state: AgentState) -> dict | None:
         resp["email"] = m.group(0).lower().replace(" ", "")
 
     return resp if resp != (state.get("intake_respuestas") or {}) else None
-
-
-_RESET_INTAKE = {
-    "intake_activo": False, "intake_idx": 0, "intake_respuestas": {},
-    "intake_attempts": 0, "intake_exit": None, "intake_resume": False,
-    "intake_decision": None, "intake_stage": None, "intake_started_en": None,
-    "intake_completado": False, "intake_oferta_qid": None,
-}
 
 
 def receive_message(state: AgentState) -> AgentState:
@@ -118,6 +159,8 @@ def analyze_sentiment(state: AgentState) -> AgentState:
     en_intake_pausado = en_intake and state.get("intake_exit") == "pausa"
     reset: dict = {}
     forzar_intake = False
+    choice_pendiente = False
+    choice_attempts = int(state.get("handoff_choice_attempts") or 0)
 
     if en_intake_pausado:
         return {
@@ -126,6 +169,31 @@ def analyze_sentiment(state: AgentState) -> AgentState:
             "intake_exit": None,
             "intake_resume": True,
         }
+
+    # --- Bifurcación handoff: ofrecer ficha breve vs contacto directo ----
+    if state.get("handoff_choice_pending"):
+        if _expirado(state.get("handoff_choice_en"), INTAKE_TTL_HORAS):
+            logger.info("elección handoff expirada (> %dh) → reclasificar",
+                        INTAKE_TTL_HORAS)
+            reset = {**reset, **_RESET_HANDOFF_CHOICE}
+        else:
+            eleccion = _interpretar_eleccion_handoff(query)
+            if eleccion == "ficha":
+                return {
+                    "route": ROUTE_INTAKE,
+                    **_RESET_HANDOFF_CHOICE,
+                    "clf_reason": "handoff_choice → ficha breve (0 LLM)",
+                }
+            if eleccion == "directo":
+                pre = _precaptura_contacto(state)
+                return {
+                    "route": ROUTE_HANDOFF,
+                    **_RESET_HANDOFF_CHOICE,
+                    **({} if pre is None else {"intake_respuestas": pre}),
+                    "clf_reason": "handoff_choice → contacto directo (0 LLM)",
+                }
+            # Respuesta ambigua: dejamos que el LLM decida y re-preguntamos.
+            choice_pendiente = True
 
     if en_booking:
         if _parece_abort(query):
@@ -177,7 +245,21 @@ def analyze_sentiment(state: AgentState) -> AgentState:
 
     route = compute_route(result)
     reason = result.reason
-    if forzar_intake:
+
+    if choice_pendiente:
+        if route == ROUTE_HANDOFF_CHOICE:
+            if choice_attempts >= 1:
+                # Segunda respuesta ambigua: evitar bucle, ir por menor fricción.
+                route = ROUTE_HANDOFF
+                reason = f"handoff_choice ambigua x2 → directo | {result.reason}"
+                reset = {**reset, **_RESET_HANDOFF_CHOICE}
+            else:
+                reason = f"handoff_choice ambigua → re-preguntar | {result.reason}"
+                reset = {**reset, "handoff_choice_attempts": choice_attempts + 1}
+        else:
+            # El usuario cambió de tema (faq/agendar): limpiar elección pendiente.
+            reset = {**reset, **_RESET_HANDOFF_CHOICE}
+    elif forzar_intake:
         route = ROUTE_INTAKE
         reason = f"intake activo (clasificación solo metadata) | {result.reason}"
 
@@ -213,7 +295,10 @@ def compute_route(result: AnalisisResult) -> str:
     if result.intent == "fuera_de_dominio":
         return ROUTE_FUERA_DOMINIO
     if result.intent == "hablar_humano":
-        return ROUTE_INTAKE
+        # Opción de bypass para urgencia alta: salta directo a handoff.
+        # if result.urgency == "alta":
+        #     return ROUTE_HANDOFF
+        return ROUTE_HANDOFF_CHOICE
     return ROUTE_AGENDAR if result.intent == "agendar_asesoria" else ROUTE_FAQ
 
 
@@ -246,6 +331,36 @@ def route_post_faq(state: AgentState) -> str:
             and not state.get("intake_completado"):
         return ROUTE_INTAKE
     return END
+
+
+def preguntar_preferencia_handoff(state: AgentState) -> AgentState:
+    """Nodo intermedio que reduce fricción: ficha breve vs contacto directo."""
+    atn = _cfg()["atencion"]
+    pre = _precaptura_contacto(state)
+
+    key = ("handoff_choice_retry_message"
+           if (state.get("handoff_choice_attempts") or 0) > 0
+           else "handoff_choice_message")
+    template = atn.get(key) or atn["handoff_choice_message"]
+    response = template.format(disclosure=atn["disclosure"])
+
+    _guardar_ai(state, response)
+    return {
+        "response": response,
+        "response_bubbles": [response],
+        "response_interactive": {
+            "type": "buttons",
+            "body": response,
+            "buttons": [
+                {"id": "hc_ficha",   "title": "1️⃣ Rellenar ficha breve"},
+                {"id": "hc_directo", "title": "2️⃣ Contacto directo"},
+            ],
+        },
+        "handoff_choice_pending": True,
+        "handoff_choice_en": _ahora_iso(),
+        **({} if pre is None else {"intake_respuestas": pre}),
+        "messages": [AIMessage(content=response)],
+    }
 
 
 def respuesta_fuera_dominio(state: AgentState) -> AgentState:
@@ -295,10 +410,11 @@ def handoff_humano(state: AgentState) -> AgentState:
             completed=bool(state.get("intake_completado")),
         )
 
+    motivo = "hablar_abogada" if state.get("intake_completado") else "contacto_directo"
     notificacion_ok = insert_escalation(
         thread_id=tid,
         summary=summary,
-        motivo="hablar_abogada",
+        motivo=motivo,
         notificar=True,
     )
 

@@ -1,5 +1,9 @@
 """Contratos centrales: estado del grafo, thread_id y esquemas estructurados.
 
+v6.4 — Handoff choice: bifurcación previa al intake que pregunta ficha breve
+  vs contacto directo. Añade ROUTE_HANDOFF_CHOICE y estado handoff_choice_*
+  en AgentState.
+
 v6.3 — Cierre dual post-intake + fix EMAIL_RE:
   - EMAIL_RE acepta dominios con un solo punto (gmail.com, yahoo.cl);
     el patrón anterior exigía doble punto (mail.empresa.co.cl).
@@ -86,13 +90,15 @@ VALID_LABELS = {
 # --------------------------------------------------------------------------
 # 2) RUTAS OFICIALES DEL GRAFO (las emite compute_route en graph/nodes.py)
 #
-# Regla v6:
+# Regla v6.4:
 #   intent=fuera_de_dominio → respuesta_fuera_dominio
-#   intent=hablar_humano    → intake_lead (ficha) → handoff_humano
+#   intent=hablar_humano    → handoff_choice (preguntar ficha breve o contacto directo)
+#                             → intake_lead (ficha) → handoff_humano
+#                             → handoff_humano (contacto directo)
 #   intent=agendar_asesoria → SUBGRAFO de booking (graph/booking/) en ROUTE_AGENDAR
 #   resto                   → respuestas_faq (atención/orientación RAG)
 # ⚠️ El sentimiento NO routea: solo modula el tono de respuestas_faq.
-# ⚠️ Las 5 rutas DEBEN estar registradas como nodos en graph/builder.py
+# ⚠️ Las rutas DEBEN estar registradas como nodos en graph/builder.py
 #    (test de contrato: test_toda_ruta_tiene_nodo). ROUTE_AGENDAR es un
 #    subgrafo compilado registrado como nodo — el invariante no se toca.
 # ⚠️ Intake v13+ emite intake_exit="agendar" cuando la ficha se cierra con
@@ -100,12 +106,13 @@ VALID_LABELS = {
 #    ROUTE_AGENDAR.
 # --------------------------------------------------------------------------
 ROUTE_HANDOFF: str = "handoff_humano"
+ROUTE_HANDOFF_CHOICE: str = "handoff_choice"
 ROUTE_AGENDAR: str = "agendar_asesoria"
 ROUTE_FAQ: str = "respuestas_faq"
 ROUTE_FUERA_DOMINIO: str = "respuesta_fuera_dominio"
 ROUTE_INTAKE: str = "intake_lead"
 
-VALID_ROUTES = {ROUTE_HANDOFF, ROUTE_AGENDAR, ROUTE_FAQ,
+VALID_ROUTES = {ROUTE_HANDOFF, ROUTE_HANDOFF_CHOICE, ROUTE_AGENDAR, ROUTE_FAQ,
                 ROUTE_FUERA_DOMINIO, ROUTE_INTAKE}
 
 
@@ -218,7 +225,6 @@ class AgentState(TypedDict, total=False):
     agenda_dia_sin_cupos: str | None          # "miércoles 09/09" si el día pedido está lleno
     booking_privacidad_dicha: bool            # aviso legal de agenda ya emitido (one-shot por hilo, v6.4)
     booking: dict                             # cita creada (dump de EventoAsesoria)
-                          # cita creada (dump de EventoAsesoria)
 
     # --- Sub-flujo de intake / ficha de lead (nodo intake_lead) ---
     intake_activo: bool                       # ficha en curso
@@ -235,6 +241,12 @@ class AgentState(TypedDict, total=False):
                                               # "agendar" | "end" |
                                               # "cta_cierre" | "cta_escala"
     intake_resume: bool                       # tras FAQ lateral, intake re-pregunta pendiente
+    intake_oferta_qid: NotRequired[str | None]      # campo para el que ya se ofreció salida
+
+    # --- Bifurcación handoff: ficha breve vs contacto directo (v6.4) ---
+    handoff_choice_pending: bool              # True mientras esperamos elección
+    handoff_choice_attempts: int              # anti-loop de re-pregunta
+    handoff_choice_en: str | None             # ISO: inicio de la oferta
 
     # --- Escalamiento / cierre (nodo handoff_humano) ---
     closed: bool                              # hilo derivado/cerrado
@@ -243,8 +255,7 @@ class AgentState(TypedDict, total=False):
 
     response_bubbles: NotRequired[list[str]]        # burbujas separadas (fallback: response)
     response_interactive: NotRequired[dict | None]  # {"kind": "buttons"|"list", ...} one-shot
-    response_cta: NotRequired[dict | None] 
-    intake_oferta_qid: NotRequired[str | None]      # campo para el que ya se ofreció salida
+    response_cta: NotRequired[dict | None]
 
 # --------------------------------------------------------------------------
 # 5) ESQUEMAS DE SALIDA ESTRUCTURADA DEL LLM
@@ -271,7 +282,7 @@ class AnalisisResult(BaseModel):
         description=(
             "Emoción dominante hacia su situación o el servicio. "
             "negativo: sufrimiento, frustración o enojo EXPRESADO — explícito "
-            "('desesperado', 'chato', 'injusto', garabatos, 'ayuda') o implícito "
+            "('desesperado', 'chato', 'injusto', garabatos, 'esperaba algo mejor de ustedes') o implícito "
             "(sarcasmo, 'esperaba algo mejor de ustedes'). La cortesía de "
             "envoltura ('hola buenas, disculpa la hora') NO lo atenúa. "
             "neutro: consulta tranquila; INCLUYE preocupación hipotética o "
@@ -348,7 +359,7 @@ class IntakeExtract(BaseModel):
     Los validadores deterministas de graph/intake.py son la fuente de verdad;
     este esquema es solo la costura de lenguaje natural.
 
-    ⚠️ consentimiento_datos queda FUERA a propósito: debe responderse
+    ⚠️ consentimiento_datos queda FUERA a propósito: debe respondirse
     directamente (sí/no), nunca inferirse con el LLM (Ley 21.719).
 
     (La extracción del LEAD de agendamiento ya no vive aquí: es
