@@ -1,5 +1,9 @@
 """graph/booking/nodes.py — Acciones del sub-agente BOOKING.
 
+v8.3 — Fix aviso de privacidad repetido: emisión one-shot exclusiva de
+       pedir_nombre; pedir_email/pedir_modalidad ya no lo tocan; texto
+       migrado a prompts.yaml (atencion.agenda_inicio_aviso);
+       booking_privacidad_dicha formalizado como canal de AgentState.
 v8.2 — FIX import: constantes de booking desde .contracts
        (graph/booking/contracts.py), no core.contracts.
 v8.1 — Limpieza: se elimina `_slot_desde_raw`.
@@ -97,12 +101,17 @@ def _interactive_slots(slots: list, idxs: list[int] | None = None) -> dict | Non
 # Aviso de privacidad para agendamiento directo
 # ---------------------------------------------------------------------------
 def _aviso_privacidad(state: AgentState) -> str | None:
+    """Devuelve el texto del aviso SOLO si corresponde emitirlo ahora:
+    - el cliente NO tiene ficha de intake (la ficha gestiona su propio
+      consentimiento — Ley 21.719), y
+    - el flag persistido booking_privacidad_dicha aún no está levantado.
+    El texto vive en prompts.yaml (atencion.agenda_inicio_aviso); el hardcode
+    previo aquí se elimina."""
     if state.get("intake_respuestas"):
         return None
     if state.get("booking_privacidad_dicha"):
         return None
-    return ("Para agendar su asesoría usaré su nombre, correo y teléfono. "
-            "Estos datos quedarán registrados para la cita y su seguimiento.")
+    return _cfg()["atencion"]["agenda_inicio_aviso"]
 
 
 # ---------------------------------------------------------------------------
@@ -289,73 +298,73 @@ def proponer_slots(state: AgentState) -> AgentState:
 # Wizard de captura: cadena con skip por precarga
 # ---------------------------------------------------------------------------
 def pedir_nombre(state: AgentState, _pre: dict | None = None) -> AgentState:
+    """Paso 1 del wizard y ÚNICO punto de emisión del aviso de privacidad.
+
+    El flag booking_privacidad_dicha es un canal de AgentState (v6.4)
+    persistido por el checkpointer → el aviso sale a lo más una vez por hilo.
+    Regla de escritura: se levanta SOLO cuando se emite; aquí jamás se limpia,
+    y los resets del padre (abort/TTL) tampoco lo incluyen (política lead_*).
+    """
     pre = {**(_pre or {}), **_precargar_desde_intake(state)}
-    aviso = _aviso_privacidad(state)
 
     if pre.get("lead_nombre") or state.get("lead_nombre"):
-        res = pedir_email({**state, **pre}, _pre=pre)
-        out = {**pre, **res}
-        if aviso and not out.get("booking_privacidad_dicha"):
-            out["response_bubbles"] = [aviso] + out.get("response_bubbles", [])
-            out["response"] = aviso + "\n\n" + out.get("response", "")
-            out["booking_privacidad_dicha"] = True
-        return out
+        return {**pre, **pedir_email({**state, **pre}, _pre=pre)}
 
     atn = _cfg()["atencion"]
-    burbujas = []
-    if aviso:
-        burbujas.append(aviso)
+    aviso = _aviso_privacidad(state)
+    burbujas = [aviso] if aviso else []
     burbujas.append(atn["agenda_pedir_nombre"])
     response = "\n\n".join(burbujas)
     _guardar_ai(state, response)
 
-    return {**pre,
-            "response": response,
-            "response_bubbles": burbujas,
-            "response_interactive": None,
-            "booking_stage": "captura_nombre",
-            "booking_privacidad_dicha": bool(aviso),
-            "messages": [AIMessage(content=response)]}
+    out = {**pre,
+           "response": response,
+           "response_bubbles": burbujas,
+           "response_interactive": None,
+           "booking_stage": "captura_nombre",
+           "messages": [AIMessage(content=response)]}
+    if aviso:
+        # One-shot: se escribe únicamente al emitir. Si aviso es None porque
+        # el flag ya estaba levantado, NO se devuelve la clave → se conserva.
+        out["booking_privacidad_dicha"] = True
+    return out
 
 
 def pedir_email(state: AgentState, _pre: dict | None = None) -> AgentState:
+    """Paso 2 del wizard. Emite SOLO agenda_pedir_email (v8.3).
+
+    El aviso de privacidad es responsabilidad exclusiva de pedir_nombre:
+    este nodo ya no lo evalúa, no lo concatena y NO devuelve la clave
+    booking_privacidad_dicha (antes la pisaba con bool(aviso), lo que
+    re-armaba el aviso en el paso siguiente).
+    """
     pre = {**(_pre or {}), **_precargar_desde_intake(state)}
-    aviso = _aviso_privacidad(state)
 
     if pre.get("lead_email") or state.get("lead_email"):
-        res = pedir_modalidad({**state, **pre}, _pre=pre)
-        out = {**pre, **res}
-        if aviso and not out.get("booking_privacidad_dicha"):
-            out["response_bubbles"] = [aviso] + out.get("response_bubbles", [])
-            out["response"] = aviso + "\n\n" + out.get("response", "")
-            out["booking_privacidad_dicha"] = True
-        return out
+        return {**pre, **pedir_modalidad({**state, **pre}, _pre=pre)}
 
     atn = _cfg()["atencion"]
-    burbujas = []
-    if aviso:
-        burbujas.append(aviso)
-    burbujas.append(atn["agenda_pedir_email"])
-    response = "\n\n".join(burbujas)
+    response = atn["agenda_pedir_email"]
     _guardar_ai(state, response)
-
     return {**pre,
             "response": response,
-            "response_bubbles": burbujas,
+            "response_bubbles": [response],
             "response_interactive": None,
             "booking_stage": "captura_email",
-            "booking_privacidad_dicha": bool(aviso),
             "messages": [AIMessage(content=response)]}
 
 
 def pedir_modalidad(state: AgentState, _pre: dict | None = None) -> AgentState:
+    """Paso 3 del wizard. Emite SOLO agenda_pedir_modalidad, más el ack de
+    precarga de intake si corresponde, y los botones nativos.
+
+    NUNCA reinyecta el aviso de privacidad ni toca booking_privacidad_dicha
+    (v8.3): esa emisión es one-shot y pertenece a pedir_nombre.
+    """
     atn = _cfg()["atencion"]
     pre = _pre or {}
-    aviso = _aviso_privacidad(state)
 
-    burbujas = []
-    if aviso:
-        burbujas.append(aviso)
+    burbujas: list[str] = []
     if pre:
         burbujas.append("De su registro ya tengo "
                         + " y ".join(_PRECARGA_LABELS[k] for k in pre
@@ -370,7 +379,6 @@ def pedir_modalidad(state: AgentState, _pre: dict | None = None) -> AgentState:
             "response_bubbles": burbujas,
             "response_interactive": _BOTONES_MODALIDAD,
             "booking_stage": "captura_modalidad",
-            "booking_privacidad_dicha": bool(aviso),
             "messages": [AIMessage(content=response)]}
 
 
@@ -389,7 +397,12 @@ def procesar_captura(state: AgentState) -> AgentState:
                 "booking_match": None,
                 "booking_match_candidatos": [],
                 "slots_propuestos": [],
-                "booking_privacidad_dicha": bool(state.get("intake_respuestas"))}
+                # v8.3: conservar el flag previo; solo marcar como "dicho" si
+                # el cliente viene de una ficha de intake (la ficha ya gestionó
+                # el consentimiento). Antes: bool(intake_respuestas) podía BAJAR
+                # un True persistido en reingresos.
+                "booking_privacidad_dicha": bool(state.get("booking_privacidad_dicha"))
+                                            or bool(state.get("intake_respuestas"))}
 
     updates = {**init}
 

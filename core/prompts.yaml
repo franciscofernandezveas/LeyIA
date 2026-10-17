@@ -125,7 +125,14 @@ atencion:
     que se contactará con usted muy pronto. Si tiene información adicional,
     indíquela aquí y la anexaré a su expediente ({thread_id}).
 
-  agenda_pedir_nombre: "Indiqueme su nombre completo para poder dejarlo registrado en la asesoría:"
+    # Aviso legal de agendamiento — emisión ÚNICA por hilo.
+  # Lo emite exclusivamente pedir_nombre (graph/booking/nodes.py), gobernado
+  # por el flag de estado booking_privacidad_dicha. PROHIBIDO concatenarlo
+  # en plantillas de paso (agenda_pedir_*).
+  agenda_inicio_aviso: "Para agendar su asesoría usaré su nombre, correo y teléfono. Estos datos quedarán registrados para la cita y su seguimiento."
+
+  agenda_pedir_nombre: "Indíqueme su nombre completo para poder dejarlo registrado en la asesoría:"
+
 
   agenda_pedir_email: "Perfecto. Ahora indíqueme su correo electrónico para enviarle la invitación de la cita:"
 

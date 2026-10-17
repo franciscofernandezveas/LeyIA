@@ -216,7 +216,9 @@ class AgentState(TypedDict, total=False):
     agenda_ventana_desde: int                 # offset de días para "otro día"
     agenda_started_en: str                    # ISO: inicio del sub-flujo (TTL 24 h, único)
     agenda_dia_sin_cupos: str | None          # "miércoles 09/09" si el día pedido está lleno
+    booking_privacidad_dicha: bool            # aviso legal de agenda ya emitido (one-shot por hilo, v6.4)
     booking: dict                             # cita creada (dump de EventoAsesoria)
+                          # cita creada (dump de EventoAsesoria)
 
     # --- Sub-flujo de intake / ficha de lead (nodo intake_lead) ---
     intake_activo: bool                       # ficha en curso

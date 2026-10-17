@@ -1,5 +1,6 @@
 """graph/utils.py — Helpers transversales del grafo padre e intake.
 
+v1.2 — Registra atencion.agenda_inicio_aviso (emisión one-shot en booking).
 v1.1 — Añade WA_TEXTO_MAX y _truncar_burbuja para reutilizar en subgrafos.
 """
 
@@ -33,6 +34,7 @@ REQUIRED_KEYS = {
     "atencion": {"disclosure", "cta_agendar", "faq_system_prompt", "tonos",
                  "summary_system_prompt", "fuera_dominio_message",
                  "handoff_message", "hilo_cerrado_message",
+                 "agenda_inicio_aviso",                       # v1.2 — aviso one-shot booking
                  "agenda_pedir_nombre", "agenda_pedir_email",
                  "agenda_pedir_modalidad", "agenda_proponer_slots",
                  "agenda_reintento_slots", "agenda_sin_horarios",
@@ -50,6 +52,7 @@ TEMPLATE_ARGS = {
     "atencion.handoff_message": {"disclosure", "whatsapp_ejecutiva", "thread_id"},
     "atencion.hilo_cerrado_message": {"whatsapp_ejecutiva", "thread_id"},
     "atencion.cta_agendar": set(),
+    "atencion.agenda_inicio_aviso": set(),                   # v1.2 — sin placeholders
     "atencion.agenda_pedir_nombre": set(),
     "atencion.agenda_pedir_email": set(),
     "atencion.agenda_pedir_modalidad": set(),
@@ -294,6 +297,8 @@ def _upsert_conversacion_abierta(thread_id: str) -> None:
         channel=_canal_desconocido(thread_id),
         status="abierto",
     )
+
+
 _ABORT_BOOKING = ("no quiero", "mejor no", "olvídalo", "olvidalo",
                   "dejalo", "déjalo", "ya no me interesa")
 
