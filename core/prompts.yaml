@@ -1,7 +1,9 @@
 # ============================================================================
 # PROMPTS DEL AGENTE — Manzzo y Cía (dominio: derecho de familia, Chile)
-# Versión: 3.1.0
+# Versión: 3.1.1
 # Changelog:
+#   v3.1.1 - Añade handoff_choice_message y handoff_choice_retry_message
+#            en la sección atencion (bifurcación ficha breve vs contacto directo).
 #   v3.1.0 - Reescritura integral del tono LeyIA:
 #            cordial, simpática, profesional, comprensiva y ejecutiva.
 #            Alineado con la arquitectura agentica: intake, booking, FAQ,
@@ -113,6 +115,20 @@ atencion:
     materias laborales, civiles y penales. Indíqueme su consulta y con gusto
     lo orientaré.
 
+  # ------------------------------------------------------------------------
+  # HANDOFF CHOICE (v3.1.1) — bifurcación ficha breve vs contacto directo
+  # ------------------------------------------------------------------------
+  handoff_choice_message: |
+    {disclosure} Para derivarle con nuestro equipo, ¿cómo prefiere continuar?
+
+    1️⃣ *Ficha breve* (2 min): la abogada revisa su caso y lo contacta con todo el contexto.
+    2️⃣ *Contacto directo*: le entrego ahora el WhatsApp de la ejecutiva.
+
+    Responda *1* o *2*.
+
+  handoff_choice_retry_message: |
+    No le entendí bien 🙏 Responda *1* para rellenar la ficha breve o *2* para recibir el contacto directo.
+
   handoff_message: |
     {disclosure} He preparado un resumen con sus antecedentes para nuestra
     ejecutiva y lo he pasado por WhatsApp. Ella se contactará con usted a
@@ -125,14 +141,13 @@ atencion:
     que se contactará con usted muy pronto. Si tiene información adicional,
     indíquela aquí y la anexaré a su expediente ({thread_id}).
 
-    # Aviso legal de agendamiento — emisión ÚNICA por hilo.
+  # Aviso legal de agendamiento — emisión ÚNICA por hilo.
   # Lo emite exclusivamente pedir_nombre (graph/booking/nodes.py), gobernado
   # por el flag de estado booking_privacidad_dicha. PROHIBIDO concatenarlo
   # en plantillas de paso (agenda_pedir_*).
   agenda_inicio_aviso: "Para agendar su asesoría usaré su nombre, correo y teléfono. Estos datos quedarán registrados para la cita y su seguimiento."
 
   agenda_pedir_nombre: "Indíqueme su nombre completo para poder dejarlo registrado en la asesoría:"
-
 
   agenda_pedir_email: "Perfecto. Ahora indíqueme su correo electrónico para enviarle la invitación de la cita:"
 

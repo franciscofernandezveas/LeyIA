@@ -334,15 +334,36 @@ def route_post_faq(state: AgentState) -> str:
 
 
 def preguntar_preferencia_handoff(state: AgentState) -> AgentState:
-    """Nodo intermedio que reduce fricción: ficha breve vs contacto directo."""
+    """Nodo intermedio que reduce fricción: ficha breve vs contacto directo.
+    Es defensivo: si faltan las plantillas en config, usa un fallback
+    hardcodeado para evitar crash en producción."""
     atn = _cfg()["atencion"]
     pre = _precaptura_contacto(state)
 
+    fallback_default = (
+        "Para derivarte con nuestro equipo, ¿cómo prefieres continuar?\n\n"
+        "1️⃣ Rellenar una ficha breve (2 min): la abogada revisa tu caso con\n"
+        "   todo el contexto.\n"
+        "2️⃣ Contacto directo: te entrego ahora el WhatsApp de la ejecutiva.\n\n"
+        "Responde 1 o 2."
+    )
+
+    choice_attempts = state.get("handoff_choice_attempts") or 0
     key = ("handoff_choice_retry_message"
-           if (state.get("handoff_choice_attempts") or 0) > 0
+           if choice_attempts > 0
            else "handoff_choice_message")
-    template = atn.get(key) or atn["handoff_choice_message"]
-    response = template.format(disclosure=atn["disclosure"])
+
+    # Defensivo: resuelve en cascata para nunca crashear.
+    template = atn.get(key) or atn.get("handoff_choice_message") or fallback_default
+
+    if template == fallback_default:
+        logger.warning(
+            "handoff_choice: no se encontró '%s' en config; usando fallback por defecto",
+            key,
+        )
+
+    disclosure = atn.get("disclosure", "Soy LeyIA, la asistente virtual de Manzzo y Cía.")
+    response = template.format(disclosure=disclosure)
 
     _guardar_ai(state, response)
     return {
@@ -352,8 +373,8 @@ def preguntar_preferencia_handoff(state: AgentState) -> AgentState:
             "type": "buttons",
             "body": response,
             "buttons": [
-                {"id": "hc_ficha",   "title": "1️⃣ Rellenar ficha breve"},
-                {"id": "hc_directo", "title": "2️⃣ Contacto directo"},
+                {"id": "hc_ficha",   "title": "1 Rellenar ficha breve"},
+                {"id": "hc_directo", "title": "2 Contacto directo"},
             ],
         },
         "handoff_choice_pending": True,
@@ -417,7 +438,6 @@ def handoff_humano(state: AgentState) -> AgentState:
         motivo=motivo,
         notificar=True,
     )
-
 
     _persist_escalation(state, summary)
 
