@@ -1,15 +1,13 @@
 """graph/booking/nodes.py — Acciones del sub-agente BOOKING.
 
+v8.5 — UX horarios: cuando hay interactive nativo (buttons/lista), el mensaje
+       de texto solo muestra la introducción; la lista numerada ya no se
+       duplica en el cuerpo. Los horarios se leen exclusivamente desde los
+       botones/lista nativos de WhatsApp.
 v8.4 — Cierres exhaustivos: todos los retornos finales (éxito, HITL
-       rechazado, fallo técnico, sin horarios, abortado) usan RESET_BOOKING
-       para evitar estado residual (booking_decision, lead_modalidad,
-       agenda_started_en, etc.) entre flujos.
-v8.3 — Fix aviso de privacidad repetido: emisión one-shot exclusiva de
-       pedir_nombre; pedir_email/pedir_modalidad ya no lo tocan; texto
-       migrado a prompts.yaml (atencion.agenda_inicio_aviso);
-       booking_privacidad_dicha formalizado como canal de AgentState.
-v8.2 — FIX import: constantes de booking desde .contracts
-       (graph/booking/contracts.py), no core.contracts.
+       rechazado, fallo técnico, sin horarios, abortado) usan RESET_BOOKING.
+v8.3 — Fix aviso de privacidad repetido.
+v8.2 — FIX import constantes de booking.
 v8.1 — Limpieza: se elimina `_slot_desde_raw`.
 v8 — Interactivos reales en WhatsApp.
 """
@@ -271,25 +269,42 @@ def consultar_disponibilidad(state: AgentState) -> AgentState:
             "agenda_dia_sin_cupos": sin_cupos}
 
 
+def _intro_proponer_slots(state: AgentState, señal: str | None,
+                          sin_cupos: str | None) -> str:
+    """Texto introductorio cuando los horarios se muestran por interactive.
+    No incluye la lista numerada — esa vive en los botones/lista nativos."""
+    atn = _cfg()["atencion"]
+    nombre = _primer_nombre(state.get("lead_nombre"))
+
+    if señal == "slot_stale":
+        base = atn["agenda_slot_ocupado"].format(nombre=nombre, opciones="")
+    else:
+        base = atn["agenda_proponer_slots"].format(nombre=nombre, opciones="")
+        if sin_cupos:
+            base = (f"Para *{sin_cupos}* no me quedan horas, "
+                    f"pero tengo estas alternativas:\n\n{base}")
+
+    return base.rstrip()
+
+
 def proponer_slots(state: AgentState) -> AgentState:
     atn = _cfg()["atencion"]
     slots = _slots(state)
     señal = state.get("booking_signal")
+    interactive = _interactive_slots(slots)
 
-    if señal == "slot_stale":
-        response = atn["agenda_slot_ocupado"].format(opciones=_opciones(slots))
-    else:
+    if interactive is None:
+        # Fallback textual (p.ej. CLI/web sin botones nativos)
         response = atn["agenda_proponer_slots"].format(
             nombre=_primer_nombre(state.get("lead_nombre")),
             opciones=_opciones(slots))
-        sin_cupos = state.get("agenda_dia_sin_cupos")
-        if sin_cupos:
-            response = (f"Para *{sin_cupos}* no me quedan horas, "
-                        f"pero tengo estas alternativas:\n\n{response}")
+    else:
+        response = _intro_proponer_slots(state, señal, state.get("agenda_dia_sin_cupos"))
+
     _guardar_ai(state, response)
     return {"response": response,
             "response_bubbles": [response],
-            "response_interactive": _interactive_slots(slots),
+            "response_interactive": interactive,
             "booking_stage": "propuesta",
             "booking_signal": None,
             "agenda_dia_sin_cupos": None,
@@ -462,11 +477,18 @@ def procesar_captura(state: AgentState) -> AgentState:
 def reintentar_eleccion(state: AgentState) -> AgentState:
     atn = _cfg()["atencion"]
     slots = _slots(state)
-    response = atn["agenda_reintento_slots"].format(opciones=_opciones(slots))
+    interactive = _interactive_slots(slots)
+
+    if interactive is None:
+        response = atn["agenda_reintento_slots"].format(opciones=_opciones(slots))
+    else:
+        # v8.5: los horarios ya están en los botones/lista; no duplicar.
+        response = atn["agenda_reintento_slots"].format(opciones="").rstrip()
+
     _guardar_ai(state, response)
     return {"response": response,
             "response_bubbles": [response],
-            "response_interactive": _interactive_slots(slots),
+            "response_interactive": interactive,
             "booking_attempts": (state.get("booking_attempts") or 0) + 1,
             "messages": [AIMessage(content=response)]}
 
@@ -476,12 +498,19 @@ def aclarar_eleccion(state: AgentState) -> AgentState:
     slots = _slots(state)
     idxs = [i for i in (state.get("booking_match_candidatos") or [])
             if 0 <= i < len(slots)]
-    response = atn["agenda_eleccion_ambigua"].format(
-        opciones=_opciones_indexadas(slots, idxs))
+    interactive = _interactive_slots(slots, idxs)
+
+    if interactive is None:
+        response = atn["agenda_eleccion_ambigua"].format(
+            opciones=_opciones_indexadas(slots, idxs))
+    else:
+        # v8.5: los candidatos ya están en el interactive; no duplicar.
+        response = atn["agenda_eleccion_ambigua"].format(opciones="").rstrip()
+
     _guardar_ai(state, response)
     return {"response": response,
             "response_bubbles": [response],
-            "response_interactive": _interactive_slots(slots, idxs),
+            "response_interactive": interactive,
             "booking_attempts": (state.get("booking_attempts") or 0) + 1,
             "messages": [AIMessage(content=response)]}
 
