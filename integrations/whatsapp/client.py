@@ -55,9 +55,19 @@ def _build_interactive(interactive: dict, body: str) -> dict:
       - list:    lista nativa; acepta "options" (1 sección) o
                  "sections" (varias, p.ej. agrupadas por día)
       - cta:     botón call-to-action URL
+
+    Compatibilidad: se acepta la clave legacy "type" como alias de "kind"
+    (con warning en logs para detectar el nodo que la emite).
     """
     wa: dict = {"body": {"text": _clip(body, MAX_INTERACTIVE_BODY)}}
+
     kind = interactive.get("kind")
+    if kind is None and interactive.get("type") is not None:
+        logger.warning(
+            "interactive usa clave legacy 'type'; corrige el nodo emisor: %r",
+            interactive,
+        )
+        kind = interactive.get("type")
 
     if kind == "buttons":
         buttons = [

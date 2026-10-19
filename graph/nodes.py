@@ -1,5 +1,10 @@
 """graph/nodes.py — Nodos transversales del agente (Manzzo y Cía).
 
+v21 — FIX handoff_choice: response_interactive usa el contrato del canal
+       ("kind": "buttons", sin "body"); el body viaja por separado en
+       send_interactive. Títulos de botones recortados a ≤ 20 chars
+       (límite de Meta Cloud API, ver client.MAX_BUTTON_TITLE).
+
 v20 — Gatekeeper de sesión en receive_message: detecta cambio de
        conversation_id y resetea el estado de flujo (intake, handoff_choice,
        booking) conservando la memoria larga del cliente.
@@ -379,10 +384,11 @@ def preguntar_preferencia_handoff(state: AgentState) -> AgentState:
         "response": response,
         "response_bubbles": [response],
         "response_interactive": {
-            "type": "buttons",
-            "body": response,
+            # v21: contrato del canal = "kind" (no "type"); el body viaja
+            # aparte en send_interactive. Títulos ≤ 20 chars (Meta).
+            "kind": "buttons",
             "buttons": [
-                {"id": "hc_ficha",   "title": "1 Rellenar ficha breve"},
+                {"id": "hc_ficha",   "title": "1 Rellenar ficha"},
                 {"id": "hc_directo", "title": "2 Contacto directo"},
             ],
         },
