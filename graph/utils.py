@@ -1,5 +1,7 @@
 """graph/utils.py — Helpers transversales del grafo padre e intake.
 
+v1.3 — Añade RESET_INTAKE, RESET_HANDOFF_CHOICE, RESET_BOOKING y
+        RESET_SESION_NUEVA centralizados, consumidos por los nodos del grafo.
 v1.2 — Registra atencion.agenda_inicio_aviso (emisión one-shot en booking).
 v1.1 — Añade WA_TEXTO_MAX y _truncar_burbuja para reutilizar en subgrafos.
 """
@@ -26,6 +28,59 @@ WA_TEXTO_MAX = 900
 
 AGENDA_CAPTURA_TTL_HORAS = 24
 INTAKE_TTL_HORAS = 24
+
+
+# ---------------------------------------------------------------------------
+# Resets de estado transitorio
+# ---------------------------------------------------------------------------
+RESET_INTAKE = {
+    "intake_activo": False,
+    "intake_idx": 0,
+    "intake_respuestas": {},
+    "intake_attempts": 0,
+    "intake_exit": None,
+    "intake_resume": False,
+    "intake_decision": None,
+    "intake_stage": None,
+    "intake_started_en": None,
+    "intake_completado": False,
+    "intake_oferta_qid": None,
+}
+
+RESET_HANDOFF_CHOICE = {
+    "handoff_choice_pending": False,
+    "handoff_choice_attempts": 0,
+    "handoff_choice_en": None,
+}
+
+RESET_BOOKING = {
+    "booking_stage": None,
+    "slots_propuestos": [],
+    "booking_match": None,
+    "booking_match_candidatos": [],
+    "booking_signal": None,
+    "booking_attempts": 0,
+    "booking_decision": None,
+    "agenda_started_en": None,
+    "agenda_ventana_desde": 0,
+    "booking_franja": None,
+    "agenda_dia_sin_cupos": None,
+    "lead_modalidad": None,
+}
+
+# Nueva sesión de conversación → el "caso" anterior quedó atrás.
+# Se CONSERVA a propósito: lead_nombre, lead_email, booking_privacidad_dicha
+# (política lead_*: memoria larga del cliente).
+RESET_SESION_NUEVA = {
+    "closed": False,
+    "summary": None,
+    "notificacion_pendiente": False,
+    "case_category": None,
+    **RESET_INTAKE,
+    **RESET_HANDOFF_CHOICE,
+    **RESET_BOOKING,
+}
+
 
 # --------------------------------------------------------------------------
 # Config / prompts.yaml

@@ -1,5 +1,8 @@
 """graph/intake/nodes.py — Acciones del sub-agente INTAKE.
 
+v16 — Resets centralizados: importa RESET_INTAKE desde graph.utils y
+       elimina la constante local _RESET_INTAKE (sin uso actual).
+
 v15 — Cierre dual con dos mensajes:
   - Mensaje 1: cierre con botón "Agendar una hora" (reply button).
   - Mensaje 2: CTA URL "Pincha aquí" que abre wa.me con la ficha prellenada.
@@ -16,6 +19,7 @@ from core.contracts import EMAIL_RE, AgentState
 from core.db_client import upsert_lead
 from graph.intake.utils import _evento_intake, _pack
 from graph.utils import (
+    RESET_INTAKE,
     _ahora_iso, _cfg, _guardar_ai, _primer_nombre, _recent_messages,
     _telefono_cliente, _wa_link, _wa_link_diagnostico, _wa_link_display,
 )

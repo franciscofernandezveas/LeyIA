@@ -3,14 +3,15 @@
 Persiste:
   - conversations: hilo completo (una fila por SESIÓN de 24h)
   - messages: cada mensaje humano/AI
-  - leads: fichas de intake (una por thread_id)
-  - escalations: handoffs a ejecutiva (una por thread_id, con motivo)
-  - bookings: citas creadas en Google Calendar (una por thread_id)
+  - leads: ficha de intake ACTIVA por thread_id (ciclo nuevo → el caso
+    anterior se archiva en metadata['casos_anteriores'])
+  - escalations: handoffs a ejecutiva (una por CONVERSACIÓN + motivo)
+  - bookings: citas creadas en Google Calendar (una por evento_id)
 
 Regla de oro SQL (psycopg3): un parámetro NUNCA debe aparecer más de una
 vez en la misma sentencia sin CAST, o PostgreSQL lanza AmbiguousParameter.
-Por eso las banderas derivadas (effective_status / category_is_specific)
-se computan en Python y se pasan como parámetros distintos.
+Por eso las banderas derivadas (effective_status / category_is_specific /
+nuevo_ciclo) se computan en Python y se pasan como parámetros distintos.
 
 Todas las operaciones son best-effort: no lanzan excepción hacia el grafo.
 
@@ -18,6 +19,11 @@ Nota driver: psycopg3. Tras el pooler en modo transacción los prepared
  statements colisionan entre sesiones (DuplicatePreparedStatement), por eso
 el engine se crea con prepare_threshold=None — mismo criterio que
 core.persistence.build_postgres_checkpointer.
+
+REQUIERE migración (ver migración bookings/escalaciones):
+  - bookings: DROP unique(thread_id); ADD unique(evento_id)
+  - escalations: DROP unique(thread_id); ADD unique parcial
+    (conversation_id, motivo) WHERE conversation_id IS NOT NULL
 """
 import json
 import logging
@@ -89,6 +95,26 @@ def _safe(val: Any) -> Any:
 # ---------------------------------------------------------------------------
 # CONVERSATIONS
 # ---------------------------------------------------------------------------
+def get_active_conversation_id(thread_id: str) -> str | None:
+    """ID de la sesión activa (closed_at IS NULL) para el thread.
+    None si no hay sesión o si la BD falla (best-effort)."""
+    try:
+        thread_id = normalize_thread_id(thread_id)
+        with _get_engine().connect() as conn:
+            row = conn.execute(
+                text("""
+                    SELECT id FROM conversations
+                    WHERE thread_id = :tid AND closed_at IS NULL
+                    ORDER BY created_at DESC LIMIT 1
+                """),
+                {"tid": thread_id},
+            ).fetchone()
+            return str(row[0]) if row else None
+    except Exception as e:
+        logger.warning("[db] get_active_conversation_id falló: %s", e)
+        return None
+
+
 def upsert_conversation(
     thread_id: str,
     channel: str | None = None,
@@ -253,6 +279,12 @@ def upsert_lead(
     category: str | None = None,
     completed: bool = False,
 ) -> None:
+    """
+    Una ficha ACTIVA por thread_id. Si la ficha anterior ya se completó y
+    el intake llega desde OTRA sesión de conversación, se inicia un ciclo
+    nuevo: el caso anterior se archiva en metadata['casos_anteriores'] y
+    completed_at se reinicia (→ la nueva ficha completa vuelve a notificar).
+    """
     try:
         thread_id = normalize_thread_id(thread_id)
         r = intake_respuestas or {}
@@ -265,10 +297,30 @@ def upsert_lead(
 
         with _get_engine().connect() as conn:
             prev = conn.execute(
-                text("select completed_at from leads where thread_id = :thread_id"),
+                text("SELECT completed_at, conversation_id FROM leads "
+                     "WHERE thread_id = :thread_id"),
                 {"thread_id": thread_id},
             ).fetchone()
-            ya_notificado = prev is not None and prev.completed_at is not None
+
+            sesion = conn.execute(
+                text("SELECT id FROM conversations "
+                     "WHERE thread_id = :thread_id AND closed_at IS NULL "
+                     "ORDER BY created_at DESC LIMIT 1"),
+                {"thread_id": thread_id},
+            ).fetchone()
+
+            # Ciclo nuevo: ficha anterior completada Y otra sesión activa
+            nuevo_ciclo = (
+                prev is not None
+                and prev.completed_at is not None
+                and sesion is not None
+                and prev.conversation_id != sesion[0]
+            )
+            ya_notificado = (
+                prev is not None
+                and prev.completed_at is not None
+                and not nuevo_ciclo
+            )
 
             conn.execute(
                 text(f"""
@@ -291,10 +343,24 @@ def upsert_lead(
                     categoria = COALESCE(:categoria, leads.categoria),
                     consentimiento = COALESCE(:consentimiento, leads.consentimiento),
                     completed_at = CASE
-                        WHEN :completed AND leads.completed_at IS NULL
-                        THEN now() ELSE leads.completed_at END,
-                    metadata = COALESCE(leads.metadata, '{{}}'::jsonb)
-                               || CAST(:metadata_json AS jsonb)
+                        WHEN :completed
+                             AND (leads.completed_at IS NULL OR :nuevo_ciclo)
+                        THEN now()
+                        WHEN :nuevo_ciclo THEN NULL
+                        ELSE leads.completed_at
+                    END,
+                    metadata = CASE WHEN :nuevo_ciclo THEN
+                            COALESCE(leads.metadata, '{{}}'::jsonb)
+                            || jsonb_build_object('casos_anteriores',
+                                 COALESCE(leads.metadata->'casos_anteriores',
+                                          '[]'::jsonb)
+                                 || jsonb_build_array(jsonb_build_object(
+                                      'situacion', leads.situacion,
+                                      'categoria', leads.categoria,
+                                      'completed_at', leads.completed_at)))
+                        ELSE COALESCE(leads.metadata, '{{}}'::jsonb)
+                        END
+                        || CAST(:metadata_json AS jsonb)
                 """),
                 {
                     "thread_id": thread_id,
@@ -306,12 +372,13 @@ def upsert_lead(
                     "categoria": _safe(category),
                     "consentimiento": consent_bool,
                     "completed": completed,
+                    "nuevo_ciclo": nuevo_ciclo,
                     "metadata_json": json.dumps(meta, ensure_ascii=False),
                 },
             )
             conn.commit()
 
-        # Primera vez que se completa → notificar + registrar escalación silenciosa
+        # Primera vez que se completa este ciclo → notificar + escalación silenciosa
         if completed and not ya_notificado:
             from integrations.whatsapp.notify import notify_new_lead
             notify_new_lead({
@@ -346,90 +413,63 @@ def insert_escalation(
     notificar: bool = True,
 ) -> bool:
     """
-    Upsert de escalación. Devuelve True si la notif quedó enviada (o no hacía falta).
+    Una escalación por (conversación, motivo) — NO por thread_id.
 
-    motivo:      'ficha_completada' | 'hablar_abogada' | 'derivacion_parcial'
-    notificar:   True → envía WhatsApp si no fue notificado antes.
-                 False → solo upserta la fila (silencioso).
+    Devuelve True si la notif quedó enviada (o no hacía falta).
+
+    motivo:    'ficha_completada' | 'hablar_abogada' | 'derivacion_parcial'
+    notificar: True → envía WhatsApp si esta fila no fue notificada antes.
+               False → solo upserta la fila (silencioso).
+
+    Comportamiento: el mismo cliente que escala en la sesión A y luego en
+    la sesión B genera 2 filas y 2 notificaciones. Dos escalaciones con el
+    mismo motivo dentro de la misma sesión → 1 fila, 1 notificación.
     """
     try:
         thread_id = normalize_thread_id(thread_id)
+        motivo = motivo or "hablar_abogada"
 
-        # Compatibilidad con esquema sin columna `motivo`
-        with _get_engine().connect() as conn:
-            tiene_motivo = conn.execute(text("""
-                SELECT 1 FROM information_schema.columns
-                WHERE table_schema = 'public'
-                  AND table_name = 'escalations'
-                  AND column_name = 'motivo'
-            """)).fetchone() is not None
-
-        with _get_engine().connect() as conn:
-            if tiene_motivo:
-                conn.execute(
-                    text(f"""
-                    INSERT INTO escalations
-                        (conversation_id, thread_id, lead_id, summary, motivo,
-                         notificado_whatsapp, created_at)
-                    SELECT
-                        ({_CONV_ID_SQL}),
-                        :thread_id,
-                        (SELECT l.id FROM leads l
-                         WHERE l.thread_id = :thread_id LIMIT 1),
-                        :summary, :motivo, FALSE, now()
-                    ON CONFLICT (thread_id) DO UPDATE SET
-                        summary = COALESCE(:summary, escalations.summary),
-                        motivo  = :motivo
-                    """),
-                    {
-                        "thread_id": thread_id,
-                        "summary": _safe(summary),
-                        "motivo": motivo or "hablar_abogada",
-                    },
-                )
-            else:
-                conn.execute(
-                    text(f"""
-                    INSERT INTO escalations
-                        (conversation_id, thread_id, lead_id, summary,
-                         notificado_whatsapp, created_at)
-                    SELECT
-                        ({_CONV_ID_SQL}),
-                        :thread_id,
-                        (SELECT l.id FROM leads l
-                         WHERE l.thread_id = :thread_id LIMIT 1),
-                        :summary, FALSE, now()
-                    ON CONFLICT (thread_id) DO UPDATE SET
-                        summary = COALESCE(:summary, escalations.summary)
-                    """),
-                    {
-                        "thread_id": thread_id,
-                        "summary": _safe(summary),
-                    },
-                )
-            conn.commit()
-
-        if not notificar:
-            return True
-
-        # ¿Ya fue notificado?
         with _get_engine().connect() as conn:
             row = conn.execute(
-                text("SELECT notificado_whatsapp FROM escalations "
-                     "WHERE thread_id = :tid"),
-                {"tid": thread_id},
+                text(f"""
+                INSERT INTO escalations
+                    (conversation_id, thread_id, lead_id, summary, motivo,
+                     notificado_whatsapp, created_at)
+                SELECT
+                    ({_CONV_ID_SQL}),
+                    :thread_id,
+                    (SELECT l.id FROM leads l
+                     WHERE l.thread_id = :thread_id
+                     ORDER BY l.created_at DESC LIMIT 1),
+                    :summary, :motivo, FALSE, now()
+                ON CONFLICT (conversation_id, motivo)
+                    WHERE conversation_id IS NOT NULL
+                DO UPDATE SET
+                    summary = COALESCE(:summary, escalations.summary)
+                RETURNING id, notificado_whatsapp
+                """),
+                {
+                    "thread_id": thread_id,
+                    "summary": _safe(summary),
+                    "motivo": motivo,
+                },
             ).fetchone()
-        if row and row[0]:
+            conn.commit()
+
+        esc_id = row[0] if row else None
+        ya_notificado = bool(row[1]) if row else False
+
+        if not notificar or ya_notificado:
             return True
 
         # Teléfono del cliente (best-effort)
         try:
             with _get_engine().connect() as conn:
-                row = conn.execute(
+                r = conn.execute(
                     text("SELECT telefono FROM leads WHERE thread_id = :tid"),
                     {"tid": thread_id},
                 ).fetchone()
-            telefono = row[0] if row else None
+            telefono = r[0] if r else None
         except Exception:
             telefono = None
 
@@ -440,12 +480,13 @@ def insert_escalation(
             telefono=telefono,
             motivo=motivo,
         )
-        if ok:
+        if ok and esc_id is not None:
             with _get_engine().connect() as conn:
                 conn.execute(
+                    # Por FILA, no por thread: cada escalación lleva su propio flag
                     text("UPDATE escalations SET notificado_whatsapp = true "
-                         "WHERE thread_id = :tid"),
-                    {"tid": thread_id},
+                         "WHERE id = :id"),
+                    {"id": esc_id},
                 )
                 conn.commit()
         return ok
@@ -461,17 +502,29 @@ def insert_booking(
     thread_id: str,
     booking: dict,
 ) -> None:
+    """
+    Una fila por evento_id de Google Calendar — NO por thread_id.
+
+    Un mismo cliente puede tener N citas vigentes. El upsert por evento_id
+    solo da idempotencia ante reintentos del MISMO evento (no duplica ni
+    re-notifica). Un segundo booking del mismo thread crea fila nueva y
+    notifica normalmente.
+    """
     try:
         thread_id = normalize_thread_id(thread_id)
         b = booking or {}
+        evento_id = _safe(b.get("evento_id"))
+
         with _get_engine().connect() as conn:
-            ya_existia = (
-                conn.execute(
-                    text("select 1 from bookings where thread_id = :thread_id"),
-                    {"thread_id": thread_id},
-                ).fetchone()
-                is not None
-            )
+            ya_existia = False
+            if evento_id:
+                ya_existia = (
+                    conn.execute(
+                        text("SELECT 1 FROM bookings WHERE evento_id = :evento_id"),
+                        {"evento_id": evento_id},
+                    ).fetchone()
+                    is not None
+                )
 
             conn.execute(
                 text(f"""
@@ -483,12 +536,12 @@ def insert_booking(
                     ({_CONV_ID_SQL}),
                     :thread_id,
                     (SELECT l.id FROM leads l
-                     WHERE l.thread_id = :thread_id LIMIT 1),
+                     WHERE l.thread_id = :thread_id
+                     ORDER BY l.created_at DESC LIMIT 1),
                     :evento_id, :fecha, :hora_inicio, :hora_fin, :modalidad,
                     :meet_link, :html_link, :cliente_nombre, :cliente_email,
                     CAST(:inicio_cita AS timestamptz), now()
-                ON CONFLICT (thread_id) DO UPDATE SET
-                    evento_id = :evento_id,
+                ON CONFLICT (evento_id) DO UPDATE SET
                     fecha = :fecha,
                     hora_inicio = :hora_inicio,
                     hora_fin = :hora_fin,
@@ -503,7 +556,7 @@ def insert_booking(
                 """),
                 {
                     "thread_id": thread_id,
-                    "evento_id": _safe(b.get("evento_id")),
+                    "evento_id": evento_id,
                     "fecha": _safe(b.get("fecha")),
                     "hora_inicio": _safe(b.get("hora_inicio")),
                     "hora_fin": _safe(b.get("hora_fin")),

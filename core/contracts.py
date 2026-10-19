@@ -257,6 +257,9 @@ class AgentState(TypedDict, total=False):
     response_interactive: NotRequired[dict | None]  # {"kind": "buttons"|"list", ...} one-shot
     response_cta: NotRequired[dict | None]
 
+
+session_id: str | None   # uuid de la conversación activa; lo escribe receive_message
+
 # --------------------------------------------------------------------------
 # 5) ESQUEMAS DE SALIDA ESTRUCTURADA DEL LLM
 # --------------------------------------------------------------------------

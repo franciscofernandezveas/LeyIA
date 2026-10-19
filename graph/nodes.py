@@ -1,5 +1,11 @@
 """graph/nodes.py — Nodos transversales del agente (Manzzo y Cía).
 
+v20 — Gatekeeper de sesión en receive_message: detecta cambio de
+       conversation_id y resetea el estado de flujo (intake, handoff_choice,
+       booking) conservando la memoria larga del cliente.
+       Resets centralizados en graph.utils (RESET_INTAKE,
+       RESET_HANDOFF_CHOICE, RESET_BOOKING, RESET_SESION_NUEVA).
+
 v19 — Añade handoff_choice: bifurcación previa a handoff/intake que pregunta
        al usuario si prefiere rellenar una ficha breve o recibir contacto
        directo, reduciendo la fricción de forzar siempre el intake completo.
@@ -32,11 +38,13 @@ from core.contracts import (
     VALID_ROUTES, fallback_analisis,
 )
 from core.db_client import (
-    insert_escalation, insert_message, upsert_conversation, upsert_lead,
+    get_active_conversation_id, insert_escalation, insert_message,
+    upsert_conversation, upsert_lead,
 )
 from core.llm import LLM, with_structured_output
 from core.notifications import notificar_email
 from graph.utils import (
+    RESET_BOOKING, RESET_HANDOFF_CHOICE, RESET_INTAKE, RESET_SESION_NUEVA,
     _ahora_iso, _cfg, _expirado, _ficha_intake, _format_few_shots,
     _guardar_ai, _norm_simple, _parece_abort, _persist_escalation,
     _primer_nombre, _recent_messages, _telefono_cliente,
@@ -64,20 +72,6 @@ _NOMBRE_RE = re.compile(
     r"(?:\s+[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]{2,}){0,3})",
     re.IGNORECASE,
 )
-
-
-_RESET_INTAKE = {
-    "intake_activo": False, "intake_idx": 0, "intake_respuestas": {},
-    "intake_attempts": 0, "intake_exit": None, "intake_resume": False,
-    "intake_decision": None, "intake_stage": None, "intake_started_en": None,
-    "intake_completado": False, "intake_oferta_qid": None,
-}
-
-_RESET_HANDOFF_CHOICE = {
-    "handoff_choice_pending": False,
-    "handoff_choice_attempts": 0,
-    "handoff_choice_en": None,
-}
 
 # Normalizadas con _norm_simple para el parser 0-LLM.
 _ELECCION_FICHA_RAW = (
@@ -140,7 +134,26 @@ def receive_message(state: AgentState) -> AgentState:
     _upsert_conversacion_abierta(tid)
 
     insert_message(thread_id=tid, role="human", content=q)
-    return {"query": q}
+
+    updates: dict = {"query": q}
+
+    # --- Gatekeeper de sesión -------------------------------------------
+    # Si la conversación activa es OTRA distinta a la que veía el checkpoint,
+    # el "caso" anterior quedó atrás: el cliente puede no haber podido nunca
+    # salir de un hilo cerrado/escalado. Se resetea TODO el estado de flujo
+    # (intake, handoff_choice, booking, closed) y se conserva la memoria
+    # larga (lead_nombre / lead_email / booking_privacidad_dicha).
+    sid_actual = get_active_conversation_id(tid)
+    sid_prev = state.get("session_id")
+    if sid_actual:
+        if sid_prev and sid_prev != sid_actual:
+            logger.info("[sesión] %s → %s: reset de flujo para thread=%s",
+                        sid_prev, sid_actual, tid)
+            updates.update(RESET_SESION_NUEVA)
+        updates["session_id"] = sid_actual
+    # sid_actual None → BD caída: best-effort, seguir con el checkpoint tal cual.
+
+    return updates
 
 
 def analyze_sentiment(state: AgentState) -> AgentState:
@@ -175,20 +188,20 @@ def analyze_sentiment(state: AgentState) -> AgentState:
         if _expirado(state.get("handoff_choice_en"), INTAKE_TTL_HORAS):
             logger.info("elección handoff expirada (> %dh) → reclasificar",
                         INTAKE_TTL_HORAS)
-            reset = {**reset, **_RESET_HANDOFF_CHOICE}
+            reset = {**reset, **RESET_HANDOFF_CHOICE}
         else:
             eleccion = _interpretar_eleccion_handoff(query)
             if eleccion == "ficha":
                 return {
                     "route": ROUTE_INTAKE,
-                    **_RESET_HANDOFF_CHOICE,
+                    **RESET_HANDOFF_CHOICE,
                     "clf_reason": "handoff_choice → ficha breve (0 LLM)",
                 }
             if eleccion == "directo":
                 pre = _precaptura_contacto(state)
                 return {
                     "route": ROUTE_HANDOFF,
-                    **_RESET_HANDOFF_CHOICE,
+                    **RESET_HANDOFF_CHOICE,
                     **({} if pre is None else {"intake_respuestas": pre}),
                     "clf_reason": "handoff_choice → contacto directo (0 LLM)",
                 }
@@ -198,14 +211,10 @@ def analyze_sentiment(state: AgentState) -> AgentState:
     if en_booking:
         if _parece_abort(query):
             logger.info("cliente aborta booking → reclasificar")
-            reset = {"booking_stage": None, "slots_propuestos": [],
-                     "booking_match": None, "booking_match_candidatos": [],
-                     "booking_signal": None, "booking_attempts": 0}
+            reset = {**RESET_BOOKING}
         elif _expirado(state.get("agenda_started_en"), AGENDA_CAPTURA_TTL_HORAS):
             logger.info("booking expirado → reclasificar")
-            reset = {"booking_stage": None, "slots_propuestos": [],
-                     "booking_match": None, "booking_match_candidatos": [],
-                     "booking_signal": None, "booking_attempts": 0}
+            reset = {**RESET_BOOKING}
         else:
             return {"route": ROUTE_AGENDAR,
                     "clf_reason": f"sub-flujo booking/{state.get('booking_stage')} (0 LLM)"}
@@ -214,7 +223,7 @@ def analyze_sentiment(state: AgentState) -> AgentState:
         if _expirado(state.get("intake_started_en"), INTAKE_TTL_HORAS):
             logger.info("ficha de intake expirada (> %dh) → reset total",
                         INTAKE_TTL_HORAS)
-            reset = {**reset, **_RESET_INTAKE}
+            reset = {**reset, **RESET_INTAKE}
         else:
             forzar_intake = True
 
@@ -252,13 +261,13 @@ def analyze_sentiment(state: AgentState) -> AgentState:
                 # Segunda respuesta ambigua: evitar bucle, ir por menor fricción.
                 route = ROUTE_HANDOFF
                 reason = f"handoff_choice ambigua x2 → directo | {result.reason}"
-                reset = {**reset, **_RESET_HANDOFF_CHOICE}
+                reset = {**reset, **RESET_HANDOFF_CHOICE}
             else:
                 reason = f"handoff_choice ambigua → re-preguntar | {result.reason}"
                 reset = {**reset, "handoff_choice_attempts": choice_attempts + 1}
         else:
             # El usuario cambió de tema (faq/agendar): limpiar elección pendiente.
-            reset = {**reset, **_RESET_HANDOFF_CHOICE}
+            reset = {**reset, **RESET_HANDOFF_CHOICE}
     elif forzar_intake:
         route = ROUTE_INTAKE
         reason = f"intake activo (clasificación solo metadata) | {result.reason}"

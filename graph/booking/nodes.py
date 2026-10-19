@@ -1,5 +1,9 @@
 """graph/booking/nodes.py — Acciones del sub-agente BOOKING.
 
+v8.4 — Cierres exhaustivos: todos los retornos finales (éxito, HITL
+       rechazado, fallo técnico, sin horarios, abortado) usan RESET_BOOKING
+       para evitar estado residual (booking_decision, lead_modalidad,
+       agenda_started_en, etc.) entre flujos.
 v8.3 — Fix aviso de privacidad repetido: emisión one-shot exclusiva de
        pedir_nombre; pedir_email/pedir_modalidad ya no lo tocan; texto
        migrado a prompts.yaml (atencion.agenda_inicio_aviso);
@@ -22,6 +26,7 @@ from core.db_client import insert_booking, upsert_conversation, upsert_lead
 
 from core.llm import LLM
 from graph.utils import (
+    RESET_BOOKING,
     _cfg, _guardar_ai, _parse_dt, _primer_nombre, _telefono_cliente,
 )
 from tools.google_calendar import (
@@ -554,9 +559,13 @@ def confirmar_y_crear(state: AgentState) -> AgentState:
             response = ("Gracias por su interés. Una ejecutiva se contactará para "
                         "coordinar la cita. " + (decision.get("nota", ""))).strip()
             _guardar_ai(state, response)
-            return {"response": response, "response_bubbles": [response],
-                    "response_interactive": None, "booking_stage": None,
-                    "slots_propuestos": [], "messages": [AIMessage(content=response)]}
+            return {
+                "response": response,
+                "response_bubbles": [response],
+                "response_interactive": None,
+                "messages": [AIMessage(content=response)],
+                **RESET_BOOKING,
+            }
 
     evento = crear_evento_asesoria(
         LeadCalendar(
@@ -571,10 +580,13 @@ def confirmar_y_crear(state: AgentState) -> AgentState:
         response = ("Tuve un problema técnico confirmando la hora. Si lo prefiere, "
                     "una ejecutiva la agenda manualmente contigo. ¿Le parece?")
         _guardar_ai(state, response)
-        return {"response": response, "response_bubbles": [response],
-                "response_interactive": None, "booking_stage": None,
-                "booking_signal": "creacion_fallida",
-                "slots_propuestos": [], "messages": [AIMessage(content=response)]}
+        return {
+            "response": response,
+            "response_bubbles": [response],
+            "response_interactive": None,
+            "messages": [AIMessage(content=response)],
+            **RESET_BOOKING,
+        }
 
     if state.get("lead_modalidad") == "online" and evento.meet_link:
         modalidad_linea = f"Videollamada por Google Meet: {evento.meet_link}"
@@ -614,43 +626,38 @@ def confirmar_y_crear(state: AgentState) -> AgentState:
         logger.exception("[booking] SheetDB (fallback) falló: %s", e)
 
     _guardar_ai(state, response)
-    return {"response": response,
-            "response_bubbles": [response],
-            "response_interactive": None,
-            "booking": payload,
-            "booking_stage": None,
-            "closed": False,
-            "slots_propuestos": [], "booking_match": None,
-            "booking_attempts": 0, "booking_franja": None,
-            "agenda_started_en": None, "agenda_ventana_desde": 0,
-            "agenda_dia_sin_cupos": None,
-            "messages": [AIMessage(content=response)]}
+    return {
+        "response": response,
+        "response_bubbles": [response],
+        "response_interactive": None,
+        "booking": payload,
+        "closed": False,
+        "messages": [AIMessage(content=response)],
+        **RESET_BOOKING,
+    }
 
 
 def ofrecer_ejecutiva(state: AgentState) -> AgentState:
     atn = _cfg()["atencion"]
     response = atn["agenda_sin_horarios"]
     _guardar_ai(state, response)
-    return {"response": response,
-            "response_bubbles": [response],
-            "response_interactive": None,
-            "booking_stage": None,
-            "slots_propuestos": [], "booking_match": None,
-            "booking_attempts": 0, "booking_signal": None,
-            "agenda_dia_sin_cupos": None,
-            "messages": [AIMessage(content=response)]}
+    return {
+        "response": response,
+        "response_bubbles": [response],
+        "response_interactive": None,
+        "messages": [AIMessage(content=response)],
+        **RESET_BOOKING,
+    }
 
 
 def cerrar_booking(state: AgentState) -> AgentState:
     atn = _cfg()["atencion"]
     response = atn["agenda_abortado"]
     _guardar_ai(state, response)
-    return {"response": response,
-            "response_bubbles": [response],
-            "response_interactive": None,
-            "booking_stage": None,
-            "slots_propuestos": [], "booking_match": None,
-            "booking_attempts": 0, "booking_franja": None,
-            "booking_signal": None,
-            "agenda_dia_sin_cupos": None,
-            "messages": [AIMessage(content=response)]}
+    return {
+        "response": response,
+        "response_bubbles": [response],
+        "response_interactive": None,
+        "messages": [AIMessage(content=response)],
+        **RESET_BOOKING,
+    }
