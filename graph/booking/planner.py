@@ -1,5 +1,29 @@
 """graph/booking/planner.py — Comprensión del turno de agendamiento.
 
+v4.5 — FIX #9 (auditoría): el planner deja de escribir lead_nombre,
+  lead_email y lead_modalidad al canal. Esos campos los escribe SOLO
+  procesar_captura tras pasar _v_nombre/_v_email/_v_modalidad. Antes, un
+  email mal extraído por el LLM quedaba persistido en el estado (merge
+  aditivo del checkpointer) aunque el validador lo rechazara; como
+  RESET_BOOKING conserva lead_*, la basura cruzaba aborts y TTLs y podía
+  producir citas con correo inválido semanas después. booking_franja
+  sigue escribiéndose (FranjaLabel cerrado, sin riesgo, y filtrar por
+  franja no requiere validador de negocio).
+
+v4.4 — FIX #6 (auditoría): reordenamiento del abort en _fast_path.
+  - El chequeo de abort ya NO va primero: se mueve DESPUÉS de los matches
+    de captura, slots, día, franja, ordinal y título de botón. Así
+    "no quiero el lunes, mejor el martes" se interpreta como
+    pedir_otra_fecha (no abortar) y "no quiero online, mejor presencial"
+    como entregar_modalidad=presencial.
+  - _parece_abort (graph/utils.py v1.4) ahora solo matchea frases
+    inequívocas ("cancela la hora", "olvídalo"). El LLM sigue siendo la
+    red de seguridad para los ambiguos.
+  - Añade _detectar_modalidad() con manejo de negación explícita
+    ("no quiero online" → presencial). Sin esto, _RE_ONLINE matcheaba
+    "online" dentro de una frase negada y capturaba la modalidad
+    equivocada.
+
 v4.3 — Match exacto por título de botón:
   - Si el cliente pincha "Lun 06/10 09:00", el planner lo mapea
     directamente al slot correspondiente.
@@ -44,6 +68,15 @@ _RE_TARDE = re.compile(r"(por|en|de)\s+la\s+tarde|tipo tarde|al salir del trabaj
                        r"|despues de las?\s+(1[4-9]|2[01])")
 _RE_ONLINE = re.compile(r"online|videollamada|virtual|meet|zoom")
 _RE_PRESENCIAL = re.compile(r"presencial|oficina|en persona")
+
+# v4.4 (fix #6): negación explícita de modalidad.
+# "no quiero online" / "no, prefiero presencial" / "no me interesa videollamada"
+_RE_NO_ONLINE = re.compile(
+    r"\bno\b[^.,;!?\n]{0,40}(online|videollamada|virtual|meet|zoom)"
+)
+_RE_NO_PRESENCIAL = re.compile(
+    r"\bno\b[^.,;!?\n]{0,40}(presencial|oficina|en\s+persona)"
+)
 
 
 def _norm(s: str) -> str:
@@ -100,26 +133,68 @@ def _extraer_ordinal(texto: str) -> int | None:
 
 
 # ---------------------------------------------------------------------------
+# Detección de modalidad con manejo de negación (v4.4, fix #6)
+# ---------------------------------------------------------------------------
+def _detectar_modalidad(t: str) -> str | None:
+    """Interpreta la preferencia de modalidad con manejo de negación.
+
+    Reglas (t ya viene normalizado sin tildes por _norm):
+      - Niega SOLO una opción → se asume la otra.
+      - Niega AMBAS → None (el LLM decide, típicamente abortar).
+      - No niega ninguna → afirmación estándar (dígito o keyword).
+
+    Casos cubiertos:
+      "no quiero online, mejor presencial" → presencial
+      "no quiero presencial"               → online
+      "no puedo ir, mejor online"          → online
+      "online"                              → online
+      "no, prefiero la 2"                  → presencial
+      "no quiero ninguna"                  → None (LLM)
+    """
+    neg_online = bool(_RE_NO_ONLINE.search(t))
+    neg_presencial = bool(_RE_NO_PRESENCIAL.search(t))
+    if neg_online and neg_presencial:
+        return None
+    if neg_online:
+        return "presencial"
+    if neg_presencial:
+        return "online"
+    # Afirmación estándar (dígito o keyword sin negación)
+    if re.search(r"\b1\b", t) or _RE_ONLINE.search(t):
+        return "online"
+    if re.search(r"\b2\b", t) or _RE_PRESENCIAL.search(t):
+        return "presencial"
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Fast-paths deterministas
 # ---------------------------------------------------------------------------
 def _fast_path(raw: str, stage: str | None, slots: list) -> BookingDecision | None:
     t = _norm(raw)
-    if _parece_abort(raw):
-        return BookingDecision(accion="abortar")
 
-    # --- captura de modalidad (sin cambios) ---
+    # ==================================================================
+    # 0) Captura de modalidad: intención con manejo de negación (v4.4).
+    #    El abort NO va primero — va al final de la función. "no quiero
+    #    online, mejor presencial" se resuelve aquí como presencial, no
+    #    como abort ni como online.
+    # ==================================================================
     if stage == "captura_modalidad":
-        if re.search(r"\b1\b", t) or _RE_ONLINE.search(t):
-            return BookingDecision(accion="entregar_modalidad", modalidad="online")
-        if re.search(r"\b2\b", t) or _RE_PRESENCIAL.search(t):
-            return BookingDecision(accion="entregar_modalidad", modalidad="presencial")
+        modalidad = _detectar_modalidad(t)
+        if modalidad:
+            return BookingDecision(accion="entregar_modalidad",
+                                   modalidad=modalidad)
 
+    # Si no estamos en propuesta con slots vigentes, salir (el abort
+    # explícito se evalúa al final).
     if stage != "propuesta" or not slots:
+        if _parece_abort(raw):
+            return BookingDecision(accion="abortar")
         return None
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # 1) Lenguaje natural PRIMERO: día + hora / hora única / ordinal
-    # ------------------------------------------------------------------
+    # ==================================================================
     m = match_slot(raw, slots, ref=datetime.now(GCAL_TZ).date())
     if m is not None:
         if isinstance(m, int):
@@ -132,26 +207,28 @@ def _fast_path(raw: str, stage: str | None, slots: list) -> BookingDecision | No
             logger.info("[booking] fast-path match_slot ambiguo: %s", m)
             return BookingDecision(accion="elegir_horario")
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # 2) Día/fecha explícito que NO calzó exactamente → replanificar,
     #    NUNCA tratar como duda lateral ("el lunes", "mañana", "04/09"...).
-    # ------------------------------------------------------------------
+    #    "no quiero el lunes, mejor el martes" → aquí se resuelve como
+    #    pedir_otra_fecha (martes), no como abort.
+    # ==================================================================
     off = extraer_dias_offset(raw, datetime.now(GCAL_TZ).date())
     if off is not None:
         logger.info("[booking] fast-path otro día: offset %d", off)
         return BookingDecision(accion="pedir_otra_fecha", dias_offset=off)
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # 3) Franja horaria (cuando no pidió día específico)
-    # ------------------------------------------------------------------
+    # ==================================================================
     if _RE_MANANA.search(t):
         return BookingDecision(accion="filtrar_franja", franja="manana")
     if _RE_TARDE.search(t):
         return BookingDecision(accion="filtrar_franja", franja="tarde")
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # 4) Ordinales y números simples
-    # ------------------------------------------------------------------
+    # ==================================================================
     ordinal = _extraer_ordinal(raw)
     if ordinal is not None and 1 <= ordinal <= len(slots):
         logger.info("[booking] fast-path ordinal: opción %d", ordinal)
@@ -166,14 +243,25 @@ def _fast_path(raw: str, stage: str | None, slots: list) -> BookingDecision | No
         logger.info("[booking] número fuera de rango: %d (slots=%d)",
                     opcion, len(slots))
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # 5) Match exacto contra título de botón enviado por el adaptador
-    # ------------------------------------------------------------------
+    # ==================================================================
     titulo_cliente = _norm(raw)
     for i, s in enumerate(slots, 1):
         if _norm(_slot_button_label(s)) == titulo_cliente:
             logger.info("[booking] match exacto por título de botón: %d", i)
             return BookingDecision(accion="elegir_horario", eleccion=i)
+
+    # ==================================================================
+    # 6) Abort explícito DESPUÉS de todos los matches (v4.4, fix #6).
+    #    Solo llega aquí quien escribió una frase inequívoca de
+    #    cancelación ("olvídalo", "cancela la hora") que no encaja en
+    #    ninguna rama anterior. El LLM sigue siendo red de seguridad
+    #    para los ambiguos.
+    # ==================================================================
+    if _parece_abort(raw):
+        logger.info("[booking] abort explícito detectado en _fast_path")
+        return BookingDecision(accion="abortar")
 
     return None
 
@@ -294,13 +382,24 @@ def booking_planner(state: AgentState) -> AgentState:
             elif isinstance(m, list):
                 candidatos = m
 
+    # v4.5 — FIX #9 (auditoría): el planner YA NO escribe lead_nombre,
+    # lead_email ni lead_modalidad al canal. Su doctrina ("el LLM PROPONE,
+    # los validadores DISPONEN") exige que esos campos los escriba
+    # procesar_captura SOLO tras pasar _v_nombre / _v_email / _v_modalidad.
+    #
+    # Bug cerrado: un email mal extraído por el LLM quedaba persistido en
+    # el canal porque el merge del checkpointer es aditivo (no de
+    # reemplazo). Aunque procesar_captura rechazara el valor y NO lo
+    # reescribiera, el del planner sobrevivía. Como RESET_BOOKING conserva
+    # lead_* (política memoria larga), la basura cruzaba aborts y TTLs; y
+    # semanas después _siguiente_captura (supervisor.py) veía lead_email
+    # truthy → saltaba pedir_email → cita con correo inválido → Meet nunca
+    # llegaba.
+    #
+    # booking_franja SÍ se persiste: FranjaLabel es cerrado por Pydantic
+    # (Literal["manana","tarde"]), no hay riesgo de basura, y filtrar por
+    # franja en consultar_disponibilidad NO requiere pasar por un validador.
     updates = {}
-    if decision.nombre:
-        updates["lead_nombre"] = decision.nombre.strip()
-    if decision.email:
-        updates["lead_email"] = decision.email.strip().lower()
-    if decision.modalidad:
-        updates["lead_modalidad"] = decision.modalidad
     if decision.franja:
         updates["booking_franja"] = decision.franja
 

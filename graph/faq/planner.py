@@ -1,5 +1,22 @@
 """graph/faq/planner.py — Decide qué hacer con la pregunta del usuario.
 
+v2.2 — FIX #7 (auditoría): fast-paths por substring.
+  - Reordena: HUMANO → AGENDAR → SALUDO (con gate de largo). Antes el
+    saludo corría primero y enterraba intenciones en mensajes como
+    "hola, ¿puedo hablar con alguien?" o "hola, llámame" — iban a
+    responder_pregunta cuando el cliente pedía humano explícitamente.
+  - Elimina _FUERA como fast-path. Su blacklist por substring colisionaba
+    con vocabulario real de derecho de familia ("la comida de los niños",
+    "se fue de viaje con mi hijo", "vender la casa en común") — falsos
+    positivos que expulsaban a clientes angustiados con casos legítimos.
+    fuera_de_dominio queda al LLM, que ve historial completo.
+  - SALUDO limitado a mensajes cortos (≤ 8 palabras) como autodefensa:
+    "hola" es la palabra más débil del idioma; un mensaje largo que la
+    contiene casi nunca ES un saludo.
+  - HUMANO y AGENDAR mantienen fast-path sin gate: sus keywords son
+    específicas ("hablar con una persona", "reservar hora") y en un
+    mensaje largo con esta frase la intención sigue siendo la misma.
+
 v2.1 — Fast-paths ampliados: saludos, presentación y consultas generales del
 estudio van directo a responder_pregunta, donde el system prompt del FAQ
 ya se presenta y orienta. Se mantiene la precaución en humano/agendar/fuera.
@@ -37,32 +54,47 @@ _HUMANO_EXPLICITO = (
     "hablar directamente con alguien", "quiero una ejecutiva",
     "puedo hablar con alguien", "hablar con alguien de verdad",
 )
-_FUERA = (
-    "pizza", "delivery", "comida", "restaurante", "clima", "deporte",
-    "política", "noticias", "chiste", "cancha", "partido", "gimnasio",
-    "cine", "película", "viaje", "hotel", "comprar", "vender",
-)
+
+# _FUERA — DEPRECATED (v2.2, fix #7). Eliminado como fast-path: el
+# blacklist por substring colisionaba con vocabulario real de familia.
+# Ejemplos que caían erróneamente en fuera_de_dominio:
+#   "no me deja plata para la comida de los niños"  → pensión
+#   "mi ex se fue de viaje con mi hijo sin permiso" → tupla/salida
+#   "quiero vender la casa que tenemos en común"    → divorcio/bienes
+# Rechazar a un cliente angustiado con un caso legítimo es el falso
+# positivo más caro de este producto. fuera_de_dominio ahora lo decide
+# SOLO el LLM (_decidir_llm), que ve historial completo.
 
 
 def _fast_path(query: str) -> FAQDecision | None:
     q = query.lower().strip().rstrip("?").rstrip("!")
+    n_palabras = len(q.split())
 
-    # Saludos y preguntas de presentación/capacidades → responder_pregunta
-    if any(p in q for p in _SALUDO_PRESENTACION):
-        return FAQDecision(accion="responder_pregunta",
-                           razon="saludo, presentación o consulta general del estudio")
-
-    if any(p in q for p in _FUERA):
-        return FAQDecision(accion="fuera_de_dominio",
-                           razon="keywords fuera de dominio detectadas")
-
+    # HUMANO primero (fix #7): "hola, ¿puedo hablar con alguien?" debe
+    # resolverse como hablar_humano, no como saludo. Keyword específica
+    # ("hablar con una persona", "quiero una ejecutiva") → no requiere
+    # gate de largo: en un mensaje largo con esta frase, la intención
+    # sigue siendo la misma (contacto humano explícito).
     if any(p in q for p in _HUMANO_EXPLICITO):
         return FAQDecision(accion="hablar_humano",
                            razon="solicitud explícita de contacto humano")
 
+    # AGENDAR segundo (fix #7): misma lógica que HUMANO. "quiero
+    # agendar" / "reservar hora" son específicas, no se entierran por
+    # saludo previo.
     if any(p in q for p in _AGENDAR_EXPLICITO):
         return FAQDecision(accion="sugerir_agendar",
                            razon="solicitud explícita de agendamiento")
+
+    # SALUDO al final y con gate de largo (fix #7): "hola" es el token
+    # más débil del idioma; un mensaje largo que la contiene casi nunca
+    # ES un saludo (es contenido con fórmula de cortesía). Casos:
+    #   "hola, ¿quiénes son?"              ≤ 8 → responder_pregunta ✓
+    #   "buenos días, ¿atienden sábados?"  ≤ 8 → responder_pregunta ✓
+    #   "hola, me llamo X y tengo pensión" >  8 → LLM decide con contexto
+    if n_palabras <= 8 and any(p in q for p in _SALUDO_PRESENTACION):
+        return FAQDecision(accion="responder_pregunta",
+                           razon="saludo, presentación o consulta general del estudio")
 
     return None
 
@@ -110,7 +142,8 @@ def faq_planner(state: AgentState) -> AgentState:
     raw = state.get("query", "")
     decision = _fast_path(raw) or _decidir_llm(state)
     logger.info("[faq] acción=%s razon=%s", decision.accion, decision.razon)
-    return {
-        "faq_decision": decision.model_dump(),
-        "faq_stage": "respondiendo",
-    }
+    # v2.3 — FIX #11 (auditoría): faq_stage eliminado. Era dead code y su
+    # semántica era incorrecta (siempre "respondiendo", incluso cuando la
+    # acción es pedir_clarificacion).
+    return {"faq_decision": decision.model_dump()}
+

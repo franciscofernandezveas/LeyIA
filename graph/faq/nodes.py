@@ -1,5 +1,13 @@
 """graph/faq/nodes.py — Acciones del sub-agente FAQ.
 
+v3.2 — Fix #2 (auditoría): derivar_a_ejecutiva señala ROUTE_HANDOFF_CHOICE
+       (antes ROUTE_INTAKE), alineando la política con analyze_sentiment
+       para intent=hablar_humano. Antes, el padre no honraba la señal y el
+       cliente quedaba sin respuesta (route_post_faq caía en END por
+       intake_resume=False). Ahora el nodo preguntar_preferencia_handoff
+       emite la elección "ficha breve vs contacto directo" tras el END del
+       subgrafo FAQ.
+
 v3.1 — Importa helpers desde graph/utils.py (rompe ciclo graph.nodes↔faq).
 v3 — Integración con intake v11 (multi-burbuja / one-shot):
   - Todos los emisores devuelven response_bubbles + response_interactive
@@ -20,7 +28,7 @@ import logging
 from langchain_core.messages import AIMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
-from core.contracts import ROUTE_INTAKE, AgentState
+from core.contracts import ROUTE_HANDOFF_CHOICE, AgentState
 from core.llm import LLM
 from core.rag import retrieve
 from graph.utils import _cfg, _guardar_ai, _recent_messages, _wa_link
@@ -105,17 +113,21 @@ def sugerir_agendar(state: AgentState) -> AgentState:
 def derivar_a_ejecutiva(state: AgentState) -> AgentState:
     """El planner FAQ detectó pedido de humano dentro de la conversación.
 
-    Señala ROUTE_INTAKE para que el padre desvíe el turno al subgrafo de
-    intake (embudo oficial: ficha → handoff). No emite mensaje: la respuesta
-    de ESTE turno la emite el intake (apertura o, si el cliente insiste,
-    derivación con ficha parcial).
+    Emite ROUTE_HANDOFF_CHOICE (v3.2): misma política que analyze_sentiment
+    para intent=hablar_humano. Tras el END de este subgrafo, route_post_faq
+    reconoce la señal y enruta a preguntar_preferencia_handoff, que ofrece
+    la bifurcación "ficha breve (2 min) vs contacto directo" con botones
+    nativos y anti-loop (handoff_choice_attempts).
 
-    Se limpia intake_resume: si el cliente venía de una pausa lateral y aquí
-    pidió humano, el planner de intake debe EVALUAR el mensaje (→
-    insiste_humano → derivar_parcial), no reanudar la ficha mecánicamente.
+    No emite mensaje: la respuesta de ESTE turno la emite
+    preguntar_preferencia_handoff inmediatamente después.
+
+    Se limpia intake_resume: si el cliente venía de una pausa lateral del
+    intake y aquí pidió humano, el flujo pasa por la bifurcación de handoff
+    en vez de reanudar la ficha mecánicamente.
     """
     return {
-        "route": ROUTE_INTAKE,
+        "route": ROUTE_HANDOFF_CHOICE,
         "intake_resume": False,
         "response_interactive": None,
     }

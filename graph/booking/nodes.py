@@ -105,16 +105,25 @@ def _interactive_slots(slots: list, idxs: list[int] | None = None) -> dict | Non
 # ---------------------------------------------------------------------------
 def _aviso_privacidad(state: AgentState) -> str | None:
     """Devuelve el texto del aviso SOLO si corresponde emitirlo ahora:
-    - el cliente NO tiene ficha de intake (la ficha gestiona su propio
-      consentimiento — Ley 21.719), y
+    - el cliente NO dio consentimiento explícito en la ficha de intake
+      (presencia de intake_respuestas ≠ autorización — Ley 21.719), y
     - el flag persistido booking_privacidad_dicha aún no está levantado.
+
+    v8.7 — FIX #8 (auditoría): antes bastaba con que intake_respuestas
+    existiera (`bool(state.get("intake_respuestas"))`) para omitir el aviso.
+    Pero iniciar_ficha pre-carga 'telefono' y sin_consentimiento conserva
+    intake_respuestas aunque el consent haya sido explícitamente False —
+    la presencia de la ficha no es prueba de autorización. Ahora se chequea
+    el campo `consentimiento_datos is True` en lugar de la mera presencia.
+
     El texto vive en prompts.yaml (atencion.agenda_inicio_aviso); el hardcode
     previo aquí se elimina."""
-    if state.get("intake_respuestas"):
+    if (state.get("intake_respuestas") or {}).get("consentimiento_datos") is True:
         return None
     if state.get("booking_privacidad_dicha"):
         return None
     return _cfg()["atencion"]["agenda_inicio_aviso"]
+
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +419,18 @@ def procesar_captura(state: AgentState) -> AgentState:
 
     init = {}
     if not state.get("agenda_started_en"):
+        # v8.7 — FIX #8 (auditoría): el flag booking_privacidad_dicha se
+        # levanta SOLO si el cliente dio consentimiento explícito en la
+        # ficha. Antes bastaba con que intake_respuestas existiera —
+        # vulneraba Ley 21.719 cuando el cliente había negado la
+        # autorización pero iniciar_ficha ya había pre-cargado 'telefono'.
+        #
+        # Variable LOCAL (no canal del estado): consent_dado NO existe en
+        # AgentState, escribirlo como clave del dict lanzaría
+        # InvalidUpdateError (mismo patrón que el fix #1 de session_id).
+        consent_dado = ((state.get("intake_respuestas") or {})
+                        .get("consentimiento_datos") is True)
+
         init = {"agenda_started_en": datetime.now(GCAL_TZ).isoformat(),
                 "agenda_ventana_desde": 0,
                 "booking_attempts": 0,
@@ -417,12 +438,11 @@ def procesar_captura(state: AgentState) -> AgentState:
                 "booking_match": None,
                 "booking_match_candidatos": [],
                 "slots_propuestos": [],
-                # v8.3: conservar el flag previo; solo marcar como "dicho" si
-                # el cliente viene de una ficha de intake (la ficha ya gestionó
-                # el consentimiento). Antes: bool(intake_respuestas) podía BAJAR
-                # un True persistido en reingresos.
+                # v8.3 (conservado): preservar un True ya persistido.
+                # v8.7: el origen del True es ahora el consent EXPLÍCITO.
                 "booking_privacidad_dicha": bool(state.get("booking_privacidad_dicha"))
-                                            or bool(state.get("intake_respuestas"))}
+                                            or consent_dado}
+
 
     updates = {**init}
 
@@ -467,11 +487,24 @@ def procesar_captura(state: AgentState) -> AgentState:
         estado_intermedio = {**state, **updates, "booking_stage": "propuesta",
                              "booking_decision": {"accion": "entregar_datos"}}
         disponibilidad = consultar_disponibilidad(estado_intermedio)
+
+        # v8.6 — Fix #5 (auditoría): replicar el manejo de "ventana_agotada"
+        # que ya hace despues_de_consultar en el camino normal del planner.
+        # Sin este branch, proponer_slots recibía slots=[] y emitía el
+        # template de propuesta SIN opciones (texto colgado) tras capturar
+        # modalidad. ofrecer_ejecutiva ofrece el contacto humano y aplica
+        # RESET_BOOKING (limpieza de stage/signal) — el próximo turno sale
+        # del sub-flujo sin arrastre.
+        if disponibilidad.get("booking_signal") == "ventana_agotada":
+            oferta = ofrecer_ejecutiva({**estado_intermedio, **disponibilidad})
+            return {**updates, **disponibilidad, **oferta}
+
         pack = proponer_slots({**estado_intermedio, **disponibilidad})
         return {**updates, **disponibilidad, **pack}
 
     # Fallback defensivo
     return pedir_nombre({**state, **updates})
+
 
 
 def reintentar_eleccion(state: AgentState) -> AgentState:

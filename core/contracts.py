@@ -1,43 +1,35 @@
 """Contratos centrales: estado del grafo, thread_id y esquemas estructurados.
 
+v6.6 — FIX #11 (auditoría): tipado de intake_exit + eliminación de faq_stage.
+  - Nuevo IntakeExitLabel = Literal["faq","pausa","handoff","end","cta_cierre"]
+    reemplaza `intake_exit: str | None`. Elimina valores muertos que nunca
+    fueron emitidos por ningún nodo ("agendar", "cta_escala", "booking") y
+    que vivían solo en la documentación o en lectores defensivos.
+  - route_post_intake en graph/nodes.py ahora hace matching exhaustivo con
+    rama explícita para "cta_cierre" (antes caía por acoplamiento al
+    fallback intake_completado=True).
+  - Elimina faq_stage de AgentState: era dead code (siempre "respondiendo",
+    ningún nodo lo leía, y su semántica era incorrecta cuando la acción era
+    pedir_clarificacion). FAQStageLabel en graph/faq/contracts.py se
+    mantiene como contrato interno del subagente.
+
+v6.5 — FIX CRÍTICO sesión: session_id estaba declarado como anotación de
+  módulo FUERA del TypedDict AgentState, por lo que no era un canal del
+  estado. Ahora vive DENTRO de AgentState.
+
 v6.4 — Handoff choice: bifurcación previa al intake que pregunta ficha breve
   vs contacto directo. Añade ROUTE_HANDOFF_CHOICE y estado handoff_choice_*
   en AgentState.
 
 v6.3 — Cierre dual post-intake + fix EMAIL_RE:
-  - EMAIL_RE acepta dominios con un solo punto (gmail.com, yahoo.cl);
-    el patrón anterior exigía doble punto (mail.empresa.co.cl).
+  - EMAIL_RE acepta dominios con un solo punto (gmail.com, yahoo.cl).
   - intake_exit incluye nuevos valores "cta_cierre" y "cta_escala"
     para el cierre dual: Agendar / Hablar con abogada.
+    (v6.6: "cta_escala" se elimina por ser dead code — nunca emitido.)
 
-v6.2 — Refactor intake:
-  - IntakeExtract marcado como deprecated (la extracción activa del intake ahora
-    usa IntakeDecision en graph/intake/contracts.py).
-  - Limpieza de comentarios duplicados en AgentState; intake_exit documenta
-    los valores "agendar" y "end".
-
-v6.1 — Booking signal/estado extendidos:
-       + BookingSignalLabel incluye "tanda_repetida" (consultar_disponibilidad
-         detectó propuesta idéntica → duda mal clasificada como navegación).
-       + AgentState incluye agenda_dia_sin_cupos (etiqueta legible del día
-         pedido explícitamente que quedó sin cupo; lo muestra proponer_slots
-         antes de las alternativas).
-
-v6 — BOOKING migrado a subgrafo (graph/booking/):
-     + Estado: booking_stage / booking_decision / booking_match /
-       booking_match_candidatos / booking_signal / booking_franja /
-       booking_attempts (ledger del sub-flujo, persistido por checkpointer).
-     + Labels nuevos: FranjaLabel, BookingStageLabel, BookingSignalLabel.
-       Viven AQUÍ y no en graph/booking/contracts.py para respetar la
-       dirección de imports (core ← graph, jamás al revés: se evita la
-       circularidad, ya que booking/*.py importa AgentState de aquí).
-     − ELIMINADOS recolectando_datos_agenda / esperando_eleccion_horario:
-       el short-circuit de analyze_sentiment ahora es UN solo flag
-       (booking_stage: "captura" | "propuesta").
-     − ELIMINADO LeadExtract: la extracción del lead la hace el planner de
-       booking vía BookingDecision (graph/booking/contracts.py); la validez
-       del email sigue siendo EMAIL_RE determinista, aplicada allá.
-       ⚠️ Si algún test/script legado importa LeadExtract, debe migrarse.
+v6.2 — Refactor intake: ...
+v6.1 — Booking signal/estado extendidos: ...
+v6 — BOOKING migrado a subgrafo (graph/booking/): ...
 
 Changelog anterior:
   v5 - Integración del nodo de INTAKE (ficha proactiva + IntakeExtract).
@@ -101,9 +93,10 @@ VALID_LABELS = {
 # ⚠️ Las rutas DEBEN estar registradas como nodos en graph/builder.py
 #    (test de contrato: test_toda_ruta_tiene_nodo). ROUTE_AGENDAR es un
 #    subgrafo compilado registrado como nodo — el invariante no se toca.
-# ⚠️ Intake v13+ emite intake_exit="agendar" cuando la ficha se cierra con
-#    el CTA de agendamiento; el padre route_post_intake lo deriva a
-#    ROUTE_AGENDAR.
+# ⚠️ El intake v16+ emite intake_exit="cta_cierre" cuando la ficha se
+#    completa con el cierre dual (Agendar / Hablar con la abogada); el
+#    padre route_post_intake lo deriva a ROUTE_HANDOFF (v6.6 fija la rama
+#    explícita — antes dependía del fallback intake_completado=True).
 # --------------------------------------------------------------------------
 ROUTE_HANDOFF: str = "handoff_humano"
 ROUTE_HANDOFF_CHOICE: str = "handoff_choice"
@@ -142,35 +135,27 @@ BookingSignalLabel = Literal[
 ]
 
 # Formato razonable de email (validación práctica, no RFC 5322 completa).
-# v6.3: dominio de subdominio opcional — gmail.com/x@gmail.cl vuelven a pasar.
-#       Sigue rechazando TLD de 1 carácter (test@gmail.c) y dominios
-#       mal formados (usuario@dominio-).
 EMAIL_RE = re.compile(r"^[\w.+-]+@[\w-]+(\.[\w-]+)*\.[a-zA-Z]{2,}$")
 
 
 class TipoHITL(str, Enum):
-    """Tipos cerrados de interrupción humana. El CLI/app compara contra
-    estos valores — nunca con substrings sueltos."""
+    """Tipos cerrados de interrupción humana."""
     APROBACION_AGENDAMIENTO = "aprobacion_agendamiento"
-    # ESCALAMIENTO = "escalamiento"  # reservado: HITL por sentimiento quedó
-    # fuera por filosofía (derivar solo si el cliente lo pide/acepta).
 
 
 class HitlPayload(TypedDict):
-    """Payload del interrupt() hacia el operador (contrato firme nodo↔CLI).
-    Lo emite confirmar_y_crear en graph/booking/nodes.py cuando
-    REQUIERE_APROBACION_AGENDAMIENTO=True."""
+    """Payload del interrupt() hacia el operador (contrato firme nodo↔CLI)."""
     tipo: str            # TipoHITL.value
     thread_id: str
-    query: str           # último mensaje del cliente
-    detalle: str         # instrucción legible para el operador
+    query: str
+    detalle: str
     lead: dict           # {nombre, email, modalidad}
     categoria: str
     urgencia: str
 
 
 # --------------------------------------------------------------------------
-# 3bis) LABELS DEL INTAKE  (los consume IntakeExtract y graph/intake.py)
+# 3bis) LABELS DEL INTAKE
 # --------------------------------------------------------------------------
 EtapaProcesoLabel = Literal["sin_inicio", "demandado",
                             "causa_en_curso", "sentencia_previa"]
@@ -178,15 +163,34 @@ HorarioContactoLabel = Literal["manana", "tarde", "indiferente"]
 ComoConocioLabel = Literal["google", "instagram", "tiktok",
                            "recomendacion", "otro"]
 
+# v6.6 — FIX #11 (auditoría): IntakeExitLabel tipado y con valores muertos
+# eliminados. Cada valor corresponde a un emisor real verificado:
+#   "faq"        → pausar_para_faq
+#   "pausa"      → pausar_ficha
+#   "handoff"    → _derivar_parcial
+#   "end"        → abandonar_ficha / sin_consentimiento
+#   "cta_cierre" → _completar_ficha (cierre dual: Agendar / Hablar con abogada)
+# Valores eliminados (nunca emitidos por ningún nodo):
+#   "agendar"    → jamás se emitió; route_post_intake tenía rama muerta
+#   "cta_escala" → documentado en v6.3 pero sin emisor
+#   "booking"    → solo aparecía en handoff_humano.intake_ya_despidio (lectura)
+# Agregar un valor requiere: (1) incluirlo aquí, (2) emitirlo en algún nodo,
+# (3) manejar la rama en route_post_intake — el test
+# test_route_post_intake_cobertura_exhaustiva verifica el punto (3).
+IntakeExitLabel = Literal["faq", "pausa", "handoff", "end", "cta_cierre"]
+
 
 # --------------------------------------------------------------------------
 # 4) ESTADO COMPARTIDO DEL GRAFO
 # --------------------------------------------------------------------------
 class AgentState(TypedDict, total=False):
     # --- Entrada / persistencia ---
-    messages: Annotated[list, add_messages]   # historial acumulado
-    query: str                                # derivado SIEMPRE del último humano
-    thread_id: str                            # en prod = teléfono (E.164)
+    messages: Annotated[list, add_messages]
+    query: str
+    thread_id: str
+
+    # --- Sesión (v6.5: canal del estado; lo escribe receive_message) ---
+    session_id: str | None
 
     # --- Clasificación unificada (nodo analyze_sentiment) ---
     sentiment: SentimentLabel
@@ -194,71 +198,65 @@ class AgentState(TypedDict, total=False):
     intent: IntentLabel
     category: CategoryLabel
     case_category: CategoryLabel
-    clf_reason: str                           # auditoría/debug
-    route: str                                # decisión de routing (VALID_ROUTES)
+    clf_reason: str
+    route: str
 
     # --- Atención RAG (nodo respuestas_faq) ---
     context: List[str]
     response: str
+
     # --- Sub-flujo de FAQ (subgrafo graph/faq/) ---
     faq_decision: dict | None        # dump de FAQDecision (turno actual)
-    faq_stage: str | None            # "respondiendo" | "clarificando"
+    # v6.6: faq_stage ELIMINADO — era dead code (siempre "respondiendo",
+    # ningún nodo lo leía, y su semántica era incorrecta cuando la acción
+    # era pedir_clarificacion). FAQStageLabel vive en graph/faq/contracts.py
+    # como contrato interno del subagente y no cruza al estado del padre.
 
     # --- Sub-flujo de BOOKING (subgrafo graph/booking/) ---
-    # Ledger del sub-flujo: lo escriben/leen los nodos de graph/booking/;
-    # analyze_sentiment solo lee booking_stage (short-circuit) y hace
-    # reset completo por abort/TTL. lead_* se conservan a propósito tras
-    # abortar: si el cliente retoma, no se le vuelve a pedir su correo.
     lead_nombre: str
     lead_email: str
     lead_modalidad: ModalidadLabel
-    booking_stage: BookingStageLabel | None   # None | "captura" | "propuesta"
-    booking_decision: dict                    # dump de BookingDecision (turno actual)
-    booking_match: int | None                 # índice en slots_propuestos (validado)
-    booking_match_candidatos: List[int]       # ambigüedad real (subset a aclarar)
-    booking_signal: BookingSignalLabel | None # señal de replan consumible
-    booking_franja: FranjaLabel | None        # preferencia "por la mañana/tarde"
-    booking_attempts: int                     # anti-loop de reintentos de elección
-    slots_propuestos: List[str]               # ISO datetimes (fuente de verdad del match)
-    agenda_ventana_desde: int                 # offset de días para "otro día"
-    agenda_started_en: str                    # ISO: inicio del sub-flujo (TTL 24 h, único)
-    agenda_dia_sin_cupos: str | None          # "miércoles 09/09" si el día pedido está lleno
-    booking_privacidad_dicha: bool            # aviso legal de agenda ya emitido (one-shot por hilo, v6.4)
-    booking: dict                             # cita creada (dump de EventoAsesoria)
+    booking_stage: BookingStageLabel | None
+    booking_decision: dict
+    booking_match: int | None
+    booking_match_candidatos: List[int]
+    booking_signal: BookingSignalLabel | None
+    booking_franja: FranjaLabel | None
+    booking_attempts: int
+    slots_propuestos: List[str]
+    agenda_ventana_desde: int
+    agenda_started_en: str
+    agenda_dia_sin_cupos: str | None
+    booking_privacidad_dicha: bool
+    booking: dict
 
     # --- Sub-flujo de intake / ficha de lead (nodo intake_lead) ---
-    intake_activo: bool                       # ficha en curso
-    intake_idx: int                           # índice de la pregunta actual (telemetría;
-                                              # la fuente de verdad es _pendientes)
-    intake_respuestas: dict                   # {campo: valor validado}
-    intake_completado: bool                   # ficha lista → handoff directo
-    intake_started_en: str                    # ISO: inicio de ficha (TTL 24 h)
-    intake_decision: dict | None              # dump de IntakeDecision (turno actual):
-                                              # {accion, tipo, confianza, razon, campos...}
-    intake_stage: str | None                  # apertura|preguntando|pausado|completado|...
-    intake_attempts: int                      # fallos de validación en la pregunta activa
-    intake_exit: str | None                   # None | "faq" | "pausa" | "handoff" |
-                                              # "agendar" | "end" |
-                                              # "cta_cierre" | "cta_escala"
-    intake_resume: bool                       # tras FAQ lateral, intake re-pregunta pendiente
-    intake_oferta_qid: NotRequired[str | None]      # campo para el que ya se ofreció salida
+    intake_activo: bool
+    intake_idx: int
+    intake_respuestas: dict
+    intake_completado: bool
+    intake_started_en: str
+    intake_decision: dict | None
+    intake_stage: str | None
+    intake_attempts: int
+    intake_exit: IntakeExitLabel | None    # v6.6: tipado (antes str | None)
+    intake_resume: bool
+    intake_oferta_qid: NotRequired[str | None]
 
     # --- Bifurcación handoff: ficha breve vs contacto directo (v6.4) ---
-    handoff_choice_pending: bool              # True mientras esperamos elección
-    handoff_choice_attempts: int              # anti-loop de re-pregunta
-    handoff_choice_en: str | None             # ISO: inicio de la oferta
+    handoff_choice_pending: bool
+    handoff_choice_attempts: int
+    handoff_choice_en: str | None
 
     # --- Escalamiento / cierre (nodo handoff_humano) ---
-    closed: bool                              # hilo derivado/cerrado
-    summary: str                              # resumen del caso para la ejecutiva
-    notificacion_pendiente: bool              # WhatsApp falló; reintentar por job
+    closed: bool
+    summary: str
+    notificacion_pendiente: bool
 
-    response_bubbles: NotRequired[list[str]]        # burbujas separadas (fallback: response)
-    response_interactive: NotRequired[dict | None]  # {"kind": "buttons"|"list", ...} one-shot
+    response_bubbles: NotRequired[list[str]]
+    response_interactive: NotRequired[dict | None]
     response_cta: NotRequired[dict | None]
 
-
-session_id: str | None   # uuid de la conversación activa; lo escribe receive_message
 
 # --------------------------------------------------------------------------
 # 5) ESQUEMAS DE SALIDA ESTRUCTURADA DEL LLM
@@ -269,11 +267,6 @@ class AnalisisResult(BaseModel):
     v7 — 'reason' ANTES de las etiquetas (el LLM genera en orden de campos:
     razona primero, clasifica después) + descriptions operativas calibradas
     con el golden set (umbrales explícitos del dominio Manzzo).
-
-    ⚠️ Estas descriptions viajan al LLM: deben calzar con
-    classification.system_prompt de core/prompts.yaml (v3.0.0+).
-    ⚠️ El clasificador NO routea: la ruta la deriva compute_route()
-    (regla determinista). Aquí solo se etiqueta.
     """
     reason: str = Field(
         description=(
@@ -352,51 +345,19 @@ class AnalisisResult(BaseModel):
     )
 
 
-
 class IntakeExtract(BaseModel):
     """DEPRECATED — v6.2: la extracción activa del intake usa IntakeDecision en
-    graph/intake/contracts.py. Se mantiene solo por compatibilidad con tests o
-    scripts legacy que aún importen este esquema; no usar en nodos nuevos.
-
-    Mapeo texto libre → campos de la ficha de intake (nodo intake_lead).
-    Los validadores deterministas de graph/intake.py son la fuente de verdad;
-    este esquema es solo la costura de lenguaje natural.
-
-    ⚠️ consentimiento_datos queda FUERA a propósito: debe respondirse
-    directamente (sí/no), nunca inferirse con el LLM (Ley 21.719).
-
-    (La extracción del LEAD de agendamiento ya no vive aquí: es
-    BookingDecision en graph/booking/contracts.py, validada por
-    graph/booking/planner.py.)
+    graph/intake/contracts.py. Se mantiene solo por compatibilidad.
     """
     nombre: str | None = Field(default=None, description="Nombre completo.")
     email: str | None = Field(default=None, description="Correo electrónico.")
-    telefono: str | None = Field(
-        default=None, description="Móvil chileno, normalizado a +569XXXXXXXX."
-    )
-    situacion_actual: str | None = Field(
-        default=None,
-        description="Descripción breve del problema legal y desde cuándo.",
-    )
-    etapa_proceso: EtapaProcesoLabel | None = Field(
-        default=None,
-        description=(
-            "'sin_inicio': no ha hecho nada; 'demandado': lo demandaron/"
-            "notificaron; 'causa_en_curso': hay juicio activo; "
-            "'sentencia_previa': ya existe fallo o acuerdo."
-        ),
-    )
-    hijos_menores: bool | None = Field(
-        default=None,
-        description="True si menciona hijos menores de edad de por medio.",
-    )
-    comuna: str | None = Field(default=None, description="Comuna/ciudad.")
-    horario_contacto: HorarioContactoLabel | None = Field(
-        default=None, description="Horario preferido para llamada de la ejecutiva."
-    )
-    como_nos_conocio: ComoConocioLabel | None = Field(
-        default=None, description="Canal por el que conoció el estudio."
-    )
+    telefono: str | None = Field(default=None)
+    situacion_actual: str | None = Field(default=None)
+    etapa_proceso: EtapaProcesoLabel | None = Field(default=None)
+    hijos_menores: bool | None = Field(default=None)
+    comuna: str | None = Field(default=None)
+    horario_contacto: HorarioContactoLabel | None = Field(default=None)
+    como_nos_conocio: ComoConocioLabel | None = Field(default=None)
 
 
 def fallback_analisis(motivo: str = "error de parseo") -> AnalisisResult:
@@ -412,11 +373,7 @@ def fallback_analisis(motivo: str = "error de parseo") -> AnalisisResult:
 # 6) Config de ejecución
 # --------------------------------------------------------------------------
 def make_config(thread_id: str) -> dict:
-    """LangGraph persiste el estado por thread_id vía checkpointer.
-    recursion_limit defensivo: cubre el edge intake → handoff y las cadenas
-    internas del subgrafo de booking (planner → consultar → proponer, y el
-    replan confirmar → consultar por slot_stale), que cuentan como super-pasos
-    dentro de la misma invocación del grafo padre."""
+    """LangGraph persiste el estado por thread_id vía checkpointer."""
     return {
         "configurable": {"thread_id": thread_id},
         "recursion_limit": 40,

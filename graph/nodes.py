@@ -1,5 +1,20 @@
 """graph/nodes.py — Nodos transversales del agente (Manzzo y Cía).
 
+v21.2 — FIX #6 (auditoría): analyze_sentiment deja de interceptar aborts de
+        booking. El parent SOLO aplica TTL por expiración; toda decisión
+        de abort vive en el subgrafo (booking/planner.py). Antes, el
+        substring "no quiero" en _parece_abort abortaba el booking con
+        mensajes legítimos como "no quiero online, mejor presencial" y
+        reemplazaba el cierre amable agenda_abortado por una respuesta
+        FAQ aleatoria de RAG. Se elimina el import de _parece_abort
+        (ya no se usa en este módulo).
+
+v21.1 — FIX #2 (auditoría): route_post_faq honra las señales route de los
+        nodos internos del FAQ (ROUTE_HANDOFF_CHOICE desde
+        derivar_a_ejecutiva v3.2, y ROUTE_INTAKE legacy como defensa).
+        Antes, hablar_humano detectado por el planner FAQ terminaba en END
+        SIN emitir respuesta al cliente.
+
 v21 — FIX handoff_choice: response_interactive usa el contrato del canal
        ("kind": "buttons", sin "body"); el body viaja por separado en
        send_interactive. Títulos de botones recortados a ≤ 20 chars
@@ -51,7 +66,7 @@ from core.notifications import notificar_email
 from graph.utils import (
     RESET_BOOKING, RESET_HANDOFF_CHOICE, RESET_INTAKE, RESET_SESION_NUEVA,
     _ahora_iso, _cfg, _expirado, _ficha_intake, _format_few_shots,
-    _guardar_ai, _norm_simple, _parece_abort, _persist_escalation,
+    _guardar_ai, _norm_simple, _persist_escalation,
     _primer_nombre, _recent_messages, _telefono_cliente,
     _transcript_resumen, _upsert_conversacion_abierta, _wa_link_cliente,
     _wa_link_display,
@@ -214,11 +229,23 @@ def analyze_sentiment(state: AgentState) -> AgentState:
             choice_pendiente = True
 
     if en_booking:
-        if _parece_abort(query):
-            logger.info("cliente aborta booking → reclasificar")
-            reset = {**RESET_BOOKING}
-        elif _expirado(state.get("agenda_started_en"), AGENDA_CAPTURA_TTL_HORAS):
-            logger.info("booking expirado → reclasificar")
+        # v21.2 — FIX #6 (auditoría): el parent YA NO intercepta aborts.
+        # Toda decisión de abort vive en el subgrafo (booking/planner.py +
+        # _parece_abort afilada). Motivos:
+        #   1. El substring "no quiero" abortaba mensajes legítimos como
+        #      "no quiero online, mejor presencial" / "no quiero viernes,
+        #      mejor lunes" ANTES de que el planner viera el mensaje.
+        #   2. Quien sí abortaba recibía una respuesta FAQ aleatoria de RAG
+        #      a "olvídalo", en vez del cierre amable agenda_abortado
+        #      (cerrar_booking quedaba inalcanzable).
+        #   3. El LLM del planner tiene contexto para distinguir "no
+        #      quiero seguir" de "no quiero esa hora" — el parent no.
+        #
+        # Lo único que el parent todavía decide es TTL por expiración:
+        # cuando la captura lleva AGENDA_CAPTURA_TTL_HORAS sin completarse,
+        # se resetea el ledger de booking y se reclasifica el mensaje.
+        if _expirado(state.get("agenda_started_en"), AGENDA_CAPTURA_TTL_HORAS):
+            logger.info("booking expirado por TTL → reclasificar")
             reset = {**RESET_BOOKING}
         else:
             return {"route": ROUTE_AGENDAR,
@@ -327,20 +354,66 @@ def route_query(state: AgentState) -> str:
 
 
 def route_post_intake(state: AgentState) -> str:
-    if state.get("intake_exit") == "faq":
+    """Router de salida del subgrafo intake.
+
+    v21.3 — FIX #11 (auditoría): matching exhaustivo contra IntakeExitLabel.
+    Cada valor del Literal tiene su rama explícita (el test
+    test_route_post_intake_cobertura_exhaustiva lo verifica):
+
+      "faq"        → ROUTE_FAQ       (duda lateral; se reanudará después)
+      "pausa"      → END             (espera próximo mensaje del cliente)
+      "handoff"    → ROUTE_HANDOFF   (derivación parcial)
+      "cta_cierre" → ROUTE_HANDOFF   (cierre dual con CTA; ficha completa)
+      "end"        → END             (abandono / sin consentimiento)
+
+    Fallback defensivo (None u otro): si intake_completado → ROUTE_HANDOFF,
+    si no → END.
+    """
+    exit_ = state.get("intake_exit")
+
+    if exit_ == "faq":
         return ROUTE_FAQ
-    if state.get("intake_exit") == "pausa":
+    if exit_ == "pausa":
         return END
-    if state.get("intake_exit") == "agendar":
-        return ROUTE_AGENDAR
-    if state.get("intake_exit") in ("end",):
+    if exit_ == "handoff":
+        return ROUTE_HANDOFF
+    if exit_ == "cta_cierre":
+        # v21.3: rama explícita. Antes dependía del fallback
+        # (intake_completado=True) — funcionaba por acoplamiento.
+        return ROUTE_HANDOFF
+    if exit_ == "end":
         return END
-    if state.get("intake_completado") or state.get("intake_exit") == "handoff":
+
+    # Fallback defensivo: cubre None (turno sin exit) y futuras extensiones.
+    if state.get("intake_completado"):
         return ROUTE_HANDOFF
     return END
 
 
+
 def route_post_faq(state: AgentState) -> str:
+    """Router de salida del subgrafo FAQ.
+
+    v21.1 — FIX #2 (auditoría): honra la señal route emitida por nodos
+    internos del FAQ (derivar_a_ejecutiva). Antes solo miraba intake_resume,
+    por lo que hablar_humano dentro de FAQ terminaba en END SIN emitir
+    respuesta al cliente.
+
+    Reglas:
+      - route == ROUTE_HANDOFF_CHOICE → preguntar_preferencia_handoff
+        (ruta emitida por derivar_a_ejecutiva v3.2; política unificada con
+        analyze_sentiment para intent=hablar_humano).
+      - route == ROUTE_INTAKE        → intake_lead (o handoff si la ficha
+        ya estaba completa). Rama defensiva: cubre señales legacy.
+      - intake_resume + intake_activo + !completado → intake_lead
+        (round-trip lateral de duda dentro de la ficha).
+      - resto → END.
+    """
+    route = state.get("route")
+    if route == ROUTE_HANDOFF_CHOICE:
+        return ROUTE_HANDOFF_CHOICE
+    if route == ROUTE_INTAKE:
+        return ROUTE_HANDOFF if state.get("intake_completado") else ROUTE_INTAKE
     if state.get("intake_resume") and state.get("intake_activo") \
             and not state.get("intake_completado"):
         return ROUTE_INTAKE
@@ -485,8 +558,15 @@ def handoff_humano(state: AgentState) -> AgentState:
     except Exception as e:
         logger.exception("SheetDB (fallback) falló: %s", e)
 
-    intake_ya_despidio = state.get("intake_exit") in ("booking", "handoff", "agendar") \
+        # v21.3 — FIX #11 (auditoría): matching contra IntakeExitLabel.
+    # Se eliminan "booking" y "agendar" (nunca emitidos; eran código
+    # defensivo sin origen). "cta_cierre" se añade explícitamente: hoy
+    # queda cubierto también por intake_completado=True, pero hacerlo
+    # explícito documenta la intención y sobrevive a un refactor que
+    # desacople ambos.
+    intake_ya_despidio = state.get("intake_exit") in ("handoff", "cta_cierre") \
         or bool(state.get("intake_completado"))
+
     if intake_ya_despidio:
         return {
             "summary": summary, "closed": True,

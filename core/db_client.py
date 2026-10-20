@@ -278,12 +278,27 @@ def upsert_lead(
     intake_respuestas: dict,
     category: str | None = None,
     completed: bool = False,
+    notificar_crm: bool = True,
 ) -> None:
     """
     Una ficha ACTIVA por thread_id. Si la ficha anterior ya se completó y
     el intake llega desde OTRA sesión de conversación, se inicia un ciclo
     nuevo: el caso anterior se archiva en metadata['casos_anteriores'] y
     completed_at se reinicia (→ la nueva ficha completa vuelve a notificar).
+
+    v1.1 (fix #10, auditoría) — Parámetro notificar_crm:
+      - True (default): comportamiento histórico. Al completarse la ficha
+        (primera vez del ciclo), dispara notify_new_lead (WA) +
+        insert_escalation('ficha_completada', silenciosa).
+      - False: persiste el lead con completed_at=now() pero NO dispara
+        ninguna notificación. Usado por _completar_ficha del intake, porque
+        route_post_intake SIEMPRE envía intake_completado=True a
+        ROUTE_HANDOFF en el mismo turno y handoff_humano es el emisor único
+        (notify_escalation + email + sync_lead). Antes había doble WA por
+        el mismo lead.
+      - ⚠️ Si en el futuro se añade un flujo "ficha completa → END" (sin
+        handoff inmediato), ese call site debe usar notificar_crm=True
+        (explícito) para que el equipo reciba el aviso.
     """
     try:
         thread_id = normalize_thread_id(thread_id)
@@ -379,26 +394,42 @@ def upsert_lead(
             conn.commit()
 
         # Primera vez que se completa este ciclo → notificar + escalación silenciosa
+            # Primera vez que se completa este ciclo → notificar (si corresponde)
+        # + fila silenciosa en escalations.
+        #
+        # v1.1 (fix #10): se añade el flag notificar_crm para suprimir la
+        # notificación cuando un nodo posterior (handoff_humano) será el
+        # emisor único. Antes, la combinación _completar_ficha + handoff_humano
+        # en el mismo turno producía doble WA (notify_new_lead +
+        # notify_escalation) por el mismo evento — la ejecutiva recibía
+        # ≥2 WhatsApp + email redundantes por lead.
         if completed and not ya_notificado:
-            from integrations.whatsapp.notify import notify_new_lead
-            notify_new_lead({
-                "nombre": r.get("nombre"),
-                "telefono": r.get("telefono"),
-                "email": r.get("email"),
-                "categoria": category,
-                "situacion": r.get("situacion_actual"),
-                "etapa_proceso": r.get("etapa_proceso"),
-            })
+            if notificar_crm:
+                from integrations.whatsapp.notify import notify_new_lead
+                notify_new_lead({
+                    "nombre": r.get("nombre"),
+                    "telefono": r.get("telefono"),
+                    "email": r.get("email"),
+                    "categoria": category,
+                    "situacion": r.get("situacion_actual"),
+                    "etapa_proceso": r.get("etapa_proceso"),
+                })
 
-            # Registro silencioso: si el cliente desaparece sin decidir,
-            # la abogada aún lo ve en su cola de trabajo.
-            insert_escalation(
-                thread_id=thread_id,
-                summary="Cliente completó la ficha y está considerando "
-                        "agendar o hablar con la abogada.",
-                motivo="ficha_completada",
-                notificar=False,
-            )
+                # Registro silencioso: si el cliente desaparece sin decidir,
+                # la abogada aún lo ve en su cola de trabajo. Solo tiene
+                # sentido si notificar_crm=True — con False, el nodo
+                # posterior (handoff_humano) crea su propia fila
+                # (hablar_abogada o contacto_directo), por lo que el summary
+                # "está considerando" (incorrecto en el escenario de handoff
+                # inmediato) se omite aquí.
+                insert_escalation(
+                    thread_id=thread_id,
+                    summary="Cliente completó la ficha y está considerando "
+                            "agendar o hablar con la abogada.",
+                    motivo="ficha_completada",
+                    notificar=False,
+                )
+    
     except Exception as e:
         logger.exception("[db] upsert_lead falló: %s", e)
 

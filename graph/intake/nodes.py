@@ -16,7 +16,7 @@ from urllib.parse import quote
 from langchain_core.messages import AIMessage
 
 from core.contracts import EMAIL_RE, AgentState
-from core.db_client import upsert_lead
+from core.db_client import upsert_conversation, upsert_lead
 from graph.intake.utils import _evento_intake, _pack
 from graph.utils import (
     RESET_INTAKE,
@@ -552,14 +552,29 @@ def _completar_ficha(state: AgentState, respuestas: dict) -> AgentState:
     pack["response_cta"] = cta
 
     try:
+        # v16.3 — FIX #10 (auditoría): notificar_crm=False porque
+        # route_post_intake SIEMPRE envía intake_completado=True a
+        # ROUTE_HANDOFF en el mismo turno, y handoff_humano es el emisor
+        # único (notify_escalation + email + sync_lead). Antes había doble
+        # WA por el mismo lead (notify_new_lead aquí + notify_escalation en
+        # handoff) + doble fila en escalations.
+        #
+        # La persistencia del lead (con completed_at=now()) se mantiene:
+        # solo se suprime la notificación redundante.
+        #
+        # ⚠️ Si en el futuro se añade un flujo "ficha completa → END" (sin
+        # handoff inmediato), reactivar notificar_crm=True AQUÍ para que el
+        # equipo reciba el WA de ficha_completada.
         upsert_lead(
             thread_id=tid,
             intake_respuestas=respuestas,
             category=state.get("category"),
             completed=True,
+            notificar_crm=False,
         )
     except Exception as e:
         logger.warning("upsert_lead (completado) falló: %s", e)
+
 
     _guardar_ai(state, pack["response"])
     _evento_intake("intake_completado", state,
@@ -642,11 +657,37 @@ def reanudar(state: AgentState) -> AgentState:
     puente = (sec.get("reanudar_duda", DEFAULT_REANUDA_DUDA).format(duda=duda)
               if duda else sec.get("reanudar", DEFAULT_REANUDA))
 
-    pack = _pack([puente, _form_pregunta(state, q, respuestas, nombre)],
-                 interactive=_interactive_de(q))
-    _guardar_ai(state, pack["response"])
+    # v16.1 — FIX #3 (auditoría): preservar la respuesta del FAQ del MISMO
+    # turno. En un round-trip lateral (intake → FAQ → intake), los canales
+    # response/response_bubbles ya contienen la respuesta del FAQ; sin este
+    # prepend, esta burbuja la pisa (última escritura gana) y el cliente ve
+    # "espero haberte orientado" SIN la orientación.
+    #
+    # Discriminación: si el último mensaje del estado es tipo "ai", el
+    # subgrafo FAQ ya escribió en este turno (round-trip lateral → prepend).
+    # Si es "human", es una reanudación real tras pausa del cliente (no hay
+    # nada que preservar → solo puente + pregunta).
+    msgs = state.get("messages") or []
+    viene_de_faq = bool(msgs and getattr(msgs[-1], "type", "") == "ai")
+    previas = list(state.get("response_bubbles") or []) if viene_de_faq else []
+
+    pregunta = _form_pregunta(state, q, respuestas, nombre)
+    nuevo = _pack([puente, pregunta], interactive=_interactive_de(q))
+
+    if previas:
+        pack = _pack([*previas, puente, pregunta],
+                     interactive=_interactive_de(q))
+    else:
+        pack = nuevo
+
+    # Persistir SOLO el contenido NUEVO: la respuesta del FAQ ya quedó
+    # registrada por responder_pregunta → _guardar_ai en este mismo turno.
+    # Evita duplicación en el transcript para la ejecutiva.
+    _guardar_ai(state, nuevo["response"])
+
     _evento_intake("intake_reanudado", state, pregunta=q["id"])
     return {**base, **pack}
+
 
 
 def derivar_parcial(state: AgentState) -> AgentState:
@@ -689,6 +730,27 @@ def abandonar_ficha(state: AgentState) -> AgentState:
     )
     pack = _pack([msg])
     _guardar_ai(state, pack["response"])
+
+    # v16.2 — FIX #4 (auditoría): cerrar la conversación en BD ANTES de
+    # retornar closed=True. Antes solo el estado se cerraba: la conversación
+    # seguía abierta en BD, el conversation_id no cambiaba, el gatekeeper de
+    # sesión (receive_message) nunca reseteaba el flujo y todo mensaje
+    # futuro caía en analyze_sentiment.closed → ROUTE_HANDOFF →
+    # hilo_cerrado_message ETERNAMENTE. El cliente quedaba expulsado del
+    # bot incluso intentando abrir un caso nuevo.
+    #
+    # Orden crítico: _guardar_ai ANTES (insert_message necesita la
+    # conversación abierta como ancla), upsert_conversation DESPUÉS (setea
+    # closed_at → próxima entrada crea conversación nueva).
+    #
+    # status="abandonado" queda disponible para analítica del embudo.
+    upsert_conversation(
+        thread_id=state.get("thread_id", ""),
+        status="abandonado",
+        category=state.get("case_category") or state.get("category"),
+        closed=True,
+    )
+
     _evento_intake("intake_abandonado", state,
                    respuestas_keys=list(respuestas.keys()))
     return {
@@ -703,12 +765,30 @@ def abandonar_ficha(state: AgentState) -> AgentState:
     }
 
 
+
 def sin_consentimiento(state: AgentState, respuestas: dict | None = None) -> AgentState:
     msg = _cfg()["intake"]["sin_consentimiento"].format(
         wa_link=_wa_link_display(display="Hablar con un humano")
     )
     pack = _pack([msg])
     _guardar_ai(state, pack["response"])
+
+    # v16.2 — FIX #4 (auditoría): mismo tratamiento que abandonar_ficha.
+    # La negativa de consentimiento (Ley 21.719) también debe cerrar la
+    # sesión en BD para que el cliente pueda volver con un caso nuevo y
+    # para que el gatekeeper aplique RESET_SESION_NUEVA en el próximo
+    # contacto (que purga intake_respuestas, incluyendo los datos
+    # pre-capturados que se hubieran almacenado antes del NO).
+    #
+    # status="sin_consentimiento" para analítica del embudo (¿cuántos
+    # rechazan la autorización en la primera pregunta?).
+    upsert_conversation(
+        thread_id=state.get("thread_id", ""),
+        status="sin_consentimiento",
+        category=state.get("case_category") or state.get("category"),
+        closed=True,
+    )
+
     _evento_intake("intake_sin_consentimiento", state)
     return {
         **pack,
@@ -722,3 +802,4 @@ def sin_consentimiento(state: AgentState, respuestas: dict | None = None) -> Age
         "intake_oferta_qid": None,
         "closed": True,
     }
+

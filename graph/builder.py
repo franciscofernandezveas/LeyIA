@@ -79,15 +79,21 @@ def build_graph() -> StateGraph:
     # FAQ: normalmente responde y cierra; si el intake estaba pausado, lo
     # reanuda. Además, si el planner FAQ detectó un pedido de humano,
     # señala intake (o handoff si la ficha ya estaba completa).
+        # FAQ: normalmente responde y cierra; si el intake estaba pausado, lo
+    # reanuda. Si el planner FAQ detectó pedido de humano (fix #2, v21.1),
+    # señala ROUTE_HANDOFF_CHOICE → bifurcación ficha vs contacto directo
+    # (misma política que analyze_sentiment para intent=hablar_humano).
     workflow.add_conditional_edges(
         ROUTE_FAQ,
         route_post_faq,
         {
             ROUTE_INTAKE: ROUTE_INTAKE,
             ROUTE_HANDOFF: ROUTE_HANDOFF,
+            ROUTE_HANDOFF_CHOICE: ROUTE_HANDOFF_CHOICE,
             END: END,
         },
     )
+
 
     return workflow.compile(checkpointer=checkpointer)
 

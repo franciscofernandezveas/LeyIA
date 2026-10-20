@@ -9,6 +9,8 @@ v1.1 — Añade WA_TEXTO_MAX y _truncar_burbuja para reutilizar en subgrafos.
 import json
 import logging
 import re
+import unicodedata           # ← NUEVO (fix #6)
+
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -358,6 +360,65 @@ _ABORT_BOOKING = ("no quiero", "mejor no", "olvídalo", "olvidalo",
                   "dejalo", "déjalo", "ya no me interesa")
 
 
+# --------------------------------------------------------------------------
+# Abort explícito de booking (v1.4 — fix #6, auditoría)
+#
+# Solo frases INEQUÍVOCAS de cancelación/renuncia. Se eliminaron
+# deliberadamente "no quiero" y "mejor no" sueltos porque son substring de
+# mensajes legítimos:
+#   "no quiero online, mejor presencial"  → abortaba (mal)
+#   "no quiero el lunes, mejor el martes" → abortaba (mal)
+#   "mejor no sé qué hacer"               → abortaba (mal)
+#
+# Frases ambiguas quedan a cargo del LLM del planner de booking
+# (BookingDecision.accion="abortar" con contexto), que es la red de
+# seguridad real.
+#
+# Detección: normalización NFD (tildes fuera) + match por límite de palabra
+# (\b...\b), para no matchear "cancelar" dentro de "cancelaron" ni
+# "olvidalo" dentro de "no me olvides".
+# --------------------------------------------------------------------------
+_ABORT_BOOKING_PHRASES = (
+    # Cancelación explícita con objeto (cita / hora / agendamiento)
+    "cancelar la hora", "cancela la hora", "cancelo la hora",
+    "cancelar la cita", "cancela la cita", "cancelo la cita",
+    "cancelar el agendamiento", "cancela el agendamiento",
+    "cancelar mi hora", "cancela mi hora",
+    "cancelar mi cita", "cancela mi cita",
+    "anular la hora", "anula la hora", "anular la cita", "anula la cita",
+    "anular mi hora", "anula mi hora",
+    # Cancelación imperativa
+    "cancelalo", "cancelala", "cancelalo todo",
+    # Renuncia explícita al agendamiento
+    "ya no quiero agendar", "ya no quiero la hora", "ya no quiero una cita",
+    "ya no quiero la asesoria",
+    "ya no me interesa agendar", "ya no me interesa la hora",
+    "no quiero agendar", "no quiero agendar mas",
+    "no quiero seguir con esto", "no quiero continuar con esto",
+    "no me interesa agendar", "no me interesa la hora",
+    # Abandono coloquial (inequívoco)
+    "olvidalo", "olvidalo todo", "olvidate del tema",
+    "dejalo asi", "dejemoslo", "dejemoslo asi",
+    "mejor lo dejamos", "mejor no agendo", "mejor no agendamos",
+)
+
+_ABORT_BOOKING_RX = tuple(
+    re.compile(r"\b" + re.escape(frase) + r"\b", re.IGNORECASE)
+    for frase in _ABORT_BOOKING_PHRASES
+)
+
 def _parece_abort(query: str) -> bool:
-    q = query.lower()
-    return any(p in q for p in _ABORT_BOOKING)
+    """Detección de abort EXPLÍCITO de booking.
+
+    v1.4 (fix #6): normaliza tildes (NFD) y usa frase completa con
+    límites de palabra. Solo frases inequívocas — ver bloque de
+    _ABORT_BOOKING_PHRASES. Los casos ambiguos los resuelve el LLM del
+    planner de booking (accion="abortar").
+    """
+    q = (query or "").strip().lower()
+    if not q:
+        return False
+    q_norm = "".join(c for c in unicodedata.normalize("NFD", q)
+                     if unicodedata.category(c) != "Mn")
+    return any(rx.search(q_norm) for rx in _ABORT_BOOKING_RX)
+
