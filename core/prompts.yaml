@@ -1,37 +1,34 @@
 # ============================================================================
 # PROMPTS DEL AGENTE — Manzzo y Cía (dominio: derecho de familia, Chile)
-# Versión: 4.0.0
+# Versión: 4.0.1
 #
 # Changelog:
-#   v4.0.0 - Refactor integral post-auditoría:
-#     SEGURIDAD: protocolo de crisis (VIF, riesgo de menores, autolesión)
-#       con intent=crisis de precedencia máxima y template dedicado.
-#     CLASIFICADOR: catálogos cerrados para las 4 etiquetas, regla de
-#       precedencia multi-intención, nuevos intents gestionar_cita y
-#       reclamo, regla de aceptación ambigua, regla de idioma.
-#     PRIVACIDAD: consentimiento explícito en booking e intake con
-#       finalidad y derechos (Ley 21.719). Datos sensibles documentados.
-#     VOZ: unificada en todo el recorrido: de usted, sin emojis, sin
-#       signos de exclamación (resuelve contradicción atención/intake).
-#     INTEGRIDAD: handoff_message gateado por flag handoff_resumen_enviado
-#       + template fallback; anti-jailbreak; límite información general
-#       vs asesoría jurídica; género neutral.
-#     NEGOCIO: alcance de "causa completa" definido; precios con vigencia;
-#       ritmo de oferta anti-insistencia; dirección de oficina inyectable.
-#   v3.1.1 - (ver historial previo)
-# ============================================================================
-# VARIABLES (fuente única en backend, no hardcodear en el texto):
-#   {wa_link} {whatsapp_ejecutiva} {html_link} {thread_id}
-#   {direccion_oficina} {link_privacidad} {email_privacidad}
-#   {vigencia_precios} {precio_asesoria} {precio_causa} {cuotas_causa}
-# FLAGS DE ESTADO:
-#   booking_privacidad_dicha, booking_consentimiento_otorgado (nuevo),
-#   handoff_resumen_enviado (nuevo, gatea handoff_message),
-#   handoff_choice_reintentos (nuevo, máx. 2)
-# PENDIENTE DE VERIFICACIÓN ANTES DE PRODUCCIÓN:
+#   v4.0.1 - Alineación con el código vigente (post-incidente producción):
+#     * Placeholders nuevos de v4.0.0 literalizados: el validador de
+#       graph/utils.py (TEMPLATE_ARGS) solo reconoce los args que los nodos
+#       entregan hoy. Sin wiring de código, todo placeholder nuevo
+#       (precios, privacidad, direccion_oficina) rompe _cfg() en el primer
+#       mensaje del cliente.
+#     * Catálogos del clasificador revertidos a los Literales de
+#       core/contracts.py (intents de 4 valores, urgency sin 'critica',
+#       categories del catálogo vigente). v4.0.0 pedía labels que el
+#       esquema Pydantic rechaza → fallback silencioso constante.
+#     * crisis: aproximación prompt-only vía intent=hablar_humano +
+#       urgency=alta (la ruta determinista ROUTE_CRISIS requiere código).
+#     * Fix fugas: cierre_ctas ya no trae {wa_link} literal al cliente;
+#       oferta_salida vuelve a viñetas (coherente con parser/botones);
+#       agenda_inicio_aviso queda informativo (sin pregunta binaria, el
+#       gate de consentimiento en booking es trabajo de código pendiente).
+#   v4.0.0 - Refactor integral post-auditoría: voz unificada, protocolo
+#     de crisis, nuevos intents, privacidad explícita. (ver historial)
+#   v3.1.1 - Handoff choice; v3.1.0 - Reescritura de tono.
+#
+# PENDIENTE DE VERIFICACIÓN ANTES DE PRODUCCIÓN (sin cambios desde v4.0.0):
+#   - link_privacidad / email_privacidad: valores asumidos; confirmar los
+#     reales del estudio.
 #   - Números de emergencia en crisis_message (149, 1455, *4141) con
 #     fuentes oficiales vigentes.
-#   - Texto de alcance de "causa completa" validado por el estudio.
+#   - Texto de "causa completa" validado por el estudio.
 # ============================================================================
 
 atencion:
@@ -41,9 +38,9 @@ atencion:
   cta_agendar: "Si lo prefiere, puedo agendarle una asesoría con un abogado de nuestro equipo para revisar su caso en detalle y con confidencialidad. ¿Le interesa?"
 
   # ------------------------------------------------------------------
-  # CRISIS (nuevo v4.0.0) — intent=crisis, precedencia máxima.
-  # Emite el sistema, no el LLM. PENDIENTE: verificar números con
-  # fuentes oficiales vigentes antes de producción.
+  # Templates v4.0.0 SIN WIRING de código todavía: se conservan en el
+  # archivo pero ningún nodo los emite hoy. Con el despliegue de las
+  # rutas nuevas (ROUTE_CRISIS, etc.) quedan activos.
   # ------------------------------------------------------------------
   crisis_message: |
     Lamento profundamente lo que está pasando. Antes que cualquier trámite
@@ -59,13 +56,27 @@ atencion:
     puede dictar con rapidez. ¿Quiere que una persona de nuestro equipo le
     contacte hoy, con prioridad, para ayudarle con la parte legal?
 
-  # Reclamo (nuevo v4.0.0) — intent=reclamo. Emisión gateada: solo tras
-  # confirmación de derivación por el sistema.
   reclamo_message: |
     Lamento la experiencia que describe; no es el servicio que queremos
     entregar. He pasado su caso con prioridad a una persona del equipo,
     que le contactará hoy dentro del horario hábil (09:00–18:30) para
     resolverlo. Su conversación quedó registrada bajo el código {thread_id}.
+
+  handoff_fallback_message: |
+    {disclosure} Tuve un inconveniente técnico al enviar su resumen al
+    equipo. Para no hacerle esperar, escríbales directamente aquí:
+    {whatsapp_ejecutiva}. Su conversación quedó registrada bajo el código
+    {thread_id}.
+
+  handoff_choice_max_reintentos: |
+    Para no hacerle perder tiempo, le entrego directamente el contacto de
+    nuestro equipo: {whatsapp_ejecutiva}. Ellos tomarán su caso desde aquí.
+
+  agenda_sin_consentimiento: |
+    Entendido, sin problema. Sin su autorización no puedo registrar sus
+    datos para la cita. Si lo prefiere, puede coordinar directamente con
+    nuestro equipo por este enlace: {wa_link}
+  # ------------------------------------------------------------------
 
   faq_error: |
     Disculpe, tuve un inconveniente técnico al procesar su mensaje.
@@ -126,13 +137,14 @@ atencion:
       Fórmula de resguardo: "la estrategia exacta la define el abogado en
       la asesoría, con los antecedentes completos".
 
-    PRECIOS (fuente única; vigencia: {vigencia_precios}):
-    - Asesoría/consulta inicial: {precio_asesoria}, descontable del total
+    PRECIOS (memorizar, nunca confundir ni invertir):
+    - La asesoría/consulta inicial cuesta $30.000 y se descuenta del total
       si luego contrata.
-    - Tramitación completa de causa de familia: {precio_causa} (promoción,
-      hasta {cuotas_causa} cuotas sin interés).
-    - NUNCA inviertas estos valores. Si no están en este contexto, dilo y
-      deriva; jamás adivines un precio.
+    - La tramitación de la causa de familia completa cuesta $500.000
+      (promoción, hasta 12 cuotas sin interés).
+    - NUNCA digas que la asesoría cuesta $500.000 ni que la causa completa
+      cuesta $30.000. Si no estás segura de un precio, dilo y deriva;
+      jamás adivines un precio.
 
     ALCANCE "CAUSA COMPLETA" (validar texto con el estudio):
     - Incluye: preparación y presentación de la demanda, representación en
@@ -194,6 +206,8 @@ atencion:
 
   # ------------------------------------------------------------------
   # HANDOFF CHOICE — bifurcación ficha breve vs contacto directo
+  # (los dígitos 1/2 y los botones hc_ficha/hc_directo están soportados
+  #  por el parser del código).
   # ------------------------------------------------------------------
   handoff_choice_message: |
     {disclosure} Para derivarle con nuestro equipo, ¿cómo prefiere continuar?
@@ -208,15 +222,6 @@ atencion:
     No le entendí bien. Responda *1* para rellenar la ficha breve o *2*
     para recibir el contacto directo.
 
-  # Gobernado por handoff_choice_reintentos (máx. 2).
-  handoff_choice_max_reintentos: |
-    Para no hacerle perder tiempo, le entrego directamente el contacto de
-    nuestro equipo: {whatsapp_ejecutiva}. Ellos tomarán su caso desde aquí.
-
-  # EMISIÓN CONDICIONADA (v4.0.0): enviar ÚNICAMENTE tras confirmación del
-  # envío del resumen (flag handoff_resumen_enviado=true). Si el envío
-  # falló, usar handoff_fallback_message. Este texto afirma una acción
-  # completada: no emitir sin verificación.
   handoff_message: |
     {disclosure} Su resumen con los antecedentes fue enviado a nuestro
     equipo por WhatsApp. Le contactarán a la brevedad dentro del horario
@@ -224,40 +229,26 @@ atencion:
     Si prefiere escribirles directamente ahora: {whatsapp_ejecutiva}.
     Su conversación quedó registrada bajo el código {thread_id}.
 
-  handoff_fallback_message: |
-    {disclosure} Tuve un inconveniente técnico al enviar su resumen al
-    equipo. Para no hacerle esperar, escríbales directamente aquí:
-    {whatsapp_ejecutiva}. Su conversación quedó registrada bajo el código
-    {thread_id}.
-
   hilo_cerrado_message: |
     Su caso ya fue derivado a nuestro equipo ({whatsapp_ejecutiva}), que
     le contactará a la brevedad en horario hábil. Si tiene información
     adicional, indíquela aquí y la anexaré a su registro ({thread_id}).
 
-  # ------------------------------------------------------------------
-  # PRIVACIDAD (v4.0.0) — consentimiento explícito, simétrico en booking
-  # e intake. Finalidad + derechos (Ley 21.719). Emisión única por hilo,
-  # gobernada por booking_privacidad_dicha; la continuidad del flujo
-  # requiere booking_consentimiento_otorgado=true.
-  # ------------------------------------------------------------------
+  # Aviso legal de agendamiento — emisión ÚNICA por hilo, INFORMATIVO.
+  # (v4.0.1: sin pregunta "¿autoriza?"; el gate de consentimiento binario
+  #  en booking requiere código. El gate real vive en la ficha de intake.)
   agenda_inicio_aviso: |
-    Antes de agendar: usaré su nombre, correo y teléfono solo para gestionar
-    su cita y su seguimiento, conforme a nuestra política de privacidad
-    ({link_privacidad}). Usted puede ejercer sus derechos de acceso,
-    rectificación y cancelación escribiendo a {email_privacidad}.
-    ¿Autoriza el tratamiento de estos datos? Responda "sí" para continuar.
-
-  agenda_sin_consentimiento: |
-    Entendido, sin problema. Sin su autorización no puedo registrar sus
-    datos para la cita. Si lo prefiere, puede coordinar directamente con
-    nuestro equipo por este enlace: {wa_link}
+    Para agendar su asesoría usaré su nombre, correo y teléfono solo para
+    gestionar su cita y su seguimiento, conforme a nuestra política de
+    privacidad (https://www.manzzo.cl/privacidad). Puede ejercer sus
+    derechos de acceso, rectificación y cancelación escribiendo a
+    privacidad@manzzo.cl.
 
   agenda_pedir_nombre: "Indíqueme su nombre completo para dejarlo registrado en la asesoría:"
 
   agenda_pedir_email: "Perfecto. Ahora indíqueme su correo electrónico para enviarle la invitación de la cita:"
 
-  agenda_pedir_modalidad: "¿Qué modalidad prefiere? Responda: 1) Online por Google Meet, o 2) Presencial en nuestra oficina ({direccion_oficina}):"
+  agenda_pedir_modalidad: "¿Qué modalidad prefiere? Responda: 1) Online por Google Meet, o 2) Presencial en nuestra oficina de Santiago Centro:"
 
   agenda_proponer_slots: |
     {nombre}, estos son los próximos horarios disponibles para la asesoría:
@@ -278,13 +269,13 @@ atencion:
     ¿Cuál de ellos prefiere? Puede responderme con el número.
 
   agenda_max_reintentos: |
-    Para no hacerle perder más tiempo, puedo derivarle con una persona del
-    equipo que coordine la cita directamente con usted. ¿Le parece bien?
+    Para no hacerle perder más tiempo, puedo derivarlo con una ejecutiva que
+    coordine la cita directamente con usted. ¿Le parece bien?
 
   agenda_sin_horarios: |
     No encontré horarios disponibles en los próximos días. Si lo prefiere,
-    una persona del equipo puede contactarle directamente para coordinar la
-    cita. ¿Desea que lo derive?
+    una ejecutiva puede contactarlo directamente para coordinar la cita.
+    ¿Desea que lo derivo con ella?
 
   agenda_ya_agendada: |
     Su asesoría ya está agendada para el {fecha} a las {hora_inicio} hrs.
@@ -295,8 +286,6 @@ atencion:
     Entendido. Quedo atento por si desea retomar el agendamiento o si tiene
     otra consulta en la que pueda ayudarle.
 
-  # EMISIÓN CONDICIONADA: solo tras confirmación de la herramienta de
-  # calendario. Datos finales siempre desde la respuesta de la herramienta.
   agenda_confirmada: |
     Su asesoría quedó agendada, {nombre}:
 
@@ -359,7 +348,10 @@ atencion:
 
 
 # ============================================================================
-# CLASIFICADOR — v4.0.0 (catálogos cerrados + precedencia + nuevos intents)
+# CLASIFICADOR — v4.0.1
+# Catálogos REVERTIDOS a los Literales de core/contracts.py (código vigente).
+# Las mejoras prosaicas de v4.0.0 independientes de labels se conservan.
+# Aproximación de crisis sin ruta propia: intent=hablar_humano + alta.
 # ============================================================================
 classification:
 
@@ -371,39 +363,34 @@ classification:
 
     PRIMERO redacta 'reason' (tu análisis en 1 línea, siempre en español)
     y DESPUÉS emite las 4 etiquetas usando EXACTAMENTE un valor de cada
-    catálogo cerrado:
+    catálogo cerrado (prohibido inventar valores):
 
-    CATÁLOGOS CERRADOS (prohibido inventar valores):
     - sentiment: negativo | neutro | positivo
-    - urgency: baja | media | alta | critica
-    - intent: crisis | reclamo | hablar_humano | gestionar_cita |
-      agendar_asesoria | respuestas_faq | fuera_de_dominio
-    - category: pension_alimentos | rebaja_pension | divorcio |
-      relacion_directa | medidas_apremio | violencia_intrafamiliar |
-      consulta_general | otro
+    - urgency: baja | media | alta
+    - intent: hablar_humano | agendar_asesoria | respuestas_faq |
+      fuera_de_dominio
+    - category: pension_alimentos | rebaja_pension | regimen_visitas |
+      medidas_apremio | terminacion_pension | divorcio |
+      compensacion_economica | consulta_general | otro
 
-    PRECEDENCIA (si un mensaje gatilla más de un intent, elige el más alto):
-    crisis > reclamo > hablar_humano > gestionar_cita > agendar_asesoria >
-    respuestas_faq > fuera_de_dominio
+    SEGURIDAD PRIMERO (aproximación hasta que exista la ruta dedicada):
+    - Si el mensaje menciona violencia actual, peligro inmediato, riesgo
+      para menores o ideas de autolesión: intent=hablar_humano con
+      urgency=alta y category=otro. El objetivo es derivarlo con una
+      persona de inmediato. Anota "RIESGO:" al inicio del reason.
 
     UMBRALES:
-    - intent=crisis (OVERRIDE: gana a todo, urgency=critica): peligro físico
-      inmediato, violencia intrafamiliar activa, riesgo para menores, o
-      mención de autolesión/suicidio. No requiere pedido explícito de ayuda.
-    - intent=reclamo: queja sobre el servicio de la firma, demoras de
-      atención, cobros o incumplimientos.
-    - intent=gestionar_cita: ya tiene hora agendada y pide cambiarla,
-      cancelarla o confirmarla; también "estado de mi caso" de cliente
-      existente.
     - sentiment=negativo exige emoción EXPRESADA ('desesperado', 'chato',
       garabatos, sarcasmo). La cortesía de envoltura NO la atenúa; la
       preocupación hipotética tranquila sigue siendo neutro.
     - urgency mide el HECHO, no el tono: coacción judicial vigente → alta
       aunque el cliente escriba con calma. Preguntas sobre la firma → baja.
-    - intent: la emoción NUNCA cambia la intención (salvo crisis). Pregunta
-      factual con enojo = respuestas_faq. Auxilio explícito o angustia aguda
-      sobre el caso propio = agendar_asesoria. Pedir persona = hablar_humano.
+    - intent: la emoción NUNCA cambia la intención. Pregunta factual con
+      enojo = respuestas_faq. Auxilio explícito o angustia aguda sobre el
+      caso propio = agendar_asesoria. Pedir persona = hablar_humano.
     - category siempre describe el tema, incluso si solo pregunta precios.
+      Violencia intrafamiliar se clasifica como category=otro hasta que el
+      contrato sume categoría propia.
 
     REGLAS ESTRICTAS:
     - Describir el caso propio con calma buscando orientación → respuestas_faq.
@@ -413,10 +400,9 @@ classification:
       describiendo su caso → agendar_asesoria con category=otro (lead).
     - Pedir persona/ejecutiva o ACEPTAR oferta de contacto → hablar_humano.
     - "Sí", "dale" tras oferta de AGENDAMIENTO → agendar_asesoria.
-    - "Sí", "dale" tras oferta de CONTACTO HUMANO → hablar_humano.
-    - ACEPTACIÓN AMBIGUA: si el último mensaje del asistente ofreció dos
-      opciones y el cliente responde "sí/dale", asigna el intent
-      correspondiente a la ÚLTIMA opción mencionada por el asistente.
+    - "Sí", "dale" tras oferta de EJECUTIVA → hablar_humano.
+    - Si el último mensaje del asistente ofreció dos opciones y el cliente
+      responde "sí/dale", asigna el intent de la ÚLTIMA opción ofrecida.
     - IDIOMA: clasifica igual aunque el mensaje esté en otro idioma; el
       'reason' siempre en español.
     - Errores de tipeo y registro informal chileno NO alteran las reglas.
@@ -507,50 +493,25 @@ classification:
       intent: fuera_de_dominio
       category: otro
       reason: "No es un servicio legal; fuera del dominio de la firma."
-    # --- NUEVOS v4.0.0 ---
-    # Saludo solo → FAQ de apertura
+    # --- v4.0.1: saludo solo, crisis (aproximación) e idioma ---
     - input: "hola, buenas tardes"
       sentiment: neutro
       urgency: baja
       intent: respuestas_faq
       category: consulta_general
       reason: "Saludo de apertura sin consulta; el FAQ gestiona el primer contacto."
-    # Crisis: precedencia máxima, no requiere pedido de ayuda
     - input: "ayer mi ex me golpeó delante de los niños y dice que va a volver, tengo mucho miedo"
       sentiment: negativo
-      urgency: critica
-      intent: crisis
-      category: violencia_intrafamiliar
-      reason: "Violencia intrafamiliar activa con riesgo de reiteración; override de crisis aunque no pida hora."
-    # Crisis sin emoción explícita alta
+      urgency: alta
+      intent: hablar_humano
+      category: otro
+      reason: "RIESGO: violencia intrafamiliar activa; derivación humana inmediata (ruta de crisis dedicada pendiente)."
     - input: "necesito saber qué hacer porque mi pareja no me deja salir de la casa y me controla el celular"
       sentiment: neutro
-      urgency: critica
-      intent: crisis
-      category: violencia_intrafamiliar
-      reason: "Coacción y control vigentes; hecho de riesgo aunque narre con calma."
-    # Gestión de cita existente
-    - input: "se me complicó el jueves, ¿puedo cambiar mi hora al viernes?"
-      sentiment: neutro
-      urgency: media
-      intent: gestionar_cita
-      category: consulta_general
-      reason: "Reagendar cita existente, no una reserva nueva."
-    # Reclamo: precede a agendar/faq
-    - input: "llevo una semana esperando que me llamen y nadie me pesca, pésimo servicio"
-      sentiment: negativo
       urgency: alta
-      intent: reclamo
-      category: consulta_general
-      reason: "Queja por demora de la firma; reclamo precede a cualquier otro intent."
-    # Aceptación ambigua: última opción mencionada por el asistente
-    - input: "sí dale"
-      sentiment: neutro
-      urgency: media
       intent: hablar_humano
-      category: consulta_general
-      reason: "El último turno del asistente cerró ofreciendo a la ejecutiva tras mencionar la agenda; la aceptación se asigna a la última opción ofrecida."
-    # Idioma distinto: mismas reglas
+      category: otro
+      reason: "RIESGO: coacción y control vigentes; hecho de riesgo aunque narre con calma."
     - input: "Hi, do you handle divorce cases? How much is a consultation?"
       sentiment: neutro
       urgency: baja
@@ -560,8 +521,9 @@ classification:
 
 
 # ----------------------------------------------------------------------------
-# INTAKE — ficha conversada (v4.0.0: voz unificada — de usted, sin emojis,
-# sin exclamaciones. La calidez se logra con la redacción).
+# INTAKE — ficha conversada (v4.0.1: voz unificada conservada; correcciones
+# de integración: oferta_salida alineada a parser/botones; cierre_ctas sin
+# {wa_link} — el contacto directo va en el CTA separado del cierre dual).
 # ----------------------------------------------------------------------------
 intake:
 
@@ -584,13 +546,13 @@ intake:
     complica, también puedo derivarle con una persona del equipo que lo tome
     directamente con usted; solo indíquemelo.
 
+  # v4.0.1: SIN dígitos 1/2 — el parser y los botones nativos esperan las
+  # frases "hablar con humano" / "lo intento de nuevo". Numerar aquí hace
+  # que "1" caiga al validador del campo activo.
   oferta_salida: |
     {nombre}este dato se nos está resistiendo. ¿Qué prefiere?
-
-    1) Le derivo con una persona del equipo que lo toma directamente con usted.
-    2) Lo intentamos una vez más.
-
-    Responda *1* o *2*.
+    • Le paso con una ejecutiva que lo toma directamente con usted, o
+    • lo intentamos una vez más.
 
   reanudar: |
     Perfecto, retomemos justo donde quedamos con su caso.
@@ -607,18 +569,13 @@ intake:
     horario hábil (09:00–18:30). Quedó todo anotado a su nombre, con el
     detalle que nos compartió.
 
+  # v4.0.1: cierre_ctas SIN {wa_link}. El contacto directo va en el mensaje
+  # siguiente (CTA "Pincha aquí" del cierre dual). Antes el cliente recibía
+  # el literal "{wa_link}" porque el nodo no formatea esta plantilla.
   cierre_ctas: |
     Si quiere asegurar una atención más pronto, puedo agendar su asesoría
-    ahora mismo. Y si prefiere que el equipo le contacte directamente,
-    escríbales aquí: {wa_link}
-
-  consentimiento_pedir: |
-    Para registrar y derivar su caso necesito su autorización para tratar
-    sus datos personales (nombre, contacto y antecedentes del caso),
-    conforme a nuestra política de privacidad ({link_privacidad}). Puede
-    ejercer sus derechos de acceso, rectificación y cancelación en
-    {email_privacidad}.
-    ¿Autoriza este tratamiento de datos? Responda "sí" para continuar.
+    ahora mismo. Y en el siguiente mensaje le dejo el contacto directo
+    del equipo por si prefiere escribirles usted.
 
   sin_consentimiento: |
     Entiendo, sin problema. Sin su autorización no puedo registrar ni
