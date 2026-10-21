@@ -78,6 +78,7 @@ RESET_SESION_NUEVA = {
     "summary": None,
     "notificacion_pendiente": False,
     "case_category": None,
+    "cta_agenda_ofrecida": False,      # ← v1.6: nueva sesión = nueva oferta permitida
     **RESET_INTAKE,
     **RESET_HANDOFF_CHOICE,
     **RESET_BOOKING,

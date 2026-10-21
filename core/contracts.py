@@ -211,6 +211,7 @@ class AgentState(TypedDict, total=False):
     # ningún nodo lo leía, y su semántica era incorrecta cuando la acción
     # era pedir_clarificacion). FAQStageLabel vive en graph/faq/contracts.py
     # como contrato interno del subagente y no cruza al estado del padre.
+    cta_agenda_ofrecida: bool
 
     # --- Sub-flujo de BOOKING (subgrafo graph/booking/) ---
     lead_nombre: str

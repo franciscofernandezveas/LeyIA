@@ -98,16 +98,18 @@ def pedir_clarificacion(state: AgentState) -> AgentState:
 
 def sugerir_agendar(state: AgentState) -> AgentState:
     """El usuario mostró intención de agendar dentro del FAQ. Se envía el CTA
-    (pregunta + botón nativo) y se espera su respuesta: el próximo turno
-    clasifica agendar_asesoria (o, en hilo cerrado post-intake, la excepción
-    0-LLM del padre) y entra booking. NO se re-rutea en el mismo turno."""
+    (pregunta + botón nativo) y se levanta el ledger one-shot: si el planner
+    vuelve a proponerlo en esta sesión, el supervisor lo degrada a
+    responder_pregunta (la oferta queda embebida en la respuesta RAG)."""
     atn = _cfg()["atencion"]
     response = atn["cta_agendar"]
     _guardar_ai(state, response)
     return {"response": response,
             "response_bubbles": [response],
             "response_interactive": _BOTON_AGENDAR,
+            "cta_agenda_ofrecida": True,              # ← v3.3: ledger one-shot
             "messages": [AIMessage(content=response)]}
+
 
 
 def derivar_a_ejecutiva(state: AgentState) -> AgentState:

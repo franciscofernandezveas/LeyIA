@@ -1,25 +1,33 @@
 """graph/faq/planner.py — Decide qué hacer con la pregunta del usuario.
 
-v2.2 — FIX #7 (auditoría): fast-paths por substring.
-  - Reordena: HUMANO → AGENDAR → SALUDO (con gate de largo). Antes el
-    saludo corría primero y enterraba intenciones en mensajes como
-    "hola, ¿puedo hablar con alguien?" o "hola, llámame" — iban a
-    responder_pregunta cuando el cliente pedía humano explícitamente.
-  - Elimina _FUERA como fast-path. Su blacklist por substring colisionaba
-    con vocabulario real de derecho de familia ("la comida de los niños",
-    "se fue de viaje con mi hijo", "vender la casa en común") — falsos
-    positivos que expulsaban a clientes angustiados con casos legítimos.
-    fuera_de_dominio queda al LLM, que ve historial completo.
-  - SALUDO limitado a mensajes cortos (≤ 8 palabras) como autodefensa:
-    "hola" es la palabra más débil del idioma; un mensaje largo que la
-    contiene casi nunca ES un saludo.
-  - HUMANO y AGENDAR mantienen fast-path sin gate: sus keywords son
-    específicas ("hablar con una persona", "reservar hora") y en un
-    mensaje largo con esta frase la intención sigue siendo la misma.
+v2.3 — B4 (post-incidente producción 20/10): el CTA standalone de agenda
+  deja de ser elegible por el LLM.
 
-v2.1 — Fast-paths ampliados: saludos, presentación y consultas generales del
-estudio van directo a responder_pregunta, donde el system prompt del FAQ
-ya se presenta y orienta. Se mantiene la precaución en humano/agendar/fuera.
+  Causal del bug: el LLM elegía sugerir_agendar ante descripciones de caso
+  ("mi ex no me paga hace 8 meses", "¿cómo se demanda?") porque la
+  definición de la acción ("que un abogado tome su caso") calzaba con el
+  ~80% del tráfico real. El cliente recibía el CTA pelado — dos turnos
+  seguidos — en vez de orientación.
+
+  Ahora:
+  - El catálogo del LLM tiene 4 acciones (responder_pregunta es default);
+    sugerir_agendar NO existe para el LLM. La oferta de agenda vive
+    embebida en la respuesta RAG (mission del faq_system_prompt v4.0.1).
+  - sugerir_agendar subsiste en FAQDecision pero SOLO la emite el
+    fast-path determinista (_AGENDAR_EXPLICITO: keywords reales).
+  - La anti-repetición (CTA ×2) la resuelve el supervisor con el ledger
+    cta_agenda_ofrecida (AgentState), no el planner — política de flujo
+    vive en el router, idiom idéntico a intake_oferta_qid.
+  - "quiero hablar con un abogado" pasa de _AGENDAR_EXPLICITO a
+    _HUMANO_EXPLICITO: es pedir persona, no pedir hora (coherente con el
+    clasificador padre).
+
+v2.2 — FIX #7 (auditoría): fast-paths por substring.
+  - Reordena: HUMANO → AGENDAR → SALUDO (con gate de largo). ...
+  - Elimina _FUERA como fast-path. fuera_de_dominio queda al LLM.
+  - SALUDO limitado a mensajes cortos (≤ 8 palabras).
+
+v2.1 — Fast-paths ampliados: saludos, presentación y consultas generales.
 """
 import logging
 
@@ -32,7 +40,9 @@ from .contracts import FAQDecision
 
 logger = logging.getLogger(__name__)
 
-# Fast-paths EXPLÍCITOS. Si no calza, el LLM decide.
+# --------------------------------------------------------------------------
+# Fast-paths EXPLÍCITOS (0-LLM). Si no calza, el LLM decide.
+# --------------------------------------------------------------------------
 _SALUDO_PRESENTACION = (
     "hola", "buenas", "buenos dias", "buenas tardes", "buenas noches",
     "como me pueden ayudar", "como pueden ayudarme", "quienes son",
@@ -42,10 +52,11 @@ _SALUDO_PRESENTACION = (
     "dónde quedan", "quienes son ustedes", "quiénes son ustedes",
     "presentacion", "presentación",
 )
+# Única vía al CTA standalone (v2.3): keywords explícitas de agendamiento.
 _AGENDAR_EXPLICITO = (
     "agendar", "reservar", "quiero una cita", "quiero asesoría",
     "quiero asesoria", "tomar mi caso", "coordinar una cita",
-    "necesito un abogado", "quiero hablar con un abogado",
+    "necesito un abogado",
 )
 _HUMANO_EXPLICITO = (
     "hablar con una ejecutiva", "hablar con una persona",
@@ -53,45 +64,27 @@ _HUMANO_EXPLICITO = (
     "llámame", "llamame", "contacto humano", "abogado real",
     "hablar directamente con alguien", "quiero una ejecutiva",
     "puedo hablar con alguien", "hablar con alguien de verdad",
+    "quiero hablar con un abogado",   # v2.3: desde _AGENDAR_EXPLICITO
 )
 
-# _FUERA — DEPRECATED (v2.2, fix #7). Eliminado como fast-path: el
-# blacklist por substring colisionaba con vocabulario real de familia.
-# Ejemplos que caían erróneamente en fuera_de_dominio:
-#   "no me deja plata para la comida de los niños"  → pensión
-#   "mi ex se fue de viaje con mi hijo sin permiso" → tupla/salida
-#   "quiero vender la casa que tenemos en común"    → divorcio/bienes
-# Rechazar a un cliente angustiado con un caso legítimo es el falso
-# positivo más caro de este producto. fuera_de_dominio ahora lo decide
-# SOLO el LLM (_decidir_llm), que ve historial completo.
+# _FUERA — DEPRECATED (v2.2, fix #7). Ver historial.
 
 
 def _fast_path(query: str) -> FAQDecision | None:
     q = query.lower().strip().rstrip("?").rstrip("!")
     n_palabras = len(q.split())
 
-    # HUMANO primero (fix #7): "hola, ¿puedo hablar con alguien?" debe
-    # resolverse como hablar_humano, no como saludo. Keyword específica
-    # ("hablar con una persona", "quiero una ejecutiva") → no requiere
-    # gate de largo: en un mensaje largo con esta frase, la intención
-    # sigue siendo la misma (contacto humano explícito).
+    # HUMANO primero (v2.2): las keywords son específicas; sin gate de largo.
     if any(p in q for p in _HUMANO_EXPLICITO):
         return FAQDecision(accion="hablar_humano",
                            razon="solicitud explícita de contacto humano")
 
-    # AGENDAR segundo (fix #7): misma lógica que HUMANO. "quiero
-    # agendar" / "reservar hora" son específicas, no se entierran por
-    # saludo previo.
+    # AGENDAR segundo (v2.2/2.3): única forma del CTA standalone.
     if any(p in q for p in _AGENDAR_EXPLICITO):
         return FAQDecision(accion="sugerir_agendar",
                            razon="solicitud explícita de agendamiento")
 
-    # SALUDO al final y con gate de largo (fix #7): "hola" es el token
-    # más débil del idioma; un mensaje largo que la contiene casi nunca
-    # ES un saludo (es contenido con fórmula de cortesía). Casos:
-    #   "hola, ¿quiénes son?"              ≤ 8 → responder_pregunta ✓
-    #   "buenos días, ¿atienden sábados?"  ≤ 8 → responder_pregunta ✓
-    #   "hola, me llamo X y tengo pensión" >  8 → LLM decide con contexto
+    # SALUDO al final y con gate de largo (v2.2).
     if n_palabras <= 8 and any(p in q for p in _SALUDO_PRESENTACION):
         return FAQDecision(accion="responder_pregunta",
                            razon="saludo, presentación o consulta general del estudio")
@@ -105,7 +98,7 @@ def _decidir_llm(state: AgentState) -> FAQDecision:
         for m in state.get("messages", [])[-5:]
     ) or "(sin historial)"
 
-    prompt_text = f"""Eres el planner de un agente FAQ de un estudio jurídico chileno (Manzzo y Cía).
+    prompt_text = f"""Eres el planner del agente FAQ de Manzzo y Cía (Derecho de Familia, Chile).
 Decide la mejor acción para ESTE mensaje del usuario.
 
 Mensaje del usuario: {state['query']}
@@ -114,19 +107,35 @@ Historial reciente:
 {history}
 
 Acciones posibles (devuelve UNA):
-- responder_pregunta: saludos, presentación, preguntas sobre derecho familiar, pensiones, divorcio, visitas, costos, proceso, ubicación, servicios del estudio, etc.
-- sugerir_agendar: el usuario quiere reservar una cita o que un abogado tome su caso.
-- hablar_humano: pide explícitamente hablar con una persona/ejecutiva real.
-- fuera_de_dominio: no se relaciona con servicios legales.
-- pedir_clarificacion: SOLO si la pregunta es realmente ambigua o incomprensible.
+- responder_pregunta: orientar con contenido (caso propio, proceso, costos,
+  documentos, plazos, consecuencias). ACCIÓN DEFAULT y la más frecuente.
+  Incluye: describir el problema legal, preguntar "¿cómo se demanda?",
+  "¿cómo es el proceso?", "¿cómo pido rebaja?", costos, "necesito ayuda"
+  sin pedir hora. El agente orienta PRIMERO.
+- hablar_humano: pide EXPLÍCITAMENTE hablar con persona/ejecutiva real, o
+  acepta una oferta de contacto humano previa.
+- fuera_de_dominio: nada relacionado con servicios legales.
+- pedir_clarificacion: SOLO si el mensaje es realmente incomprensible.
 
-Reglas importantes:
-- "Hola", saludos o preguntas como "¿quiénes son?", "¿cómo me ayudan?", "¿qué servicios ofrecen?" → responder_pregunta.
-- "hablar con usted" o frases corteses NO son hablar_humano; son responder_pregunta.
-- "¿a qué hora atienden?" o "¿cuándo abren?" NO son agendar; son responder_pregunta.
-- "quiero agendar", "quiero una asesoría" SÍ son sugerir_agendar.
-- "hablar con una ejecutiva", "quiero una persona real" SÍ son hablar_humano.
-- Devuelve SOLO la acción y una justificación breve. No inventes hechos."""  # noqa: E501
+NOTA DE CONTRATO (v2.3 — inquebrantable):
+- No existe acción de agendamiento standalone para ti. La oferta de
+  agendar asesoría va SIEMPRE embebida dentro de la respuesta orientativa
+  (cierra con el siguiente paso concreto), nunca como mensaje aparte.
+- Si el último mensaje del asistente ya ofrecía agendar O contacto humano
+  (texto breve que termina en "¿Le interesa?" / "¿Cómo prefiere?"), NO
+  vuelvas a esa oferta como respuesta: este turno responde la nueva
+  consulta. La aceptación implícita ("sí", "dale") la gestiona el
+  clasificador padre, no tú.
+
+Ejemplos normativos:
+- "mi ex no me paga la pensión hace 8 meses" → responder_pregunta
+- "¿cómo se hace para demandar? no sé de trámites" → responder_pregunta
+- "¿cuánto cobran por demandar pensión?" → responder_pregunta
+- "me llegó demanda, ¿qué hago?" → responder_pregunta
+- "quiero que me atienda una persona" → hablar_humano
+- "¿me recomiendan un contador?" → fuera_de_dominio
+
+Devuelve SOLO la acción y una justificación breve. No inventes hechos."""
 
     try:
         prompt = ChatPromptTemplate.from_messages([("system", prompt_text)])
@@ -141,9 +150,6 @@ Reglas importantes:
 def faq_planner(state: AgentState) -> AgentState:
     raw = state.get("query", "")
     decision = _fast_path(raw) or _decidir_llm(state)
-    logger.info("[faq] acción=%s razon=%s", decision.accion, decision.razon)
-    # v2.3 — FIX #11 (auditoría): faq_stage eliminado. Era dead code y su
-    # semántica era incorrecta (siempre "respondiendo", incluso cuando la
-    # acción es pedir_clarificacion).
+    logger.info("[faq] acción=%s razon=%s", decision.accion,
+                decision.razon)
     return {"faq_decision": decision.model_dump()}
-
