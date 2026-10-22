@@ -1,4 +1,8 @@
-"""graph/intake/supervisor.py — Routing interno del sub-agente INTAKE (v10)."""
+"""graph/intake/supervisor.py — Routing interno del sub-agente INTAKE (v17).
+
+v17: nueva acción "derivar_urgente" (detención vigente / orden de arresto →
+handoff inmediato). Hacia el padre se traduce en intake_exit="handoff".
+"""
 import logging
 
 from core.contracts import AgentState
@@ -12,6 +16,7 @@ _ACCIONES = {
     "pausar_para_faq": "pausar_para_faq",
     "pausar_ficha": "pausar_ficha",
     "derivar_parcial": "derivar_parcial",
+    "derivar_urgente": "derivar_urgente",
     "abandonar_ficha": "abandonar_ficha",
     "sin_consentimiento": "sin_consentimiento",
 }

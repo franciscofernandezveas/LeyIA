@@ -1,5 +1,13 @@
 """graph/utils.py — Helpers transversales del grafo padre e intake.
 
+v1.7 — FIX crisis:
+  - RESET_SESION_NUEVA incluye "crisis": None para que el flag de crisis no
+    sobreviva entre sesiones de conversación distintas (gatekeeper de
+    receive_message).
+
+v1.6 — Añade cta_agenda_ofrecida a RESET_SESION_NUEVA (nueva sesión = nueva
+        oferta de agenda permitida).
+
 v1.3 — Añade RESET_INTAKE, RESET_HANDOFF_CHOICE, RESET_BOOKING y
         RESET_SESION_NUEVA centralizados, consumidos por los nodos del grafo.
 v1.2 — Registra atencion.agenda_inicio_aviso (emisión one-shot en booking).
@@ -9,7 +17,7 @@ v1.1 — Añade WA_TEXTO_MAX y _truncar_burbuja para reutilizar en subgrafos.
 import json
 import logging
 import re
-import unicodedata           # ← NUEVO (fix #6)
+import unicodedata
 
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -78,7 +86,8 @@ RESET_SESION_NUEVA = {
     "summary": None,
     "notificacion_pendiente": False,
     "case_category": None,
-    "cta_agenda_ofrecida": False,      # ← v1.6: nueva sesión = nueva oferta permitida
+    "cta_agenda_ofrecida": False,
+    "crisis": None,                    # v1.7: no sobrevive entre sesiones
     **RESET_INTAKE,
     **RESET_HANDOFF_CHOICE,
     **RESET_BOOKING,
@@ -92,7 +101,7 @@ REQUIRED_KEYS = {
     "atencion": {"disclosure", "cta_agendar", "faq_system_prompt", "tonos",
                  "summary_system_prompt", "fuera_dominio_message",
                  "handoff_message", "hilo_cerrado_message",
-                 "agenda_inicio_aviso",                       # v1.2 — aviso one-shot booking
+                 "agenda_inicio_aviso",
                  "agenda_pedir_nombre", "agenda_pedir_email",
                  "agenda_pedir_modalidad", "agenda_proponer_slots",
                  "agenda_reintento_slots", "agenda_sin_horarios",
@@ -110,7 +119,7 @@ TEMPLATE_ARGS = {
     "atencion.handoff_message": {"disclosure", "whatsapp_ejecutiva", "thread_id"},
     "atencion.hilo_cerrado_message": {"whatsapp_ejecutiva", "thread_id"},
     "atencion.cta_agendar": set(),
-    "atencion.agenda_inicio_aviso": set(),                   # v1.2 — sin placeholders
+    "atencion.agenda_inicio_aviso": set(),
     "atencion.agenda_pedir_nombre": set(),
     "atencion.agenda_pedir_email": set(),
     "atencion.agenda_pedir_modalidad": set(),
@@ -137,6 +146,11 @@ TEMPLATE_ARGS = {
     "intake.derivacion_parcial": {"wa_link", "nombre"},
     "intake.cierre_abandono": {"wa_link"},
 }
+
+# Nota v1.7 (opcional/pendiente): si se implementa contador de ofertas de
+# agendamiento en FAQ, registrar aquí el placeholder correspondiente, p.ej.
+# "atencion.faq_system_prompt": {"disclosure", "tono", "context", "oferta_estado"}
+# y pasarlo desde graph/faq/nodes.py::responder_pregunta.
 
 _PLACEHOLDER_RE = re.compile(r"{(\w+)}")
 
@@ -349,14 +363,6 @@ def _persist_escalation(state: dict, summary: str) -> Path:
     return path
 
 
-def _upsert_conversacion_abierta(thread_id: str) -> None:
-    upsert_conversation(
-        thread_id=thread_id,
-        channel=_canal_desconocido(thread_id),
-        status="abierto",
-    )
-
-
 _ABORT_BOOKING = ("no quiero", "mejor no", "olvídalo", "olvidalo",
                   "dejalo", "déjalo", "ya no me interesa")
 
@@ -422,4 +428,3 @@ def _parece_abort(query: str) -> bool:
     q_norm = "".join(c for c in unicodedata.normalize("NFD", q)
                      if unicodedata.category(c) != "Mn")
     return any(rx.search(q_norm) for rx in _ABORT_BOOKING_RX)
-

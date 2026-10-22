@@ -1,5 +1,16 @@
 """graph/faq/planner.py — Decide qué hacer con la pregunta del usuario.
 
+v2.4 — FIX "agendar forzado" (FAQ fast-path):
+  - _AGENDAR_EXPLICITO deja de incluir "necesito un abogado" y "tomar mi
+    caso"; esas frases las clasifica el padre como respuestas_faq y el
+    FAQ debe orientar primero.
+  - Guarda anti-negación: "no quiero agendar", "aún no quiero asesoría",
+    etc. no disparan el CTA standalone.
+  - Ejemplos normativos del LLM actualizados para reforzar que "necesito
+    un abogado que tome mi caso" → responder_pregunta.
+  - NOTA DE CONTRATO ajustada: la invitación a agendar como información
+    (embebida) es distinta del CTA standalone, que solo viene del fast-path.
+
 v2.3 — B4 (post-incidente producción 20/10): el CTA standalone de agenda
   deja de ser elegible por el LLM.
 
@@ -12,7 +23,7 @@ v2.3 — B4 (post-incidente producción 20/10): el CTA standalone de agenda
   Ahora:
   - El catálogo del LLM tiene 4 acciones (responder_pregunta es default);
     sugerir_agendar NO existe para el LLM. La oferta de agenda vive
-    embebida en la respuesta RAG (mission del faq_system_prompt v4.0.1).
+    embebida en la respuesta RAG (mission del faq_system_prompt v4.2.0).
   - sugerir_agendar subsiste en FAQDecision pero SOLO la emite el
     fast-path determinista (_AGENDAR_EXPLICITO: keywords reales).
   - La anti-repetición (CTA ×2) la resuelve el supervisor con el ledger
@@ -52,12 +63,15 @@ _SALUDO_PRESENTACION = (
     "dónde quedan", "quienes son ustedes", "quiénes son ustedes",
     "presentacion", "presentación",
 )
-# Única vía al CTA standalone (v2.3): keywords explícitas de agendamiento.
+
+# v2.4: única vía al CTA standalone. Palabras de pedido EXPLÍCITO de
+# hora/cita/asesoría. "necesito un abogado" / "tomar mi caso" FUERA:
+# el clasificador padre las manda a respuestas_faq (orientar primero).
 _AGENDAR_EXPLICITO = (
     "agendar", "reservar", "quiero una cita", "quiero asesoría",
-    "quiero asesoria", "tomar mi caso", "coordinar una cita",
-    "necesito un abogado",
+    "quiero asesoria", "coordinar una cita",
 )
+
 _HUMANO_EXPLICITO = (
     "hablar con una ejecutiva", "hablar con una persona",
     "hablar con un humano", "persona real", "ejecutiva real",
@@ -65,9 +79,32 @@ _HUMANO_EXPLICITO = (
     "hablar directamente con alguien", "quiero una ejecutiva",
     "puedo hablar con alguien", "hablar con alguien de verdad",
     "quiero hablar con un abogado",   # v2.3: desde _AGENDAR_EXPLICITO
+    # v2.4: rechazo explícito de la atención automatizada (coherente con la
+    # sección ESCALAMIENTO HUMANO del faq_system_prompt v4.2.0).
+    "eres un bot", "eres un robot", "eres una ia",
+    "no quiero un bot", "no quiero hablar con una maquina",
+    "no quiero hablar con una máquina", "no quiero atencion automatica",
+    "no quiero atención automática",
 )
 
-# _FUERA — DEPRECATED (v2.2, fix #7). Ver historial.
+# Patrones de negación inmediatamente anteriores a una keyword de agenda.
+# Detectan "no quiero agendar", "aún no quiero asesoría", etc.
+_NEGACION = (
+    "no ", "no quiero ", "no voy a ", "no deseo ",
+    "aún no ", "aun no ",
+    "todavía no ", "todavia no ", "por ahora no ",
+    "tampoco ", "nunca ",
+)
+
+
+def _negada(q: str, kw: str) -> bool:
+    """Devuelve True si la keyword de agenda aparece precedida de negación
+    en la ventana inmediata anterior (últimos 30 caracteres)."""
+    i = q.find(kw)
+    if i <= 0:
+        return False
+    ventana = q[max(0, i - 30):i].lower()
+    return any(n in ventana for n in _NEGACION)
 
 
 def _fast_path(query: str) -> FAQDecision | None:
@@ -79,8 +116,10 @@ def _fast_path(query: str) -> FAQDecision | None:
         return FAQDecision(accion="hablar_humano",
                            razon="solicitud explícita de contacto humano")
 
-    # AGENDAR segundo (v2.2/2.3): única forma del CTA standalone.
-    if any(p in q for p in _AGENDAR_EXPLICITO):
+    # AGENDAR segundo (v2.2/2.4): única forma del CTA standalone, con
+    # guarda anti-negación para no forzar la oferta cuando el cliente la
+    # rechaza explícitamente.
+    if any(p in q and not _negada(q, p) for p in _AGENDAR_EXPLICITO):
         return FAQDecision(accion="sugerir_agendar",
                            razon="solicitud explícita de agendamiento")
 
@@ -110,17 +149,22 @@ Acciones posibles (devuelve UNA):
 - responder_pregunta: orientar con contenido (caso propio, proceso, costos,
   documentos, plazos, consecuencias). ACCIÓN DEFAULT y la más frecuente.
   Incluye: describir el problema legal, preguntar "¿cómo se demanda?",
-  "¿cómo es el proceso?", "¿cómo pido rebaja?", costos, "necesito ayuda"
-  sin pedir hora. El agente orienta PRIMERO.
-- hablar_humano: pide EXPLÍCITAMENTE hablar con persona/ejecutiva real, o
-  acepta una oferta de contacto humano previa.
+  "¿cómo es el proceso?", "¿cómo pido rebaja?", costos, "necesito ayuda",
+  "necesito un abogado que tome mi caso" — todo sin pedir hora. El agente
+  orienta PRIMERO.
+- hablar_humano: pide EXPLÍCITAMENTE hablar con persona/ejecutiva real,
+  rechaza la atención automatizada, o acepta una oferta de contacto humano
+  previa.
 - fuera_de_dominio: nada relacionado con servicios legales.
 - pedir_clarificacion: SOLO si el mensaje es realmente incomprensible.
 
-NOTA DE CONTRATO (v2.3 — inquebrantable):
-- No existe acción de agendamiento standalone para ti. La oferta de
-  agendar asesoría va SIEMPRE embebida dentro de la respuesta orientativa
-  (cierra con el siguiente paso concreto), nunca como mensaje aparte.
+NOTA DE CONTRATO (v2.4 — inquebrantable):
+- Tú (el planner LLM) NO tienes acción de agendamiento standalone. El CTA
+  standalone ("¿Le agendo?") solo se dispara por el fast-path determinista
+  cuando el usuario pide explícitamente hora/cita/asesoría.
+- Dentro de la respuesta orientativa, la asesoría se menciona como
+  información cuando el caso lo justifica ("en casos como el suyo..."), pero
+  eso NO es una invitación de cierre a agendar; es parte de orientar.
 - Si el último mensaje del asistente ya ofrecía agendar O contacto humano
   (texto breve que termina en "¿Le interesa?" / "¿Cómo prefiere?"), NO
   vuelvas a esa oferta como respuesta: este turno responde la nueva
@@ -132,10 +176,13 @@ Ejemplos normativos:
 - "¿cómo se hace para demandar? no sé de trámites" → responder_pregunta
 - "¿cuánto cobran por demandar pensión?" → responder_pregunta
 - "me llegó demanda, ¿qué hago?" → responder_pregunta
+- "necesito un abogado que tome mi caso" → responder_pregunta
+- "no quiero agendar, solo información" → responder_pregunta
 - "quiero que me atienda una persona" → hablar_humano
+- "eres un bot, pásame con alguien" → hablar_humano
 - "¿me recomiendan un contador?" → fuera_de_dominio
 
-Devuelve SOLO la acción y una justificación breve. No inventes hechos."""
+Devuelve SOLO la acción y una justificación breve. No inventes hechos."""  # noqa: E501
 
     try:
         prompt = ChatPromptTemplate.from_messages([("system", prompt_text)])

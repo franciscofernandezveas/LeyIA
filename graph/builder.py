@@ -1,5 +1,14 @@
 """graph/builder.py — Grafo padre con 3 sub-agentes especializados.
 
+v5.4 — FIX crisis:
+  - Importa y registra ROUTE_CRISIS en el mapeo de analyze_sentiment.
+  - ROUTE_CRISIS se rutea al nodo handoff_humano ya existente (no se
+    agrega nodo nuevo). El propio handoff_humano detecta state["crisis"]
+    y emite crisis_message + escalamiento prioritario.
+  - route_post_faq ya propagaba ROUTE_HANDOFF_CHOICE y ROUTE_INTAKE;
+    no se requiere cambio para ROUTE_CRISIS porque el padre la maneja
+    directamente desde analyze_sentiment.
+
 v5.3 — Handoff choice: bifurcación previa a handoff/intake que pregunta
        ficha breve vs contacto directo. Nodo intermedio que reduce fricción.
 
@@ -13,7 +22,7 @@ from langgraph.graph import END, START, StateGraph
 from core.contracts import (
     AgentState,
     ROUTE_AGENDAR, ROUTE_FAQ, ROUTE_FUERA_DOMINIO, ROUTE_HANDOFF,
-    ROUTE_INTAKE, ROUTE_HANDOFF_CHOICE,
+    ROUTE_INTAKE, ROUTE_HANDOFF_CHOICE, ROUTE_CRISIS,  # v5.4
 )
 from core.persistence import checkpointer
 from graph.booking.builder import build_booking_graph
@@ -53,6 +62,7 @@ def build_graph() -> StateGraph:
             ROUTE_HANDOFF: ROUTE_HANDOFF,
             ROUTE_FUERA_DOMINIO: ROUTE_FUERA_DOMINIO,
             ROUTE_HANDOFF_CHOICE: ROUTE_HANDOFF_CHOICE,
+            ROUTE_CRISIS: ROUTE_HANDOFF,  # v5.4: crisis reusa handoff_humano
         },
     )
 
@@ -77,9 +87,6 @@ def build_graph() -> StateGraph:
     )
 
     # FAQ: normalmente responde y cierra; si el intake estaba pausado, lo
-    # reanuda. Además, si el planner FAQ detectó un pedido de humano,
-    # señala intake (o handoff si la ficha ya estaba completa).
-        # FAQ: normalmente responde y cierra; si el intake estaba pausado, lo
     # reanuda. Si el planner FAQ detectó pedido de humano (fix #2, v21.1),
     # señala ROUTE_HANDOFF_CHOICE → bifurcación ficha vs contacto directo
     # (misma política que analyze_sentiment para intent=hablar_humano).
@@ -93,7 +100,6 @@ def build_graph() -> StateGraph:
             END: END,
         },
     )
-
 
     return workflow.compile(checkpointer=checkpointer)
 

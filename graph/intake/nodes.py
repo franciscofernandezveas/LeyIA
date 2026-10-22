@@ -1,19 +1,29 @@
 """graph/intake/nodes.py — Acciones del sub-agente INTAKE.
 
-v16 — Resets centralizados: importa RESET_INTAKE desde graph.utils y
-       elimina la constante local _RESET_INTAKE (sin uso actual).
+v17 — Ficha por ramas temáticas (familia / penal / general):
+  - QUESTIONS = tronco común + módulos condicionados por area_caso (vía
+    skip_if, mecanismo que ya existía pero nunca se usaba).
+  - La category del padre NO distingue penal (va a "otro"): la rama penal
+    se detecta por extracción (area_caso/detenido del planner) o por la
+    pregunta area_caso cuando la rama está "pendiente".
+  - Nueva acción derivar_urgente: detención vigente u orden de arresto →
+    handoff inmediato con ficha parcial. Emite intake_exit="handoff" (el
+    IntakeExitLabel del padre no se toca) y marca urgencia_legal=True en
+    las respuestas para que handoff_humano lo vea en el lead.
+  - FIX: _texto_ficha_wa recibe la categoría como parámetro — antes leía
+    respuestas["categoria"], clave que jamás existió, por lo que el "Área"
+    del wa.me siempre decía "consulta_general".
+  - La ficha wa.me ahora incluye los campos de rama (subtipo, hijos,
+    ingresos, medidas, rol, audiencia, urgencia).
 
-v15 — Cierre dual con dos mensajes:
-  - Mensaje 1: cierre con botón "Agendar una hora" (reply button).
-  - Mensaje 2: CTA URL "Pincha aquí" que abre wa.me con la ficha prellenada.
-  - El cliente elige; nada se fuerza.
+v16 — Resets centralizados (RESET_INTAKE desde graph.utils).
+v15 — Cierre dual con botón Agendar + CTA wa.me con ficha prellenada.
 """
 import os
+import re
 import logging
 import unicodedata
 from urllib.parse import quote
-
-from langchain_core.messages import AIMessage
 
 from core.contracts import EMAIL_RE, AgentState
 from core.db_client import upsert_conversation, upsert_lead
@@ -39,6 +49,19 @@ RESPUESTAS_HUMANO = ("hablar con humano", "hablar con una persona",
                      "hablar con un humano", "hablar con una ejecutiva",
                      "hablar con la ejecutiva")
 
+# Detección determinista de urgencia (refuerzo 0-LLM al campo `detenido`).
+# Solo formulaciones de HECHO VIGENTE en primera persona; las hipotéticas
+# ("¿me pueden detener?") las filtra el planner como duda_o_consulta y este
+# regex no llega a evaluarse como urgencia.
+_URGENTE_RE = re.compile(
+    r"(me|lo|la|nos)\s+detuvieron"
+    r"|est[aá]\s+detenid[oa]"
+    r"|control\s+de\s+detenci[oó]n\s+(es\s+)?(hoy|ma[ñn]ana)"
+    r"|me\s+formalizaron"
+    r"|tengo\s+orden\s+de\s+arresto"
+    r"|orden\s+de\s+arresto\s+en\s+mi\s+contra",
+    re.IGNORECASE,
+)
 
 DEFAULT_AP_IA = ("👋 ¡Hola! Soy el *asistente virtual* de Manzzo y Cía — "
                  "un sistema automatizado, no una persona, pero estoy aquí "
@@ -69,6 +92,13 @@ DEFAULT_CIERRE_CTA = (
 )
 DEFAULT_DERIVA = ("Ningún problema{nombre} — te paso directamente con una "
                   "ejecutiva para que lo vean contigo 🤝\n{wa_link}")
+DEFAULT_URGENTE = (
+    "{nombre}Entiendo — una detención o una orden vigente *no puede "
+    "esperar* ⏱️\n"
+    "Dejé tu caso marcado como *urgente* para que el equipo te contacte "
+    "a la brevedad. Si necesitas hablar ahora mismo, escríbele directo "
+    "a la abogada aquí:\n{wa_link}"
+)
 
 # Número de la ejecutiva para el CTA wa.me (override vía env var).
 WA_EJECUTIVA = os.getenv("WA_EJECUTIVA", "56942313989")
@@ -81,6 +111,11 @@ def _sin_tildes(s: str) -> str:
 
 def _norm(s) -> str:
     return _sin_tildes((s or "").strip().lower().rstrip("."))
+
+
+def _recortar(s, n: int) -> str:
+    s = str(s or "").strip()
+    return s if len(s) <= n else s[:n - 1].rstrip() + "…"
 
 
 def _v_text(minlen: int):
@@ -145,13 +180,104 @@ def _botones(*id_title) -> dict:
             "buttons": [{"id": i, "title": t} for i, t in id_title]}
 
 
+# ===========================================================================
+# RAMAS TEMÁTICAS
+# ===========================================================================
+# La category del padre es fina para familia pero mete penal/laboral/civil
+# en "otro". La rama se resuelve así:
+#   1) señales duras ya capturadas (detenido / rol_penal) → penal
+#   2) category del padre ∈ familia → familia
+#   3) respuesta/extracción de area_caso → texto canónico → rama
+#   4) "pendiente" → se pregunta area_caso
+# ===========================================================================
+_CATS_FAMILIA = frozenset({
+    "pension_alimentos", "rebaja_pension", "regimen_visitas",
+    "medidas_apremio", "terminacion_pension", "divorcio",
+    "compensacion_economica",
+})
+
+# Texto canónico almacenado en intake_respuestas["area_caso"] → rama.
+_AREA_TXT_A_RAMA = {
+    "pensión de alimentos": "familia",
+    "régimen de visitas": "familia",
+    "divorcio / compensación económica": "familia",
+    "medidas de apremio": "familia",
+    "derecho penal": "penal",
+    "laboral / civil": "general_otra",
+    "otro tema": "general_otra",
+}
+
+_AREA_LABEL_MAP = {
+    "pension_alimentos": "pensión de alimentos",
+    "regimen_visitas": "régimen de visitas",
+    "divorcio": "divorcio / compensación económica",
+    "medidas_apremio": "medidas de apremio",
+    "penal": "derecho penal",
+    "laboral_civil": "laboral / civil",
+    "otro_tema": "otro tema",
+}
+
+_ROL_LABEL_MAP = {
+    "imputado": "imputado / querellado",
+    "victima": "víctima",
+    "familiar": "familiar o cercano",
+}
+
+_INGRESOS_LABEL_MAP = {
+    "dependiente_estable": "trabajo dependiente, sueldo estable",
+    "independiente_variable": "independiente / ingresos variables",
+    "cesante_reducidos": "cesante o ingresos muy reducidos",
+    "jubilado": "jubilado / pensionado",
+}
+
+
+def _rama(state, respuestas=None) -> str:
+    """'familia' | 'penal' | 'general_otra' | 'pendiente'."""
+    resp = respuestas if respuestas is not None \
+        else (state.get("intake_respuestas") or {})
+
+    # (1) señales duras ya capturadas
+    if resp.get("detenido") is True or resp.get("rol_penal"):
+        return "penal"
+
+    # (2) category del clasificador del padre
+    cat = state.get("case_category") or state.get("category") or ""
+    if cat in _CATS_FAMILIA:
+        return "familia"
+
+    # (3) área declarada o extraída del relato
+    area = resp.get("area_caso")
+    if area:
+        return _AREA_TXT_A_RAMA.get(str(area), "pendiente")
+
+    return "pendiente"
+
+
+def _es_familia(s, r=None): return _rama(s, r) == "familia"
+def _es_penal(s, r=None):   return _rama(s, r) == "penal"
+def _area_pendiente(s, r=None): return _rama(s, r) == "pendiente"
+
+
+def _es_urgencia(state, respuestas: dict) -> bool:
+    """Hecho de urgencia vigente: detención u orden de arresto."""
+    if respuestas.get("detenido") is True:
+        return True
+    med = _norm(str(respuestas.get("medidas_apremio") or ""))
+    if ("arresto" in med and "ningun" not in med
+            and not med.startswith("no ")):
+        return True
+    return bool(_URGENTE_RE.search(state.get("query") or ""))
+
+
+# ===========================================================================
+# INTERACTIVOS
+# ===========================================================================
 _INTERACTIVE_CONSENTIMIENTO = _botones(("si", "Sí, autorizo"),
                                        ("no", "No autorizo"))
 _BOTONES_OFERTA = _botones(("humano", "Hablar con humano"),
                            ("retry", "Lo intento de nuevo"))
-
-# v15: botón Agendar para el primer mensaje del cierre.
 _BOTON_AGENDAR = _botones(("agendar", "Agendar una hora"))
+_INTERACTIVE_SI_NO = _botones(("si", "Sí"), ("no", "No"))
 
 _ETAPA_TITULOS = ["Aún no inicio nada", "Me demandaron / avisaron",
                   "Causa en curso", "Hay sentencia previa"]
@@ -161,7 +287,38 @@ _INTERACTIVE_ETAPA = {
                 for i, t in enumerate(_ETAPA_TITULOS)],
 }
 
+_AREA_TITULOS = ["Pensión de alimentos", "Ver a mis hijos",
+                 "Divorcio / compensación", "Medidas de apremio",
+                 "Tema penal", "Laboral / civil", "Otro tema"]
+_INTERACTIVE_AREA = {
+    "kind": "list", "cta": "Ver opciones", "title": "Tu caso",
+    "options": [{"id": f"area_{i + 1}", "title": t}
+                for i, t in enumerate(_AREA_TITULOS)],
+}
+
+_ROL_TITULOS = ["Soy el imputado", "Soy la víctima", "Es un familiar"]
+_INTERACTIVE_ROL = {
+    "kind": "list", "cta": "Ver opciones", "title": "Tu rol en el caso",
+    "options": [{"id": f"rol_{i + 1}", "title": t}
+                for i, t in enumerate(_ROL_TITULOS)],
+}
+
+_INGRESOS_TITULOS = ["Dependiente, sueldo fijo", "Independiente",
+                     "Cesante / ingresos bajos", "Jubilado(a)"]
+_INTERACTIVE_INGRESOS = {
+    "kind": "list", "cta": "Ver opciones", "title": "Tus ingresos",
+    "options": [{"id": f"ing_{i + 1}", "title": t}
+                for i, t in enumerate(_INGRESOS_TITULOS)],
+}
+
+
+# ===========================================================================
+# QUESTIONS — tronco común + módulos por rama
+# Orden: la posición define la secuencia; skip_if(state, respuestas) la
+# aplica solo si la rama corresponde (se recalcula cada turno).
+# ===========================================================================
 QUESTIONS: list[dict] = [
+    # ================= TRONCO COMÚN =================
     {"id": "consentimiento_datos", "requerida": True, "extractable": False,
      "label": "tu autorización",
      "prompt": ("Para poder revisar tu caso y que un abogado te contacte, "
@@ -201,12 +358,43 @@ QUESTIONS: list[dict] = [
                 "con tus palabras:"),
      "retry_prompt": ("Me falta un poco más para derivarte bien: ¿*qué "
                       "ocurrió*, *quiénes* están involucrados y *desde "
-                      "cuándo*?"),
+                      "cuándo*? (si es un tema penal, solo lo general — "
+                      "sin detalles sensibles del hecho)"),
      "ack": None,
-     "validate": _v_text(8)},  # v14: bajado de 20 para no expulsar relatos cortos
+     "validate": _v_text(8)},
+
+    # Pregunta clasificadora: solo si la rama no quedó clara por category
+    # del padre ni por extracción del relato.
+    {"id": "area_caso", "requerida": True,
+     "label": "el tipo de caso",
+     "skip_if": lambda s, r=None: not _area_pendiente(s, r),
+     "prompt": ("¿Cuál de estos se acerca más a tu situación?\n"
+                "  1) Pensión de alimentos (me demandan, quiero rebajarla "
+                "o terminarla)\n"
+                "  2) Ver a mis hijos (régimen de visitas)\n"
+                "  3) Divorcio o compensación económica\n"
+                "  4) Medidas de apremio (embargo, licencia retenida, "
+                "registro de deudores)\n"
+                "  5) Tema penal\n"
+                "  6) Laboral / civil\n"
+                "  7) Otro tema\n"
+                "(elige de la lista o respóndeme con el número)"),
+     "retry_prompt": ("No logré ubicarlo entre las opciones 😅 Elige de la "
+                      "lista o respóndeme solo con el número (1 al 7):"),
+     "ack": "Anotado ✓",
+     "interactive": _INTERACTIVE_AREA,
+     "label_map": _AREA_LABEL_MAP,
+     "validate": _v_opciones(
+         "pensión de alimentos", "régimen de visitas",
+         "divorcio / compensación económica", "medidas de apremio",
+         "derecho penal", "laboral / civil", "otro tema",
+         aliases={"ver a mis hijos": "régimen de visitas",
+                  "divorcio / compensación": "divorcio / compensación económica",
+                  "tema penal": "derecho penal"})},
 
     {"id": "etapa_proceso", "requerida": False,
      "label": "la etapa del caso",
+     "skip_if": lambda s, r=None: _es_penal(s, r),  # penal tiene etapa propia
      "prompt": ("¿En qué estado está tu caso hoy?\n"
                 "  1) Aún no he iniciado acciones\n"
                 "  2) Fui demandado(a) o notificado(a)\n"
@@ -219,7 +407,7 @@ QUESTIONS: list[dict] = [
      "interactive": _INTERACTIVE_ETAPA,
      "validate": _v_opciones(
          "aún no inicio nada", "me demandaron o me notificaron",
-         "causa en curso", "sentencia o acuerdo previo",
+         "causa en curso", "sentencia o acuerdo previa",
          aliases={"aún no inicio nada": "aún no inicio nada",
                   "me demandaron / avisaron": "me demandaron o me notificaron",
                   "causa en curso": "causa en curso",
@@ -228,6 +416,115 @@ QUESTIONS: list[dict] = [
                    "demandado": "me demandaron o me notificaron",
                    "causa_en_curso": "causa en curso",
                    "sentencia_previa": "sentencia o acuerdo previa"}},
+
+    # ================= MÓDULO FAMILIA =================
+    {"id": "hijos_menores", "requerida": False,
+     "label": "los hijos menores",
+     "skip_if": lambda s, r=None: not _es_familia(s, r),
+     "prompt": ("¿Hay hijos menores de edad involucrados? Si es así, "
+                "¿cuántos y de qué edades? (ej: *2, de 5 y 8 años*; si no "
+                "hay, responde *no*)"),
+     "retry_prompt": ("Solo necesito el número y las edades aproximadas — "
+                      "por ejemplo: *una hija de 12 años* — o *no* si no "
+                      "hay hijos menores."),
+     "ack": "Anotado ✓",
+     "validate": _v_text(1)},
+
+    {"id": "ingresos_rango", "requerida": False,
+     "label": "tu situación de ingresos",
+     "skip_if": lambda s, r=None: not _es_familia(s, r),
+     "prompt": ("Para evaluar montos justos (pensión, acuerdos), ¿cuál es "
+                "tu situación laboral hoy?\n"
+                "  1) Trabajo dependiente, sueldo estable\n"
+                "  2) Independiente / ingresos variables\n"
+                "  3) Cesante o ingresos muy reducidos\n"
+                "  4) Jubilado(a) / pensionado(a)"),
+     "retry_prompt": ("Elige de la lista o respóndeme con el número "
+                      "(1 al 4):"),
+     "ack": "Anotado ✓",
+     "interactive": _INTERACTIVE_INGRESOS,
+     "label_map": _INGRESOS_LABEL_MAP,
+     "validate": _v_opciones(
+         "trabajo dependiente, sueldo estable",
+         "independiente / ingresos variables",
+         "cesante o ingresos muy reducidos",
+         "jubilado / pensionado",
+         aliases={"dependiente, sueldo fijo": "trabajo dependiente, sueldo estable",
+                  "independiente": "independiente / ingresos variables",
+                  "cesante / ingresos bajos": "cesante o ingresos muy reducidos",
+                  "jubilado(a)": "jubilado / pensionado"})},
+
+    {"id": "medidas_apremio", "requerida": False,
+     "label": "las medidas de apremio",
+     "skip_if": lambda s, r=None: not _es_familia(s, r),
+     "prompt": ("¿Tienes alguna medida vigente en tu contra? Puedes indicar "
+                "varias:\n"
+                "  1) Retención de licencia de conducir\n"
+                "  2) Prohibición de salir del país\n"
+                "  3) Embargo o retención de sueldo / AFP\n"
+                "  4) Orden de arresto\n"
+                "  5) Ninguna\n"
+                "(o cuéntamelo con tus palabras)"),
+     "retry_prompt": ("Léeme las que apliquen con su número (ej: *1 y 3*), "
+                      "o responde *ninguna*."),
+     "ack": "Anotado ✓",
+     "validate": _v_text(2)},
+
+    # ================= MÓDULO PENAL =================
+    # Nota de diseño: en penal la ficha es deliberadamente CORTA y no pide
+    # detalles del hecho — un imputado no debe autoincriminarse por
+    # WhatsApp. Lo relevante es rol + urgencia + audiencia, y derivar.
+    {"id": "rol_penal", "requerida": True,
+     "label": "tu rol en el caso",
+     "skip_if": lambda s, r=None: not _es_penal(s, r),
+     "prompt": ("¿Cuál es tu relación con el caso?\n"
+                "  1) Soy el imputado (me acusan / querellaron)\n"
+                "  2) Soy la víctima\n"
+                "  3) Es un familiar o cercano"),
+     "retry_prompt": ("Solo necesito ubicar tu rol: responde con el número "
+                      "(1 al 3) o elige de la lista:"),
+     "ack": "Anotado ✓",
+     "interactive": _INTERACTIVE_ROL,
+     "label_map": _ROL_LABEL_MAP,
+     "validate": _v_opciones(
+         "imputado / querellado", "víctima", "familiar o cercano",
+         aliases={"soy el imputado": "imputado / querellado",
+                  "soy la víctima": "víctima",
+                  "es un familiar": "familiar o cercano",
+                  "me acusan": "imputado / querellado",
+                  "me querellaron": "imputado / querellado"})},
+
+    {"id": "detenido", "requerida": True,
+     "label": "si hay alguien detenido",
+     "skip_if": lambda s, r=None: not _es_penal(s, r),
+     "prompt": ("Pregunta clave: ¿hay alguien *detenido ahora* o con "
+                "audiencia de control de detención en las próximas horas?"),
+     "retry_prompt": ("Necesito un *sí* o un *no*: ¿hay alguien detenido "
+                      "en este momento?"),
+     "ack": "Anotado ✓",
+     "interactive": _INTERACTIVE_SI_NO,
+     "validate": _v_si_no},
+
+    {"id": "audiencia_proxima", "requerida": False,
+     "label": "la audiencia próxima",
+     "skip_if": lambda s, r=None: not _es_penal(s, r),
+     "prompt": ("¿Tienes fecha de alguna audiencia, citación o "
+                "formalización? ¿Para cuándo es?"),
+     "retry_prompt": ("Con la fecha aproximada basta — por ejemplo: "
+                      "*el martes* o *aún no me citan*."),
+     "ack": "Anotado ✓",
+     "validate": _v_text(2)},
+
+    # ================= CIERRE (todas las ramas) =================
+    {"id": "comuna", "requerida": False,
+     "label": "tu comuna",
+     "prompt": ("Última pregunta: ¿en qué *comuna o ciudad* estás? (para "
+                "ubicar el tribunal que corresponde — atendemos en todo "
+                "Chile)"),
+     "retry_prompt": ("Solo el nombre de la comuna o ciudad — por ejemplo: "
+                      "*Puente Alto* o *Concepción*."),
+     "ack": "Anotado ✓",
+     "validate": _v_text(3)},
 ]
 
 _BY_ID = {q["id"]: q for q in QUESTIONS}
@@ -348,32 +645,56 @@ def _persistir_parcial(state: AgentState, respuestas: dict) -> None:
         logger.warning("upsert_lead parcial falló (best-effort): %s", e)
 
 
-def _texto_ficha_wa(respuestas: dict, thread_id: str) -> str:
-    """Corta el texto de la ficha para que quepa en la URL de wa.me."""
+def _texto_ficha_wa(respuestas: dict, thread_id: str,
+                    categoria: str) -> str:
+    """Ficha comprimida para el wa.me. v17: la categoría llega por parámetro
+    (antes se leía de respuestas, donde nunca existió → siempre decía
+    'consulta_general')."""
     nombre = respuestas.get("nombre") or ""
     email = respuestas.get("email") or ""
-    situacion = respuestas.get("situacion_actual") or ""
-    etapa = respuestas.get("etapa_proceso") or ""
     telefono = respuestas.get("telefono") or ""
-    categoria = respuestas.get("categoria") or "consulta_general"
 
-    return (
+    lineas = [
         f"Hola, soy {nombre}. Acabo de completar mi registro. "
-        f"Resumen de mi caso:\n"
-        f"• Área: {categoria}\n"
-        f"• Correo: {email}\n"
-        f"• Teléfono: {telefono}\n"
-        f"• Mi situación: {situacion}\n"
-        f"• Etapa de mi caso: {etapa}\n"
-        f"(ID de mi atención: {thread_id})"
-    )
+        "Resumen de mi caso:",
+        f"• Área: {categoria or 'sin clasificar'}",
+    ]
+    if respuestas.get("area_caso"):
+        lineas.append(f"• Tipo de caso: {_recortar(respuestas['area_caso'], 40)}")
+    if respuestas.get("urgencia_legal"):
+        lineas.append("• ⚠️ URGENTE: detención u orden vigente")
+    if respuestas.get("rol_penal"):
+        lineas.append(f"• Rol (penal): {respuestas['rol_penal']}")
+    if respuestas.get("audiencia_proxima"):
+        lineas.append(
+            f"• Audiencia: {_recortar(respuestas['audiencia_proxima'], 60)}")
+    if respuestas.get("etapa_proceso"):
+        lineas.append(f"• Etapa: {_recortar(respuestas['etapa_proceso'], 40)}")
+    if respuestas.get("hijos_menores"):
+        lineas.append(
+            f"• Hijos menores: {_recortar(respuestas['hijos_menores'], 40)}")
+    if respuestas.get("ingresos_rango"):
+        lineas.append(
+            f"• Ingresos: {_recortar(respuestas['ingresos_rango'], 40)}")
+    if respuestas.get("medidas_apremio"):
+        lineas.append(
+            f"• Medidas: {_recortar(respuestas['medidas_apremio'], 80)}")
+    if respuestas.get("comuna"):
+        lineas.append(f"• Comuna: {_recortar(respuestas['comuna'], 40)}")
+    lineas += [
+        f"• Correo: {email}",
+        f"• Teléfono: {telefono}",
+        f"• Mi situación: {_recortar(respuestas.get('situacion_actual'), 240)}",
+        f"(ID de mi atención: {thread_id})",
+    ]
+    return "\n".join(lineas)
 
 
-def _cta_humano_con_ficha(respuestas: dict, thread_id: str) -> dict:
+def _cta_humano_con_ficha(respuestas: dict, thread_id: str,
+                          categoria: str) -> dict:
     """CTA URL 'Pincha aquí' que abre wa.me con la ficha prellenada."""
-    texto = _texto_ficha_wa(respuestas, thread_id)
+    texto = _texto_ficha_wa(respuestas, thread_id, categoria)
     url = f"https://wa.me/{WA_EJECUTIVA}?text={quote(texto)}"
-
     return {
         "text": DEFAULT_CIERRE_CTA,
         "interactive": {
@@ -393,6 +714,10 @@ def iniciar_ficha(state: AgentState) -> AgentState:
 
     _aplicar_extraccion(respuestas, state.get("intake_decision") or {})
 
+    # Urgencia ya presente al iniciar (caso borde: decisión pre-poblada).
+    if _es_urgencia(state, respuestas):
+        return _derivar_urgente(state, respuestas)
+
     pend = _pendientes(state, respuestas)
     q0 = pend[0]
 
@@ -403,7 +728,8 @@ def iniciar_ficha(state: AgentState) -> AgentState:
     ]
     pack = _pack(burbujas, interactive=_interactive_de(q0))
     _guardar_ai(state, pack["response"])
-    _evento_intake("intake_iniciado", state, pregunta=q0["id"])
+    _evento_intake("intake_iniciado", state, pregunta=q0["id"],
+                   rama=_rama(state, respuestas))
     return {
         **pack,
         "intake_activo": True,
@@ -465,6 +791,11 @@ def procesar_respuesta(state: AgentState) -> AgentState:
 
     if respuestas.get("consentimiento_datos") is False:
         return sin_consentimiento(state, respuestas)
+
+    # v17: la urgencia corta la ficha ANTES de seguir preguntando
+    # (un detenido no puede esperar el resto del cuestionario).
+    if _es_urgencia(state, respuestas):
+        return _derivar_urgente(state, respuestas)
 
     pend = _pendientes(state, respuestas)
     if not pend:
@@ -533,10 +864,9 @@ def procesar_respuesta(state: AgentState) -> AgentState:
 
 def _completar_ficha(state: AgentState, respuestas: dict) -> AgentState:
     sec = _cfg()["intake"]
-    state_con_ficha = {**state, "intake_respuestas": respuestas,
-                       "intake_completado": True}
     nombre = _primer_nombre(respuestas.get("nombre"))
     tid = state.get("thread_id", "")
+    categoria = state.get("case_category") or state.get("category") or ""
 
     burbujas = [
         sec.get("cierre_listo", DEFAULT_CIERRE_LISTO).format(
@@ -547,24 +877,15 @@ def _completar_ficha(state: AgentState, respuestas: dict) -> AgentState:
 
     pack = _pack(burbujas, interactive=_BOTON_AGENDAR)
 
-    # Segundo mensaje: CTA "Pincha aquí" con la ficha comprimida en URL
-    cta = _cta_humano_con_ficha(respuestas, tid)
-    pack["response_cta"] = cta
+    # Segundo mensaje: CTA "Pincha aquí" con la ficha comprimida en URL.
+    # v17 FIX: se pasa la categoría explícitamente (antes leía una clave
+    # inexistente en respuestas → "consulta_general" en el 100% de casos).
+    pack["response_cta"] = _cta_humano_con_ficha(respuestas, tid, categoria)
 
     try:
-        # v16.3 — FIX #10 (auditoría): notificar_crm=False porque
-        # route_post_intake SIEMPRE envía intake_completado=True a
-        # ROUTE_HANDOFF en el mismo turno, y handoff_humano es el emisor
-        # único (notify_escalation + email + sync_lead). Antes había doble
-        # WA por el mismo lead (notify_new_lead aquí + notify_escalation en
-        # handoff) + doble fila en escalations.
-        #
-        # La persistencia del lead (con completed_at=now()) se mantiene:
-        # solo se suprime la notificación redundante.
-        #
-        # ⚠️ Si en el futuro se añade un flujo "ficha completa → END" (sin
-        # handoff inmediato), reactivar notificar_crm=True AQUÍ para que el
-        # equipo reciba el WA de ficha_completada.
+        # FIX #10 (se mantiene): notificar_crm=False porque route_post_intake
+        # SIEMPRE envía intake_completado=True a ROUTE_HANDOFF en el mismo
+        # turno, y handoff_humano es el emisor único. Solo se persiste.
         upsert_lead(
             thread_id=tid,
             intake_respuestas=respuestas,
@@ -575,17 +896,17 @@ def _completar_ficha(state: AgentState, respuestas: dict) -> AgentState:
     except Exception as e:
         logger.warning("upsert_lead (completado) falló: %s", e)
 
-
     _guardar_ai(state, pack["response"])
     _evento_intake("intake_completado", state,
                    respuestas_keys=list(respuestas.keys()),
+                   rama=_rama(state, respuestas),
                    tiene_email=bool(respuestas.get("email")))
     return {
         **pack,
         "intake_activo": False,
         "intake_completado": True,
         "intake_respuestas": respuestas,
-        "intake_exit": "cta_cierre",  # v15: termina turno; padre espera elección
+        "intake_exit": "cta_cierre",
         "intake_decision": None,
         "intake_stage": "completado",
         "intake_oferta_qid": None,
@@ -657,16 +978,8 @@ def reanudar(state: AgentState) -> AgentState:
     puente = (sec.get("reanudar_duda", DEFAULT_REANUDA_DUDA).format(duda=duda)
               if duda else sec.get("reanudar", DEFAULT_REANUDA))
 
-    # v16.1 — FIX #3 (auditoría): preservar la respuesta del FAQ del MISMO
-    # turno. En un round-trip lateral (intake → FAQ → intake), los canales
-    # response/response_bubbles ya contienen la respuesta del FAQ; sin este
-    # prepend, esta burbuja la pisa (última escritura gana) y el cliente ve
-    # "espero haberte orientado" SIN la orientación.
-    #
-    # Discriminación: si el último mensaje del estado es tipo "ai", el
-    # subgrafo FAQ ya escribió en este turno (round-trip lateral → prepend).
-    # Si es "human", es una reanudación real tras pausa del cliente (no hay
-    # nada que preservar → solo puente + pregunta).
+    # FIX #3 (se mantiene): preservar la respuesta del FAQ del MISMO turno
+    # en round-trips laterales (intake → FAQ → intake).
     msgs = state.get("messages") or []
     viene_de_faq = bool(msgs and getattr(msgs[-1], "type", "") == "ai")
     previas = list(state.get("response_bubbles") or []) if viene_de_faq else []
@@ -680,14 +993,10 @@ def reanudar(state: AgentState) -> AgentState:
     else:
         pack = nuevo
 
-    # Persistir SOLO el contenido NUEVO: la respuesta del FAQ ya quedó
-    # registrada por responder_pregunta → _guardar_ai en este mismo turno.
-    # Evita duplicación en el transcript para la ejecutiva.
     _guardar_ai(state, nuevo["response"])
 
     _evento_intake("intake_reanudado", state, pregunta=q["id"])
     return {**base, **pack}
-
 
 
 def derivar_parcial(state: AgentState) -> AgentState:
@@ -722,6 +1031,52 @@ def _derivar_parcial(state: AgentState, respuestas: dict) -> AgentState:
     }
 
 
+def derivar_urgente(state: AgentState) -> AgentState:
+    """Acción invocable por el planner (detenido=True detectado por LLM)."""
+    respuestas = dict(state.get("intake_respuestas") or {})
+    _aplicar_extraccion(respuestas, state.get("intake_decision") or {})
+    return _derivar_urgente(state, respuestas)
+
+
+def _derivar_urgente(state: AgentState, respuestas: dict) -> AgentState:
+    """v17 — Detención vigente u orden de arresto → handoff inmediato.
+
+    Emite intake_exit="handoff" (mismo valor que derivar_parcial: el
+    IntakeExitLabel del padre no admite valores nuevos, y el handoff es
+    además el emisor único de notificaciones — FIX #10). La marca
+    urgencia_legal=True viaja en intake_respuestas: el equipo la ve en el
+    lead y handoff_humano la incluye en el resumen que notifica.
+    """
+    respuestas = {**respuestas, "urgencia_legal": True}
+    nombre = _primer_nombre(respuestas.get("nombre"))
+    msg = _cfg()["intake"].get("derivacion_urgente", DEFAULT_URGENTE).format(
+        nombre=f"{nombre}, " if nombre else "",
+        wa_link=_wa_link_display(
+            f"URGENTE — soy {respuestas.get('nombre', '') or 'un cliente del asistente'}: "
+            "hay una detención u orden vigente. Mi ficha quedó registrada, "
+            "necesito hablar con la abogada ahora.",
+            display="Hablar con la abogada ahora",
+        )
+    )
+    _persistir_parcial(state, respuestas)
+    pack = _pack([msg])
+    _guardar_ai(state, pack["response"])
+    _evento_intake("intake_derivacion_urgente", state,
+                   respuestas_keys=list(respuestas.keys()),
+                   gatillo=("detenido" if respuestas.get("detenido") is True
+                            else "apremio_o_regex"))
+    return {
+        **pack,
+        "intake_activo": False,
+        "intake_completado": False,
+        "intake_respuestas": respuestas,
+        "intake_exit": "handoff",
+        "intake_stage": "completado",
+        "intake_decision": None,
+        "intake_oferta_qid": None,
+    }
+
+
 def abandonar_ficha(state: AgentState) -> AgentState:
     respuestas = dict(state.get("intake_respuestas") or {})
     _persistir_parcial(state, respuestas)
@@ -731,19 +1086,9 @@ def abandonar_ficha(state: AgentState) -> AgentState:
     pack = _pack([msg])
     _guardar_ai(state, pack["response"])
 
-    # v16.2 — FIX #4 (auditoría): cerrar la conversación en BD ANTES de
-    # retornar closed=True. Antes solo el estado se cerraba: la conversación
-    # seguía abierta en BD, el conversation_id no cambiaba, el gatekeeper de
-    # sesión (receive_message) nunca reseteaba el flujo y todo mensaje
-    # futuro caía en analyze_sentiment.closed → ROUTE_HANDOFF →
-    # hilo_cerrado_message ETERNAMENTE. El cliente quedaba expulsado del
-    # bot incluso intentando abrir un caso nuevo.
-    #
-    # Orden crítico: _guardar_ai ANTES (insert_message necesita la
-    # conversación abierta como ancla), upsert_conversation DESPUÉS (setea
-    # closed_at → próxima entrada crea conversación nueva).
-    #
-    # status="abandonado" queda disponible para analítica del embudo.
+    # FIX #4 (se mantiene): cerrar la conversación en BD ANTES de retornar
+    # closed=True, para que el gatekeeper de sesión resetee el flujo en el
+    # próximo mensaje (status="abandonado" para analítica del embudo).
     upsert_conversation(
         thread_id=state.get("thread_id", ""),
         status="abandonado",
@@ -765,7 +1110,6 @@ def abandonar_ficha(state: AgentState) -> AgentState:
     }
 
 
-
 def sin_consentimiento(state: AgentState, respuestas: dict | None = None) -> AgentState:
     msg = _cfg()["intake"]["sin_consentimiento"].format(
         wa_link=_wa_link_display(display="Hablar con un humano")
@@ -773,15 +1117,8 @@ def sin_consentimiento(state: AgentState, respuestas: dict | None = None) -> Age
     pack = _pack([msg])
     _guardar_ai(state, pack["response"])
 
-    # v16.2 — FIX #4 (auditoría): mismo tratamiento que abandonar_ficha.
-    # La negativa de consentimiento (Ley 21.719) también debe cerrar la
-    # sesión en BD para que el cliente pueda volver con un caso nuevo y
-    # para que el gatekeeper aplique RESET_SESION_NUEVA en el próximo
-    # contacto (que purga intake_respuestas, incluyendo los datos
-    # pre-capturados que se hubieran almacenado antes del NO).
-    #
-    # status="sin_consentimiento" para analítica del embudo (¿cuántos
-    # rechazan la autorización en la primera pregunta?).
+    # FIX #4 (se mantiene): la negativa de consentimiento (Ley 21.719)
+    # también cierra la sesión en BD (status="sin_consentimiento").
     upsert_conversation(
         thread_id=state.get("thread_id", ""),
         status="sin_consentimiento",
@@ -802,4 +1139,3 @@ def sin_consentimiento(state: AgentState, respuestas: dict | None = None) -> Age
         "intake_oferta_qid": None,
         "closed": True,
     }
-
