@@ -127,7 +127,10 @@ _CRISIS_KEYWORDS = (
     "quitarme la vida", "no quiero vivir", "quiero morir",
     "suicid", "hacerme daño", "hacerme dano",
     "no aguanto más", "no aguanto mas", "me quiere hacer daño",
+    "no me deja salir", "me controla el celular", "me encierra",
+    "me amenaza con un cuchillo", "cuchillo", "arma", "me apunta",
 )
+
 
 # v22.1: keywords de rechazo a la IA / pedido explícito de humano.
 # Debe coincidir con _HUMANO_EXPLICITO de graph/faq/planner.py.
@@ -141,7 +144,9 @@ _HUMANO_EXPLICITO_KW = (
     "eres un bot", "eres un robot", "eres una ia",
     "no quiero un bot", "no quiero hablar con una maquina",
     "no quiero hablar con una máquina",
+    "pásame con", "pasame con", "pásame a", "pasame a",
 )
+
 
 _EMAIL_BUSCA = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 _NOMBRE_RE = re.compile(

@@ -69,8 +69,9 @@ _SALUDO_PRESENTACION = (
 # el clasificador padre las manda a respuestas_faq (orientar primero).
 _AGENDAR_EXPLICITO = (
     "agendar", "reservar", "quiero una cita", "quiero asesoría",
-    "quiero asesoria", "coordinar una cita",
+    "quiero asesoria", "coordinar una cita", "coordinar una asesoría",
 )
+
 
 _HUMANO_EXPLICITO = (
     "hablar con una ejecutiva", "hablar con una persona",
