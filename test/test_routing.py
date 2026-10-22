@@ -1,23 +1,48 @@
 """Flujos reales de clientes. Requiere que el grafo esté compilado."""
+import uuid
+from unittest.mock import patch
+
 import pytest
+from langchain_core.messages import HumanMessage
 
 from core.contracts import make_config
 from graph.builder import agent_graph
+
+
+# Contexto canónico para tests, evita que el LLM alucine cuando Chroma falla.
+_FAQ_CONTEXT = """
+Servicios de Manzzo y Cía:
+- Pensión de alimentos: demanda, cobranza, rebaja, terminación.
+- Divorcio, relación directa y regular, medidas de apremio.
+- Asesoría inicial de 30-45 minutos con abogado: $30.000, se descuenta del
+  total si contrata la causa.
+- Tramitación de causa de familia completa: $500.000, promoción hasta
+  12 cuotas sin interés.
+
+Proceso pensión de alimentos: se presenta demanda en el Juzgado de Familia
+correspondiente, con partida de nacimiento de los hijos, certificado de
+nacimiento, liquidaciones o boletas si hay relación laboral, y antecedentes
+de gastos del menor.
+"""
 
 
 @pytest.fixture
 def state():
     return {
         "messages": [],
-        "thread_id": "test-whatsapp-56912345678",
+        "thread_id": f"test-{uuid.uuid4().hex[:12]}",
     }
 
 
 def _enviar(state, texto: str):
-    from langchain_core.messages import HumanMessage
     cfg = make_config(state["thread_id"])
     state["messages"].append(HumanMessage(content=texto))
-    return agent_graph.invoke(state, cfg)
+    with patch("graph.faq.nodes.retrieve", return_value=[]):
+        # Si prefieres que el LLM tenga contexto, descomenta:
+        # with patch("graph.faq.nodes.retrieve") as mock_ret:
+        #     from langchain_core.documents import Document
+        #     mock_ret.return_value = [Document(page_content=_FAQ_CONTEXT)]
+        return agent_graph.invoke(state, cfg)
 
 
 @pytest.mark.slow
@@ -27,12 +52,10 @@ def test_cliente_con_duda_de_pension_no_es_empujado_a_agendar(state):
     assert len(ai_messages) >= 1
     texto = ai_messages[-1].content.lower()
 
-    # Debe orientar, mencionar proceso/documentos
     assert any(p in texto for p in ["demanda", "juzgado", "familia", "documentos"])
-
-    # NO debe terminar con CTA de agenda como cierre forzado
     assert not any(cta in texto[-120:] for cta in [
         "¿le interesa?", "¿le agendo?", "agendar una asesoría",
+        "¿le gustaría proceder", "puedo ayudarle a agendar",
     ]), f"El sistema empujó a agendar: {texto[-120:]}"
 
 
@@ -43,8 +66,10 @@ def test_cliente_angustiado_recibe_orientacion_no_cta(state):
     texto = ai_messages[-1].content.lower()
 
     assert "desesperado" in texto or "complejo" in texto or "difícil" in texto
-    # No debe ofrecer agendar inmediatamente
-    assert "¿le interesa?" not in texto[-150:]
+    assert not any(cta in texto[-150:] for cta in [
+        "¿le interesa?", "¿le agendo?", "agendar una asesoría",
+        "puedo ayudarle a agendar",
+    ])
 
 
 @pytest.mark.slow
