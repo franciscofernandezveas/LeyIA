@@ -1,5 +1,12 @@
 """graph/intake/nodes.py — Acciones del sub-agente INTAKE.
 
+v18 — Fix "saltar" en campos opcionales:
+  - Detección robusta de intención de salto (no solo coincidencia exacta).
+  - Campos opcionales saltados se registran como None y el intake avanza.
+  - Nuevo campo de estado intake_skipped; la extracción posterior no
+    sobreescribe campos que el usuario eligió omitir.
+  - Propagación de intake_skipped en todas las ramas de salida.
+
 v17 — Ficha por ramas temáticas (familia / penal / general):
   - QUESTIONS = tronco común + módulos condicionados por area_caso (vía
     skip_if, mecanismo que ya existía pero nunca se usaba).
@@ -49,6 +56,50 @@ RESPUESTAS_HUMANO = ("hablar con humano", "hablar con una persona",
                      "hablar con un humano", "hablar con una ejecutiva",
                      "hablar con la ejecutiva")
 
+
+def _detecta_salto(raw: str) -> bool:
+    """Detecta intención de saltar una pregunta opcional.
+
+    Acepta frases exactas del catálogo SALTAR y variaciones naturales
+    ('quiero saltar esta pregunta', 'paso de esta', etc.), pero descarta
+    negaciones como 'no quiero saltar'.
+    """
+    t = _norm(raw)
+    if not t:
+        return False
+
+    # 1) Frases exactas del catálogo
+    if t in SALTAR:
+        return True
+
+    # 2) Negación explícita → no es salto
+    if t.startswith("no ") or " no " in t:
+        return False
+
+    # 3) Mensaje corto con palabra clave de salto
+    palabras = t.split()
+    if len(palabras) > 6:
+        return False
+
+    claves_salto = {
+        "saltar", "salta", "salto", "saltarme", "saltarlo",
+        "omitir", "omito", "omítir", "paso", "pasar", "páse",
+        "skip", "skipear", "salte",
+    }
+    if any(p in claves_salto for p in palabras):
+        return True
+
+    # 4) Frases típicas de omisión explícita
+    omitir_frases = (
+        "no quiero responder", "prefiero no responder",
+        "prefiero no decir", "no aplica", "n/a", "me salto",
+    )
+    if any(p in t for p in omitir_frases):
+        return True
+
+    return False
+
+
 # Detección determinista de urgencia (refuerzo 0-LLM al campo `detenido`).
 # Solo formulaciones de HECHO VIGENTE en primera persona; las hipotéticas
 # ("¿me pueden detener?") las filtra el planner como duda_o_consulta y este
@@ -67,9 +118,9 @@ DEFAULT_AP_IA = ("👋 ¡Hola! Soy el *asistente virtual* de Manzzo y Cía — "
                  "un sistema automatizado, no una persona, pero estoy aquí "
                  "para ayudarte.")
 DEFAULT_AP_EXP = ("Te haré unas preguntas rápidas (unos 2 minutos) para "
-                  "preparar tu caso.\nEn cualquier momento puedes hacer una "
-                  "pregunta, pedir *hablar con una persona* o escribir "
-                  "*pausa* para retomar después.")
+                "preparar tu caso.\nEn cualquier momento puedes hacer una "
+                "pregunta, pedir *hablar con una persona* o escribir "
+                "*pausa* para retomar después.")
 DEFAULT_AVISO_SALTAR = "Si prefieres no responder, escribe *saltar*."
 DEFAULT_ERROR_NO_SALTAR = ("Este dato sí lo necesito para poder derivar tu "
                            "caso 🙏 Si te complica, también puedes pedir "
@@ -411,7 +462,7 @@ QUESTIONS: list[dict] = [
          aliases={"aún no inicio nada": "aún no inicio nada",
                   "me demandaron / avisaron": "me demandaron o me notificaron",
                   "causa en curso": "causa en curso",
-                  "hay sentencia previa": "sentencia o acuerdo previo"}),
+                  "hay sentencia previa": "sentencia o acuerdo previa"}),
      "label_map": {"sin_inicio": "aún no inicio nada",
                    "demandado": "me demandaron o me notificaron",
                    "causa_en_curso": "causa en curso",
@@ -609,8 +660,11 @@ def _acks_turno(q_actual: dict, antes: dict, respuestas: dict) -> list[str]:
     return acks
 
 
-def _aplicar_extraccion(respuestas: dict, decision: dict) -> None:
+def _aplicar_extraccion(respuestas: dict, decision: dict,
+                        skipped: set | None = None) -> None:
     for qid, qdef in _BY_ID.items():
+        if qid in (skipped or set()):
+            continue
         if not qdef.get("extractable", True):
             continue
         raw = decision.get(qid)
@@ -708,15 +762,17 @@ def _cta_humano_con_ficha(respuestas: dict, thread_id: str,
 def iniciar_ficha(state: AgentState) -> AgentState:
     sec = _cfg()["intake"]
     respuestas: dict = {}
+    skipped = set(state.get("intake_skipped") or ())
     tel = _telefono_cliente(state)
     if tel:
         respuestas["telefono"] = tel
 
-    _aplicar_extraccion(respuestas, state.get("intake_decision") or {})
+    _aplicar_extraccion(respuestas, state.get("intake_decision") or {},
+                        skipped=skipped)
 
     # Urgencia ya presente al iniciar (caso borde: decisión pre-poblada).
     if _es_urgencia(state, respuestas):
-        return _derivar_urgente(state, respuestas)
+        return _derivar_urgente(state, respuestas, skipped=skipped)
 
     pend = _pendientes(state, respuestas)
     q0 = pend[0]
@@ -743,6 +799,7 @@ def iniciar_ficha(state: AgentState) -> AgentState:
         "intake_decision": None,
         "intake_stage": "preguntando",
         "intake_oferta_qid": None,
+        "intake_skipped": skipped,
     }
 
 
@@ -753,10 +810,11 @@ def procesar_respuesta(state: AgentState) -> AgentState:
     decision = state.get("intake_decision") or {}
     attempts = int(state.get("intake_attempts") or 0)
     raw = (state.get("query") or "").strip()
+    skipped = set(state.get("intake_skipped") or ())
 
     pend = _pendientes(state, respuestas)
     if not pend:
-        return _completar_ficha(state, respuestas)
+        return _completar_ficha(state, respuestas, skipped=skipped)
     q_actual = pend[0]
     nombre = _primer_nombre(respuestas.get("nombre"))
     ya_ofrecido = state.get("intake_oferta_qid") == q_actual["id"]
@@ -770,16 +828,20 @@ def procesar_respuesta(state: AgentState) -> AgentState:
             "intake_respuestas": respuestas,
             "intake_attempts": attempts,
             "intake_decision": None,
+            "intake_skipped": skipped,
         }
 
     error_key = None
-    if _norm(raw) in SALTAR:
+    if _detecta_salto(raw):
         if q_actual["requerida"]:
             error_key = "no_skip"
         else:
             respuestas[q_actual["id"]] = None
+            skipped.add(q_actual["id"])
+            logger.info("[intake] campo opcional saltado: %s",
+                        q_actual["id"])
     else:
-        _aplicar_extraccion(respuestas, decision)
+        _aplicar_extraccion(respuestas, decision, skipped=skipped)
         if q_actual["id"] not in respuestas:
             val, err = q_actual["validate"](raw)
             if err:
@@ -795,11 +857,18 @@ def procesar_respuesta(state: AgentState) -> AgentState:
     # v17: la urgencia corta la ficha ANTES de seguir preguntando
     # (un detenido no puede esperar el resto del cuestionario).
     if _es_urgencia(state, respuestas):
-        return _derivar_urgente(state, respuestas)
+        return _derivar_urgente(state, respuestas, skipped=skipped)
+
+    # GUARDA: asegurar que un salto opcional nunca deje el intake atascado.
+    if (q_actual["id"] in respuestas
+            and respuestas[q_actual["id"]] is None
+            and q_actual["id"] not in antes):
+        logger.info("[intake] avanzando tras salto opcional de %s",
+                    q_actual["id"])
 
     pend = _pendientes(state, respuestas)
     if not pend:
-        return _completar_ficha(state, respuestas)
+        return _completar_ficha(state, respuestas, skipped=skipped)
 
     if error_key:
         extras = _extras_turno(q_actual, antes, respuestas)
@@ -811,7 +880,7 @@ def procesar_respuesta(state: AgentState) -> AgentState:
             if ya_ofrecido:
                 logger.info("[intake] reintento agotado en '%s' → "
                             "derivación parcial", q_actual["id"])
-                return _derivar_parcial(state, respuestas)
+                return _derivar_parcial(state, respuestas, skipped=skipped)
             msg_oferta = sec.get("oferta_salida", DEFAULT_OFERTA).format(
                 nombre=f"{nombre}, " if nombre else "")
             pack = _pack([msg_oferta], interactive=_BOTONES_OFERTA)
@@ -822,6 +891,7 @@ def procesar_respuesta(state: AgentState) -> AgentState:
                 "intake_attempts": attempts,
                 "intake_decision": None,
                 "intake_oferta_qid": q_actual["id"],
+                "intake_skipped": skipped,
             }
 
         burbujas = []
@@ -841,6 +911,7 @@ def procesar_respuesta(state: AgentState) -> AgentState:
             "intake_respuestas": respuestas,
             "intake_attempts": attempts,
             "intake_decision": None,
+            "intake_skipped": skipped,
         }
 
     _persistir_parcial(state, respuestas)
@@ -859,10 +930,12 @@ def procesar_respuesta(state: AgentState) -> AgentState:
         "intake_attempts": 0,
         "intake_oferta_qid": None,
         "intake_decision": None,
+        "intake_skipped": skipped,
     }
 
 
-def _completar_ficha(state: AgentState, respuestas: dict) -> AgentState:
+def _completar_ficha(state: AgentState, respuestas: dict,
+                     skipped: set | None = None) -> AgentState:
     sec = _cfg()["intake"]
     nombre = _primer_nombre(respuestas.get("nombre"))
     tid = state.get("thread_id", "")
@@ -910,11 +983,13 @@ def _completar_ficha(state: AgentState, respuestas: dict) -> AgentState:
         "intake_decision": None,
         "intake_stage": "completado",
         "intake_oferta_qid": None,
+        "intake_skipped": skipped or set(),
     }
 
 
 def pausar_ficha(state: AgentState) -> AgentState:
     """El cliente pide pausa: detener la ficha y esperar al próximo mensaje."""
+    skipped = set(state.get("intake_skipped") or ())
     pack = _pack(["Perfecto, quedo aquí esperando. Cuando quieras retomar, "
                   "solo escríbeme 🤙"])
     _guardar_ai(state, pack["response"])
@@ -927,6 +1002,7 @@ def pausar_ficha(state: AgentState) -> AgentState:
         "intake_stage": "pausado",
         "intake_decision": None,
         "intake_oferta_qid": None,
+        "intake_skipped": skipped,
     }
 
 
@@ -960,6 +1036,7 @@ def _ultima_duda(state: AgentState) -> str | None:
 def reanudar(state: AgentState) -> AgentState:
     sec = _cfg()["intake"]
     respuestas = dict(state.get("intake_respuestas") or {})
+    skipped = set(state.get("intake_skipped") or ())
     pend = _pendientes(state, respuestas)
     base = {
         "intake_exit": None,
@@ -968,6 +1045,7 @@ def reanudar(state: AgentState) -> AgentState:
         "intake_stage": "preguntando",
         "intake_oferta_qid": None,
         "response_interactive": None,
+        "intake_skipped": skipped,
     }
     if not pend or not state.get("intake_activo"):
         return base
@@ -1001,10 +1079,12 @@ def reanudar(state: AgentState) -> AgentState:
 
 def derivar_parcial(state: AgentState) -> AgentState:
     respuestas = dict(state.get("intake_respuestas") or {})
-    return _derivar_parcial(state, respuestas)
+    skipped = set(state.get("intake_skipped") or ())
+    return _derivar_parcial(state, respuestas, skipped=skipped)
 
 
-def _derivar_parcial(state: AgentState, respuestas: dict) -> AgentState:
+def _derivar_parcial(state: AgentState, respuestas: dict,
+                     skipped: set | None = None) -> AgentState:
     nombre = _primer_nombre(respuestas.get("nombre"))
     msg = _cfg()["intake"].get("derivacion_parcial", DEFAULT_DERIVA).format(
         nombre=f", {nombre}" if nombre else "",
@@ -1028,17 +1108,21 @@ def _derivar_parcial(state: AgentState, respuestas: dict) -> AgentState:
         "intake_stage": "completado",
         "intake_decision": None,
         "intake_oferta_qid": None,
+        "intake_skipped": skipped or set(),
     }
 
 
 def derivar_urgente(state: AgentState) -> AgentState:
     """Acción invocable por el planner (detenido=True detectado por LLM)."""
     respuestas = dict(state.get("intake_respuestas") or {})
-    _aplicar_extraccion(respuestas, state.get("intake_decision") or {})
-    return _derivar_urgente(state, respuestas)
+    skipped = set(state.get("intake_skipped") or ())
+    _aplicar_extraccion(respuestas, state.get("intake_decision") or {},
+                        skipped=skipped)
+    return _derivar_urgente(state, respuestas, skipped=skipped)
 
 
-def _derivar_urgente(state: AgentState, respuestas: dict) -> AgentState:
+def _derivar_urgente(state: AgentState, respuestas: dict,
+                     skipped: set | None = None) -> AgentState:
     """v17 — Detención vigente u orden de arresto → handoff inmediato.
 
     Emite intake_exit="handoff" (mismo valor que derivar_parcial: el
@@ -1074,11 +1158,13 @@ def _derivar_urgente(state: AgentState, respuestas: dict) -> AgentState:
         "intake_stage": "completado",
         "intake_decision": None,
         "intake_oferta_qid": None,
+        "intake_skipped": skipped or set(),
     }
 
 
 def abandonar_ficha(state: AgentState) -> AgentState:
     respuestas = dict(state.get("intake_respuestas") or {})
+    skipped = set(state.get("intake_skipped") or ())
     _persistir_parcial(state, respuestas)
     msg = _cfg()["intake"]["cierre_abandono"].format(
         wa_link=_wa_link_display(display="Hablar con un humano")
@@ -1107,10 +1193,12 @@ def abandonar_ficha(state: AgentState) -> AgentState:
         "intake_decision": None,
         "intake_oferta_qid": None,
         "closed": True,
+        "intake_skipped": skipped,
     }
 
 
 def sin_consentimiento(state: AgentState, respuestas: dict | None = None) -> AgentState:
+    skipped = set(state.get("intake_skipped") or ())
     msg = _cfg()["intake"]["sin_consentimiento"].format(
         wa_link=_wa_link_display(display="Hablar con un humano")
     )
@@ -1138,4 +1226,5 @@ def sin_consentimiento(state: AgentState, respuestas: dict | None = None) -> Age
         "intake_stage": "sin_consentimiento",
         "intake_oferta_qid": None,
         "closed": True,
+        "intake_skipped": skipped,
     }

@@ -114,20 +114,9 @@ def _send_alert(titulo: str, body: str) -> bool:
         logger.warning("[notify] destinatario vacío")
         return False
 
-    logger.info("[notify] alerta '%s' → %s", titulo, to)
-    ok, code = _post({
-        "messaging_product": "whatsapp",
-        "recipient_type": "individual",
-        "to": to,
-        "type": "text",
-        "text": {"preview_url": False, "body": _clip(body, MAX_LEN)},
-    })
-    if ok:
-        return True
-    if code in _TEMPLATE_FALLBACK_CODES:
-        logger.warning("[notify] fuera de ventana 24h (code=%s) → plantilla", code)
-        return _send_template(to, titulo, body)
-    return False
+    logger.info("[notify] alerta '%s' → %s (plantilla utility)", titulo, to)
+    return _send_template(to, titulo, body)
+
 
 
 def notify_new_lead(lead: dict) -> bool:
