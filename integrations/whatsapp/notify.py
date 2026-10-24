@@ -62,6 +62,11 @@ def _post(payload: dict) -> tuple[bool, int | None]:
     if not ACCESS_TOKEN or not PHONE_NUMBER_ID:
         logger.warning("[notify] WhatsApp no configurado; skip")
         return False, None
+
+    to = payload.get("to", "unknown")
+    msg_type = payload.get("type", "unknown")
+    logger.info("[notify] POST a %s (type=%s)", to, msg_type)
+
     try:
         with httpx.Client(timeout=10) as client:
             r = client.post(
@@ -70,6 +75,7 @@ def _post(payload: dict) -> tuple[bool, int | None]:
                 json=payload,
             )
         if r.status_code < 400:
+            logger.info("[notify] enviado a %s (type=%s)", to, msg_type)
             return True, None
         code = None
         try:
@@ -80,7 +86,7 @@ def _post(payload: dict) -> tuple[bool, int | None]:
                      r.status_code, code, r.text[:300])
         return False, code
     except Exception:
-        logger.exception("[notify] falló el POST a Meta")
+        logger.exception("[notify] falló el POST a %s (type=%s)", to, msg_type)
         return False, None
 
 
@@ -91,6 +97,7 @@ def _send_template(to: str, titulo: str, detalle: str) -> bool:
         logger.error("[notify] rechazado por ventana 24h y NOTIFY_TEMPLATE "
                      "no configurada — aviso perdido")
         return False
+    logger.info("[notify] fallback plantilla a %s: %s", to, titulo)
     ok, _ = _post({
         "messaging_product": "whatsapp",
         "to": to,
@@ -117,6 +124,7 @@ def _send_alert(titulo: str, body: str) -> bool:
                        "(LAWYER_WHATSAPP_TO / WHATSAPP_OPERATOR_NUMBER); skip")
         return False
 
+    logger.info("[notify] alerta '%s' → %s", titulo, to)
     ok, code = _post({
         "messaging_product": "whatsapp",
         "recipient_type": "individual",
@@ -125,7 +133,6 @@ def _send_alert(titulo: str, body: str) -> bool:
         "text": {"preview_url": False, "body": _clip(body, MAX_LEN)},
     })
     if ok:
-        logger.info("[notify] enviado a %s", to)
         return True
     if code in _TEMPLATE_FALLBACK_CODES:
         logger.warning("[notify] fuera de ventana 24h (code=%s) → plantilla", code)
@@ -138,6 +145,7 @@ def _send_alert(titulo: str, body: str) -> bool:
 # ------------------------------------------------------------------ #
 def notify_new_lead(lead: dict) -> bool:
     d = lead or {}
+    logger.info("[notify] evento: nuevo lead | %s", d.get("telefono"))
     body = (
         "📋 *Nuevo lead completo*\n"
         f"👤 Nombre: {_clip(d.get('nombre'), 120)}\n"
@@ -153,6 +161,7 @@ def notify_new_lead(lead: dict) -> bool:
 
 def notify_escalation(thread_id, summary, telefono=None,
                       motivo="hablar_abogada") -> bool:
+    logger.info("[notify] evento: escalación %s | %s", motivo, telefono)
     icon, titulo = _MOTIVOS.get(motivo, ("🚨", "Escalamiento"))
     body = (
         f"{icon} *{titulo}*\n"
@@ -166,6 +175,8 @@ def notify_escalation(thread_id, summary, telefono=None,
 
 def notify_booking(booking: dict) -> bool:
     b = booking or {}
+    logger.info("[notify] evento: booking | %s | %s %s",
+                b.get("cliente_nombre"), b.get("fecha"), b.get("hora_inicio"))
     link = b.get("html_link") or b.get("meet_link") or ""
     body = (
         "📅 *Nueva cita agendada*\n"

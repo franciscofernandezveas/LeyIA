@@ -135,6 +135,11 @@ def _build_interactive(interactive: dict, body: str) -> dict:
 async def _post(payload: dict) -> dict:
     url = f"{API_BASE}/{API_VERSION}/{PHONE_NUMBER_ID}/messages"
 
+    # Log interno: tipo de mensaje y destinatario (sin el cuerpo completo)
+    msg_type = payload.get("type", "unknown")
+    to = payload.get("to", "unknown")
+    logger.info("[whatsapp] POST %s → %s (type=%s)", url, to, msg_type)
+
     async with httpx.AsyncClient(timeout=15) as client:
         response = await client.post(
             url,
@@ -148,7 +153,12 @@ async def _post(payload: dict) -> dict:
 
 
 async def send_text(to: str, body: str) -> None:
-    for chunk in _chunks(_wa_clean(body)):
+    chunks = list(_chunks(_wa_clean(body)))
+    for i, chunk in enumerate(chunks, 1):
+        logger.info(
+            "[whatsapp] texto a %s chunk %d/%d: %.120s%s",
+            to, i, len(chunks), chunk, "..." if len(chunk) > 120 else ""
+        )
         await _post({
             "messaging_product": "whatsapp",
             "recipient_type": "individual",
@@ -159,6 +169,11 @@ async def send_text(to: str, body: str) -> None:
 
 
 async def send_interactive(to: str, body: str, interactive: dict) -> dict:
+    kind = interactive.get("kind") or interactive.get("type") or "unknown"
+    logger.info(
+        "[whatsapp] interactivo a %s | kind=%s | body=%.120s%s",
+        to, kind, body, "..." if len(body) > 120 else ""
+    )
     return await _post({
         "messaging_product": "whatsapp",
         "recipient_type": "individual",
@@ -170,6 +185,7 @@ async def send_interactive(to: str, body: str, interactive: dict) -> dict:
 
 async def mark_as_read(wamid: str) -> None:
     try:
+        logger.info("[whatsapp] marcando como leído: %s", wamid)
         await _post({
             "messaging_product": "whatsapp",
             "status": "read",
