@@ -1,4 +1,3 @@
-# core/llm.py
 """Inicialización del LLM.
 
 La API key se resuelve UNA sola vez en core/config.py (con load_dotenv()
@@ -25,22 +24,8 @@ MODEL_NAME = (os.environ.get("OPENAI_MODEL") or "gpt-4o-mini").strip().lower()
 IS_REASONING = any(name in MODEL_NAME for name in ["o1", "o3", "o4", "o5"])
 IS_NEW_GPT = any(name in MODEL_NAME for name in ["gpt-4.1", "gpt-5"])
 
-if IS_REASONING or IS_NEW_GPT:
-    llm_kwargs = {
-        "model": MODEL_NAME,
-        "api_key": OPENAI_API_KEY,
-        "max_completion_tokens": 2048,
-    }
-else:
-    llm_kwargs = {
-        "model": MODEL_NAME,
-        "temperature": 0.0,
-        "max_tokens": 2048,
-        "api_key": OPENAI_API_KEY,
-    }
 
-
-def _build_llm() -> ChatOpenAI:
+def _build_llm(max_tokens: int) -> ChatOpenAI:
     """Falla con un mensaje claro si falta la key, en vez del OpenAIError crudo."""
     if not OPENAI_API_KEY:
         raise RuntimeError(
@@ -48,15 +33,44 @@ def _build_llm() -> ChatOpenAI:
             "Define DEMO_OPENAI_API_KEY u OPENAI_API_KEY en el archivo .env "
             "de la raíz del proyecto (junto a core/, scripts/, etc.)."
         )
-    return ChatOpenAI(**llm_kwargs)
+
+    if IS_REASONING or IS_NEW_GPT:
+        kwargs = {
+            "model": MODEL_NAME,
+            "api_key": OPENAI_API_KEY,
+            "max_completion_tokens": max_tokens,
+        }
+    else:
+        kwargs = {
+            "model": MODEL_NAME,
+            "temperature": 0.0,
+            "max_tokens": max_tokens,
+            "api_key": OPENAI_API_KEY,
+        }
+    return ChatOpenAI(**kwargs)
 
 
-LLM = _build_llm()
+# ------------------------------------------------------------------
+# Tres cortes de token según el uso
+# ------------------------------------------------------------------
+
+# 1) Respuestas al cliente por WhatsApp. 900 tokens ≈ 600-700 caracteres,
+#    suficiente para 1-2 burbujas. Forzamos concisión por hard cap.
+LLM = _build_llm(max_tokens=900)
+
+# 2) Salidas estructuradas (JSON): AnalisisResult, BookingDecision, etc.
+#    Son objetos pequeños; 512 tokens sobran y evitamos pagar por espacio
+#    de generación libre.
+LLM_ESTRUCTURADO = _build_llm(max_tokens=512)
+
+# 3) Textos internos que NO ve el cliente: resúmenes de crisis/handoff
+#    para la abogada. Aquí sí puede ser más extenso.
+LLM_LARGO = _build_llm(max_tokens=2048)
 
 
 def with_structured_output(model: Type[BaseModel], method: str = "function_calling") -> ChatOpenAI:
     """
     Crea un LLM con salida estructurada.
-    Usa function_calling para evitar problemas con structured output de OpenAI.
+    Usa LLM_ESTRUCTURADO para no desperdiciar tokens de salida en JSON.
     """
-    return LLM.with_structured_output(model, method=method)
+    return LLM_ESTRUCTURADO.with_structured_output(model, method=method)
