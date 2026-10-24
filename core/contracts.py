@@ -104,9 +104,10 @@ ROUTE_AGENDAR: str = "agendar_asesoria"
 ROUTE_FAQ: str = "respuestas_faq"
 ROUTE_FUERA_DOMINIO: str = "respuesta_fuera_dominio"
 ROUTE_INTAKE: str = "intake_lead"
+ROUTE_CRISIS: str = "crisis"   # ← NUEVO
 
 VALID_ROUTES = {ROUTE_HANDOFF, ROUTE_HANDOFF_CHOICE, ROUTE_AGENDAR, ROUTE_FAQ,
-                ROUTE_FUERA_DOMINIO, ROUTE_INTAKE}
+                ROUTE_FUERA_DOMINIO, ROUTE_INTAKE, ROUTE_CRISIS}  # ← NUEVO
 
 
 # --------------------------------------------------------------------------
