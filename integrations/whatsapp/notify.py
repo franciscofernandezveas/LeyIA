@@ -1,12 +1,15 @@
 """integrations/whatsapp/notify.py — Notificaciones internas de LeyIA.
 
-Envía WhatsApp al número de la abogada cuando ocurren eventos de negocio:
-  - Nuevo lead completo
-  - Escalamiento (explicito o pendiente)
-  - Cita agendada
+Eventos de negocio → WhatsApp a la abogada:
+  - Nuevo lead completo      (notify_new_lead)
+  - Escalamiento / handoff   (notify_escalation)
+  - Cita agendada            (notify_booking)
 
-Best-effort: nunca lanza excepción al grafo.
-Módulo SINCRÓNICO: pensado para ser llamado desde core.db_client (psycopg3).
+Reglas:
+  - Best-effort: NUNCA lanza excepción al grafo.
+  - Sincrónico: corre dentro del executor del grafo (no bloquea el loop).
+  - Ventana 24h: si Meta rechaza el texto libre, reintenta con la
+    plantilla utility definida en NOTIFY_TEMPLATE.
 """
 import logging
 import os
@@ -19,36 +22,46 @@ logger = logging.getLogger("leyia-notify")
 API_BASE = "https://graph.facebook.com"
 MAX_LEN = 3500
 
-# Destinataria de las notificaciones (la abogada). Reutiliza la env var
-# existente del operador si LAWYER_WHATSAPP_TO no está definida.
-LAWYER_WHATSAPP_TO = (
-    os.getenv("LAWYER_WHATSAPP_TO")
-    or os.getenv("WHATSAPP_OPERATOR_NUMBER")
-    or ""
-).replace("+", "").strip()
+# Códigos de Meta que significan "no puedes usar texto libre aquí":
+#   131047 = fuera de ventana 24h   131026 = undeliverable
+#   131030 = destinatario no está en lista permitida (app en desarrollo)
+_TEMPLATE_FALLBACK_CODES = {131047, 131026, 131030}
+
+# v2: 'contacto_directo' y 'crisis_riesgo_vital' ya no caen al default genérico.
+_MOTIVOS = {
+    "ficha_completada":              ("📋", "Ficha completada — esperando decisión"),
+    "hablar_abogada":                ("🚨", "Cliente quiere hablar contigo"),
+    "contacto_directo":              ("📞", "Cliente pidió contacto directo"),
+    "derivacion_parcial":            ("⚠️", "Derivación parcial por reintentos"),
+    "crisis_riesgo_vital":           ("🆘", "RIESGO VITAL — revisar de inmediato"),
+    "aprobacion_agendamiento_rechazada": ("⛔", "Agenda rechazada — contactar al cliente"),
+}
 
 
-def _clip(text: str, limit: int = 900) -> str:
+
+def lawyer_number() -> str:
+    """Lazy: lee el entorno en cada llamada para no depender del orden de
+    carga de dotenv/uvicorn en el arranque."""
+    raw = (os.getenv("LAWYER_WHATSAPP_TO")
+           or os.getenv("WHATSAPP_OPERATOR_NUMBER") or "")
+    return raw.replace("+", "").replace(" ", "").strip()
+
+
+def _clip(text, limit: int = 900) -> str:
     text = (text or "").strip()
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
-def send_text_sync(to: str, body: str) -> bool:
-    """Envía un texto por WhatsApp Cloud API. Devuelve True si Meta aceptó."""
+def _wa_cliente(telefono: str | None) -> str:
+    t = (telefono or "").replace("+", "").strip()
+    return f"\n💬 Contactar: https://wa.me/{t}" if t else ""
+
+
+def _post(payload: dict) -> tuple[bool, int | None]:
+    """Devuelve (ok, error_code_de_Meta)."""
     if not ACCESS_TOKEN or not PHONE_NUMBER_ID:
         logger.warning("[notify] WhatsApp no configurado; skip")
-        return False
-    if not to:
-        logger.warning("[notify] destinatario vacío; skip")
-        return False
-
-    payload = {
-        "messaging_product": "whatsapp",
-        "recipient_type": "individual",
-        "to": to,
-        "type": "text",
-        "text": {"preview_url": False, "body": _clip(body, MAX_LEN)},
-    }
+        return False, None
     try:
         with httpx.Client(timeout=10) as client:
             r = client.post(
@@ -56,14 +69,68 @@ def send_text_sync(to: str, body: str) -> bool:
                 headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
                 json=payload,
             )
-            if r.status_code >= 400:
-                logger.error("[notify] WA %s: %s", r.status_code, r.text)
-                return False
-            logger.info("[notify] enviado a %s", to)
-            return True
+        if r.status_code < 400:
+            return True, None
+        code = None
+        try:
+            code = r.json().get("error", {}).get("code")
+        except Exception:
+            pass
+        logger.error("[notify] WA %s (code=%s): %s",
+                     r.status_code, code, r.text[:300])
+        return False, code
     except Exception:
-        logger.exception("[notify] falló envío a %s", to)
+        logger.exception("[notify] falló el POST a Meta")
+        return False, None
+
+
+def _send_template(to: str, titulo: str, detalle: str) -> bool:
+    """Plantilla utility con 2 variables de cuerpo: {{1}} título, {{2}} detalle."""
+    template = os.getenv("NOTIFY_TEMPLATE", "").strip()
+    if not template:
+        logger.error("[notify] rechazado por ventana 24h y NOTIFY_TEMPLATE "
+                     "no configurada — aviso perdido")
         return False
+    ok, _ = _post({
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "template",
+        "template": {
+            "name": template,
+            "language": {"code": os.getenv("NOTIFY_TEMPLATE_LANG", "es")},
+            "components": [{
+                "type": "body",
+                "parameters": [
+                    {"type": "text", "text": _clip(titulo, 60)},
+                    {"type": "text", "text": _clip(detalle, 900)},
+                ],
+            }],
+        },
+    })
+    return ok
+
+
+def _send_alert(titulo: str, body: str) -> bool:
+    to = lawyer_number()
+    if not to:
+        logger.warning("[notify] destinatario vacío "
+                       "(LAWYER_WHATSAPP_TO / WHATSAPP_OPERATOR_NUMBER); skip")
+        return False
+
+    ok, code = _post({
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to,
+        "type": "text",
+        "text": {"preview_url": False, "body": _clip(body, MAX_LEN)},
+    })
+    if ok:
+        logger.info("[notify] enviado a %s", to)
+        return True
+    if code in _TEMPLATE_FALLBACK_CODES:
+        logger.warning("[notify] fuera de ventana 24h (code=%s) → plantilla", code)
+        return _send_template(to, titulo, body)
+    return False
 
 
 # ------------------------------------------------------------------ #
@@ -79,30 +146,22 @@ def notify_new_lead(lead: dict) -> bool:
         f"🗂️ Categoría: {_clip(d.get('categoria'), 60)}\n"
         f"📍 Situación: {_clip(d.get('situacion'), 300)}\n"
         f"🔖 Etapa: {_clip(d.get('etapa_proceso'), 60)}"
+        + _wa_cliente(d.get("telefono"))
     )
-    return send_text_sync(LAWYER_WHATSAPP_TO, body)
+    return _send_alert("Nuevo lead completo", body)
 
 
-def notify_escalation(
-    thread_id: str,
-    summary: str,
-    telefono: str | None = None,
-    motivo: str = "hablar_abogada",
-) -> bool:
-    """Notificación de escalamiento. El texto depende del motivo."""
-    icon, titulo = {
-        "ficha_completada":   ("📋", "Ficha completada — esperando decisión"),
-        "hablar_abogada":     ("🚨", "Cliente quiere hablar contigo"),
-        "derivacion_parcial": ("⚠️", "Derivación parcial por reintentos"),
-    }.get(motivo, ("🚨", "Escalamiento"))
-
+def notify_escalation(thread_id, summary, telefono=None,
+                      motivo="hablar_abogada") -> bool:
+    icon, titulo = _MOTIVOS.get(motivo, ("🚨", "Escalamiento"))
     body = (
         f"{icon} *{titulo}*\n"
         f"🧵 Hilo: {thread_id}\n"
         f"📞 Cliente: {_clip(telefono or 'sin teléfono', 30)}\n"
         f"📝 Resumen: {_clip(summary, 1200)}"
+        + _wa_cliente(telefono)
     )
-    return send_text_sync(LAWYER_WHATSAPP_TO, body)
+    return _send_alert(titulo, body)
 
 
 def notify_booking(booking: dict) -> bool:
@@ -116,4 +175,4 @@ def notify_booking(booking: dict) -> bool:
         f"📍 Modalidad: {_clip(b.get('modalidad_label') or b.get('modalidad'), 60)}"
         + (f"\n🔗 {_clip(link, 200)}" if link else "")
     )
-    return send_text_sync(LAWYER_WHATSAPP_TO, body)
+    return _send_alert("Nueva cita agendada", body)

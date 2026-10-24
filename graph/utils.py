@@ -1,21 +1,21 @@
 """graph/utils.py — Helpers transversales del grafo padre e intake.
 
+v1.8 — FIX prefijo wa-:
+  - _canal_desconocido reconoce "wa-" como canal whatsapp.
+  - _telefono_cliente extrae el número de "wa-56912345678".
+  - Unificación: única fuente del número de la abogada/esecutiva a través
+    de _ejecutiva_number(), compartida con integrations/whatsapp/notify.py
+    e integrations/whatsapp/handler.py.
+
 v1.7 — FIX crisis:
   - RESET_SESION_NUEVA incluye "crisis": None para que el flag de crisis no
     sobreviva entre sesiones de conversación distintas (gatekeeper de
     receive_message).
-
-v1.6 — Añade cta_agenda_ofrecida a RESET_SESION_NUEVA (nueva sesión = nueva
-        oferta permitida).
-
-v1.3 — Añade RESET_INTAKE, RESET_HANDOFF_CHOICE, RESET_BOOKING y
-        RESET_SESION_NUEVA centralizados, consumidos por los nodos del grafo.
-v1.2 — Registra atencion.agenda_inicio_aviso (emisión one-shot en booking).
-v1.1 — Añade WA_TEXTO_MAX y _truncar_burbuja para reutilizar en subgrafos.
 """
 
 import json
 import logging
+import os
 import re
 import unicodedata
 
@@ -28,7 +28,6 @@ import yaml
 from langchain_core.messages import AIMessage
 
 from core.db_client import insert_message, upsert_conversation
-from tools.notify_whatsapp import WHATSAPP_EJECUTIVA
 
 logger = logging.getLogger(__name__)
 
@@ -184,11 +183,25 @@ def _truncar_burbuja(texto: str, max_len: int = WA_TEXTO_MAX) -> str:
 
 
 # --------------------------------------------------------------------------
+# Número de la ejecutiva / abogada (única fuente de verdad)
+# --------------------------------------------------------------------------
+def _ejecutiva_number() -> str:
+    """Número E.164 sin '+'. Usado para:
+      - links wa.me que ve el cliente (contacto directo)
+      - alertas HITL del handler.py (vía import)
+      - notificaciones de negocio (notify.py, vía import)
+    Lazy: lee en cada uso para no depender del orden de carga de dotenv."""
+    raw = (os.getenv("LAWYER_WHATSAPP_TO")
+           or os.getenv("WHATSAPP_EJECUTIVA")
+           or os.getenv("WHATSAPP_OPERATOR_NUMBER") or "")
+    return re.sub(r"\D", "", raw)
+
+
+# --------------------------------------------------------------------------
 # WhatsApp / links
 # --------------------------------------------------------------------------
 def _wa_link(texto: str = "") -> str:
-    num = re.sub(r"\D", "", WHATSAPP_EJECUTIVA or "")
-    base = f"https://wa.me/{num}"
+    base = f"https://wa.me/{_ejecutiva_number()}"
     return f"{base}?text={quote(texto)}" if texto else base
 
 
@@ -315,12 +328,20 @@ def _ficha_intake(state: dict) -> str:
 
 
 def _telefono_cliente(state: dict) -> str | None:
-    tid = state.get("thread_id") or ""
+    """Extrae el número del cliente desde el thread_id.
+    Soporta '56912345678' y 'wa-56912345678'."""
+    tid = (state.get("thread_id") or "")
+    if tid.startswith("wa-"):
+        tid = tid[3:]
+    tid = tid.strip()
     return tid if re.fullmatch(r"\+?\d{8,15}", tid) else None
 
 
 def _canal_desconocido(thread_id: str | None) -> str:
+    """Detecta el canal desde el prefijo del thread_id."""
     tid = thread_id or ""
+    if tid.startswith("wa-"):
+        return "whatsapp"
     if tid.startswith("cli-"):
         return "cli"
     if tid.startswith("web-"):
@@ -358,7 +379,8 @@ def _persist_escalation(state: dict, summary: str) -> Path:
     }
     ESCALATIONS_DIR.mkdir(parents=True, exist_ok=True)
     safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(state.get("thread_id") or "sin-id"))
-    path = ESCALATIONS_DIR / f"{safe_id}.json"
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    path = ESCALATIONS_DIR / f"{safe_id}_{timestamp}.json"
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
 
@@ -409,5 +431,5 @@ def _upsert_conversacion_abierta(thread_id: str) -> None:
     upsert_conversation(
         thread_id=thread_id,
         channel=_canal_desconocido(thread_id),
-        status="abierto",
+        status="open",
     )

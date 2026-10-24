@@ -20,7 +20,9 @@ from langchain_core.messages import AIMessage
 from langchain_core.prompts import ChatPromptTemplate
 
 from core.contracts import AgentState, EMAIL_RE, HitlPayload, TipoHITL
-from core.db_client import insert_booking, upsert_conversation, upsert_lead
+from core.db_client import (
+    insert_booking, insert_escalation, upsert_conversation, upsert_lead,
+)
 
 from core.llm import LLM
 from graph.utils import (
@@ -621,6 +623,38 @@ def confirmar_y_crear(state: AgentState) -> AgentState:
             response = ("Gracias por su interés. Una ejecutiva se contactará para "
                         "coordinar la cita. " + (decision.get("nota", ""))).strip()
             _guardar_ai(state, response)
+
+            telefono = _telefono_cliente(state)
+
+            # Persistir lead mínimo para que la ejecutiva tenga datos de contacto
+            upsert_lead(
+                thread_id=tid,
+                intake_respuestas={
+                    "nombre": state["lead_nombre"],
+                    "email": state["lead_email"],
+                    "telefono": telefono,
+                },
+                completed=False,        # no es una ficha completa
+                notificar_crm=False,      # evita doble WA; handoff notifica aquí
+            )
+
+            # Avisar al equipo legal: este lead necesita contacto manual
+            nota_revisor = (decision.get("nota") or "").strip()
+            insert_escalation(
+                thread_id=tid,
+                summary=(
+                    f"El cliente eligió una asesoría para {_slot_display(elegido)} "
+                    f"({state.get('lead_modalidad', 'online')}), pero la creación "
+                    f"del evento fue rechazada en aprobación humana. "
+                    f"El cliente espera que una ejecutiva lo contacte. "
+                    f"Email: {state['lead_email']}. "
+                    f"Teléfono: {telefono or 'no disponible'}. "
+                    + (f"Nota del revisor: {nota_revisor}" if nota_revisor else "")
+                ).strip(),
+                motivo="aprobacion_agendamiento_rechazada",
+                notificar=True,
+            )
+
             return {
                 "response": response,
                 "response_bubbles": [response],

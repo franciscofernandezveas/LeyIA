@@ -21,8 +21,6 @@ from .normalizer import WhatsAppMessage
 
 logger = logging.getLogger("leyia-whatsapp")
 
-OPERATOR_NUMBER = os.getenv("WHATSAPP_OPERATOR_NUMBER")
-
 MSG_HITL = ("⏸️ Tu solicitud está pendiente de revisión por un abogado del estudio. "
             "Te escribiremos apenas sea resuelta.")
 MSG_ONLY_TEXT = "Por ahora solo puedo procesar mensajes de texto 🙏"
@@ -37,6 +35,17 @@ MAX_REAPER_RETRIES = 3
 REAPER_BACKOFF_SECONDS = 120
 NON_RETRYABLE_STATUS = "dead_letter"
 RETRYABLE_EXHAUSTED_STATUS = "failed"
+
+
+def _operator_number() -> str:
+    """Número de la abogada/ejecutiva para alertas de HITL.
+    Prioriza LAWYER_WHATSAPP_TO (igual que notify.py) y cae en
+    WHATSAPP_OPERATOR_NUMBER para compatibilidad histórica.
+    Lazy: se evalúa en cada envío para no depender del orden de carga de
+    variables de entorno en el arranque."""
+    raw = (os.getenv("LAWYER_WHATSAPP_TO")
+           or os.getenv("WHATSAPP_OPERATOR_NUMBER") or "")
+    return raw.replace("+", "").replace(" ", "").strip()
 
 
 def _is_retryable(exc: Exception) -> bool:
@@ -111,6 +120,12 @@ async def run_agent(wa_id: str, text: str, name: str | None) -> dict:
     config = graph_config(thread_id, user_id=wa_id, channel="whatsapp")
 
     if await in_executor(pending_interrupts, config):
+        operator = _operator_number()
+        if operator:
+            await send_text(
+                operator,
+                f"⚖️ HITL de {name or wa_id} ({thread_id}). Revísalo en el dashboard.",
+            )
         return {"text": MSG_HITL, "interactive": None, "cta": None}
 
     payload = {"messages": [("human", text)], "thread_id": thread_id}
@@ -118,9 +133,10 @@ async def run_agent(wa_id: str, text: str, name: str | None) -> dict:
 
     pendings = await in_executor(pending_interrupts, config)
     if pendings:
-        if OPERATOR_NUMBER:
+        operator = _operator_number()
+        if operator:
             await send_text(
-                OPERATOR_NUMBER,
+                operator,
                 f"⚖️ HITL de {name or wa_id} ({thread_id}). Revísalo en el dashboard.",
             )
         return {"text": MSG_HITL, "interactive": None, "cta": None}

@@ -536,27 +536,27 @@ def insert_booking(
     """
     Una fila por evento_id de Google Calendar — NO por thread_id.
 
-    Un mismo cliente puede tener N citas vigentes. El upsert por evento_id
-    solo da idempotencia ante reintentos del MISMO evento (no duplica ni
-    re-notifica). Un segundo booking del mismo thread crea fila nueva y
-    notifica normalmente.
+    El caller (graph/booking/nodes.py::confirmar_y_crear) crea el evento en
+    GCal PRIMERO y pasa el evento_id real. Sin evento_id no se inserta ni
+    se notifica (guard defensivo).
+
+    Notificación exactly-once *best-effort*: claim atómico por fila, con
+    rollback si Meta rechaza.
     """
     try:
         thread_id = normalize_thread_id(thread_id)
         b = booking or {}
         evento_id = _safe(b.get("evento_id"))
 
-        with _get_engine().connect() as conn:
-            ya_existia = False
-            if evento_id:
-                ya_existia = (
-                    conn.execute(
-                        text("SELECT 1 FROM bookings WHERE evento_id = :evento_id"),
-                        {"evento_id": evento_id},
-                    ).fetchone()
-                    is not None
-                )
+        if not evento_id:
+            logger.error(
+                "[db] insert_booking sin evento_id para thread=%s — se omite. "
+                "El caller debió crear el evento en GCal primero.",
+                thread_id,
+            )
+            return
 
+        with _get_engine().connect() as conn:
             conn.execute(
                 text(f"""
                 INSERT INTO bookings
@@ -589,8 +589,8 @@ def insert_booking(
                     "thread_id": thread_id,
                     "evento_id": evento_id,
                     "fecha": _safe(b.get("fecha")),
-                    "hora_inicio": _safe(b.get("hora_inicio")),
-                    "hora_fin": _safe(b.get("hora_fin")),
+                    "hora_inicio": _safe(b.get("hora_start") or b.get("hora_inicio")),
+                    "hora_fin": _safe(b.get("hora_end") or b.get("hora_fin")),
                     "modalidad": _safe(b.get("modalidad_label") or b.get("modalidad")),
                     "meet_link": _safe(b.get("meet_link")),
                     "html_link": _safe(b.get("html_link")),
@@ -601,8 +601,33 @@ def insert_booking(
             )
             conn.commit()
 
-        if not ya_existia:
-            from integrations.whatsapp.notify import notify_booking
-            notify_booking(b)
+        # Claim atómico: solo un worker envía la notificación por evento_id.
+        with _get_engine().connect() as conn:
+            claim = conn.execute(
+                text("""
+                    UPDATE bookings
+                       SET notificado_whatsapp = true
+                     WHERE evento_id = :eid
+                       AND notificado_whatsapp = false
+                    RETURNING id
+                """),
+                {"eid": evento_id},
+            ).fetchone()
+            conn.commit()
+
+        if claim is None:
+            return   # ya notificado por otro intento / worker
+
+        from integrations.whatsapp.notify import notify_booking
+        if not notify_booking(b):
+            # Meta falló → liberar claim para reintento futuro.
+            with _get_engine().connect() as conn:
+                conn.execute(
+                    text("UPDATE bookings SET notificado_whatsapp = false "
+                         "WHERE evento_id = :eid"),
+                    {"eid": evento_id},
+                )
+                conn.commit()
+
     except Exception as e:
         logger.exception("[db] insert_booking falló: %s", e)

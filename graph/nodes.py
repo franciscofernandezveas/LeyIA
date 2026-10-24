@@ -100,7 +100,6 @@ from graph.utils import (
     _wa_link_display,
 )
 
-from tools.notify_whatsapp import WHATSAPP_EJECUTIVA, notificar_escalamiento
 
 logger = logging.getLogger(__name__)
 
@@ -694,12 +693,14 @@ def handoff_humano(state: AgentState) -> AgentState:
 
     respuestas = state.get("intake_respuestas") or {}
     if respuestas.get("consentimiento_datos") is True:
-        upsert_lead(
+                upsert_lead(
             thread_id=tid,
             intake_respuestas=respuestas,
             category=state.get("case_category") or state.get("category"),
             completed=bool(state.get("intake_completado")),
+            notificar_crm=False,   # handoff_humano notifica vía insert_escalation
         )
+
 
     motivo = "hablar_abogada" if state.get("intake_completado") else "contacto_directo"
     notificacion_ok = insert_escalation(
