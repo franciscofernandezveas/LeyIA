@@ -1,16 +1,5 @@
-"""integrations/whatsapp/notify.py — Notificaciones internas de LeyIA.
+"""integrations/whatsapp/notify.py — Notificaciones internas de LeyIA."""
 
-Eventos de negocio → WhatsApp a la abogada:
-  - Nuevo lead completo      (notify_new_lead)
-  - Escalamiento / handoff   (notify_escalation)
-  - Cita agendada            (notify_booking)
-
-Reglas:
-  - Best-effort: NUNCA lanza excepción al grafo.
-  - Sincrónico: corre dentro del executor del grafo (no bloquea el loop).
-  - Ventana 24h: si Meta rechaza el texto libre, reintenta con la
-    plantilla utility definida en NOTIFY_TEMPLATE.
-"""
 import logging
 import os
 
@@ -22,12 +11,8 @@ logger = logging.getLogger("leyia-notify")
 API_BASE = "https://graph.facebook.com"
 MAX_LEN = 3500
 
-# Códigos de Meta que significan "no puedes usar texto libre aquí":
-#   131047 = fuera de ventana 24h   131026 = undeliverable
-#   131030 = destinatario no está en lista permitida (app en desarrollo)
 _TEMPLATE_FALLBACK_CODES = {131047, 131026, 131030}
 
-# v2: 'contacto_directo' y 'crisis_riesgo_vital' ya no caen al default genérico.
 _MOTIVOS = {
     "ficha_completada":              ("📋", "Ficha completada — esperando decisión"),
     "hablar_abogada":                ("🚨", "Cliente quiere hablar contigo"),
@@ -38,10 +23,7 @@ _MOTIVOS = {
 }
 
 
-
 def lawyer_number() -> str:
-    """Lazy: lee el entorno en cada llamada para no depender del orden de
-    carga de dotenv/uvicorn en el arranque."""
     raw = (os.getenv("LAWYER_WHATSAPP_TO")
            or os.getenv("WHATSAPP_OPERATOR_NUMBER") or "")
     return raw.replace("+", "").replace(" ", "").strip()
@@ -58,14 +40,12 @@ def _wa_cliente(telefono: str | None) -> str:
 
 
 def _post(payload: dict) -> tuple[bool, int | None]:
-    """Devuelve (ok, error_code_de_Meta)."""
     if not ACCESS_TOKEN or not PHONE_NUMBER_ID:
         logger.warning("[notify] WhatsApp no configurado; skip")
         return False, None
 
     to = payload.get("to", "unknown")
     msg_type = payload.get("type", "unknown")
-    logger.info("[notify] POST a %s (type=%s)", to, msg_type)
 
     try:
         with httpx.Client(timeout=10) as client:
@@ -74,16 +54,29 @@ def _post(payload: dict) -> tuple[bool, int | None]:
                 headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
                 json=payload,
             )
+
+        try:
+            data = r.json()
+        except Exception:
+            data = {}
+
+        msg_id = (
+            (data.get("messages") or [{}])[0].get("id")
+            or data.get("message_id")
+            or "n/a"
+        )
+
         if r.status_code < 400:
-            logger.info("[notify] enviado a %s (type=%s)", to, msg_type)
+            logger.info("[notify] enviado a %s (type=%s, msg_id=%s)", to, msg_type, msg_id)
             return True, None
+
         code = None
         try:
-            code = r.json().get("error", {}).get("code")
+            code = data.get("error", {}).get("code")
         except Exception:
             pass
-        logger.error("[notify] WA %s (code=%s): %s",
-                     r.status_code, code, r.text[:300])
+        logger.error("[notify] WA %s (code=%s, msg_id=%s): %s",
+                     r.status_code, code, msg_id, r.text[:300])
         return False, code
     except Exception:
         logger.exception("[notify] falló el POST a %s (type=%s)", to, msg_type)
@@ -91,11 +84,9 @@ def _post(payload: dict) -> tuple[bool, int | None]:
 
 
 def _send_template(to: str, titulo: str, detalle: str) -> bool:
-    """Plantilla utility con 2 variables de cuerpo: {{1}} título, {{2}} detalle."""
     template = os.getenv("NOTIFY_TEMPLATE", "").strip()
     if not template:
-        logger.error("[notify] rechazado por ventana 24h y NOTIFY_TEMPLATE "
-                     "no configurada — aviso perdido")
+        logger.error("[notify] rechazado por ventana 24h y NOTIFY_TEMPLATE no configurada")
         return False
     logger.info("[notify] fallback plantilla a %s: %s", to, titulo)
     ok, _ = _post({
@@ -120,8 +111,7 @@ def _send_template(to: str, titulo: str, detalle: str) -> bool:
 def _send_alert(titulo: str, body: str) -> bool:
     to = lawyer_number()
     if not to:
-        logger.warning("[notify] destinatario vacío "
-                       "(LAWYER_WHATSAPP_TO / WHATSAPP_OPERATOR_NUMBER); skip")
+        logger.warning("[notify] destinatario vacío")
         return False
 
     logger.info("[notify] alerta '%s' → %s", titulo, to)
@@ -140,9 +130,6 @@ def _send_alert(titulo: str, body: str) -> bool:
     return False
 
 
-# ------------------------------------------------------------------ #
-# Eventos de negocio                                                   #
-# ------------------------------------------------------------------ #
 def notify_new_lead(lead: dict) -> bool:
     d = lead or {}
     logger.info("[notify] evento: nuevo lead | %s", d.get("telefono"))
@@ -159,8 +146,7 @@ def notify_new_lead(lead: dict) -> bool:
     return _send_alert("Nuevo lead completo", body)
 
 
-def notify_escalation(thread_id, summary, telefono=None,
-                      motivo="hablar_abogada") -> bool:
+def notify_escalation(thread_id, summary, telefono=None, motivo="hablar_abogada") -> bool:
     logger.info("[notify] evento: escalación %s | %s", motivo, telefono)
     icon, titulo = _MOTIVOS.get(motivo, ("🚨", "Escalamiento"))
     body = (

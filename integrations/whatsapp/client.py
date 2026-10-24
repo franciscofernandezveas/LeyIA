@@ -9,11 +9,11 @@ logger = logging.getLogger("leyia-whatsapp")
 API_BASE = "https://graph.facebook.com"
 MAX_WA_LEN = 4000
 
-MAX_INTERACTIVE_BODY = 1024   # body de un interactivo Meta
+MAX_INTERACTIVE_BODY = 1024
 MAX_BUTTON_TITLE = 20
 MAX_ROW_TITLE = 24
 MAX_ROW_DESC = 72
-MAX_LIST_ROWS = 10            # total de filas entre TODAS las secciones
+MAX_LIST_ROWS = 10
 MAX_LIST_CTA = 20
 MAX_SECTION_TITLE = 24
 
@@ -21,7 +21,6 @@ _BR_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
 
 
 def _wa_clean(text: str) -> str:
-    """WhatsApp no renderiza HTML: convierte <br> en saltos de línea reales."""
     return _BR_RE.sub("\n", text or "").strip()
 
 
@@ -48,25 +47,11 @@ def _row(o: dict) -> dict:
 
 
 def _build_interactive(interactive: dict, body: str) -> dict:
-    """Convierte el formato interno del grafo al de Meta Cloud API.
-
-    kind soportados:
-      - buttons: reply buttons nativos (máx 3)
-      - list:    lista nativa; acepta "options" (1 sección) o
-                 "sections" (varias, p.ej. agrupadas por día)
-      - cta:     botón call-to-action URL
-
-    Compatibilidad: se acepta la clave legacy "type" como alias de "kind"
-    (con warning en logs para detectar el nodo que la emite).
-    """
     wa: dict = {"body": {"text": _clip(body, MAX_INTERACTIVE_BODY)}}
 
     kind = interactive.get("kind")
     if kind is None and interactive.get("type") is not None:
-        logger.warning(
-            "interactive usa clave legacy 'type'; corrige el nodo emisor: %r",
-            interactive,
-        )
+        logger.warning("interactive usa clave legacy 'type'; corrige el nodo emisor: %r", interactive)
         kind = interactive.get("type")
 
     if kind == "buttons":
@@ -89,12 +74,10 @@ def _build_interactive(interactive: dict, body: str) -> dict:
             ]
         else:
             sections = [{
-                "title": _clip(interactive.get("title") or "Opciones",
-                               MAX_SECTION_TITLE),
+                "title": _clip(interactive.get("title") or "Opciones", MAX_SECTION_TITLE),
                 "rows": [_row(o) for o in interactive.get("options", [])],
             }]
 
-        # Meta: máx 10 filas en TOTAL entre todas las secciones
         cupos = MAX_LIST_ROWS
         final = []
         for s in sections:
@@ -106,7 +89,6 @@ def _build_interactive(interactive: dict, body: str) -> dict:
                 break
         if not final:
             raise ValueError("interactive 'list' sin opciones")
-
         wa["type"] = "list"
         wa["action"] = {
             "button": _clip(interactive.get("cta") or "Ver opciones", MAX_LIST_CTA),
@@ -125,7 +107,6 @@ def _build_interactive(interactive: dict, body: str) -> dict:
                 "url": url,
             },
         }
-
     else:
         raise ValueError(f"kind de interactive no soportado: {kind!r}")
 
@@ -134,11 +115,8 @@ def _build_interactive(interactive: dict, body: str) -> dict:
 
 async def _post(payload: dict) -> dict:
     url = f"{API_BASE}/{API_VERSION}/{PHONE_NUMBER_ID}/messages"
-
-    # Log interno: tipo de mensaje y destinatario (sin el cuerpo completo)
-    msg_type = payload.get("type", "unknown")
     to = payload.get("to", "unknown")
-    logger.info("[whatsapp] POST %s → %s (type=%s)", url, to, msg_type)
+    msg_type = payload.get("type", "status" if payload.get("status") else "unknown")
 
     async with httpx.AsyncClient(timeout=15) as client:
         response = await client.post(
@@ -146,10 +124,31 @@ async def _post(payload: dict) -> dict:
             headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
             json=payload,
         )
+
+        try:
+            data = response.json()
+        except Exception:
+            data = {}
+
+        msg_id = (
+            (data.get("messages") or [{}])[0].get("id")
+            or data.get("message_id")
+            or "n/a"
+        )
+
         if response.status_code >= 400:
-            logger.error(f"WA API {response.status_code}: {response.text}")
+            logger.error(
+                "[whatsapp] WA API %s para %s (type=%s, msg_id=%s): %s",
+                response.status_code, to, msg_type, msg_id, response.text[:300]
+            )
+        else:
+            logger.info(
+                "[whatsapp] Meta aceptó mensaje %s para %s (type=%s)",
+                msg_id, to, msg_type
+            )
+
         response.raise_for_status()
-        return response.json()
+        return data
 
 
 async def send_text(to: str, body: str) -> None:
@@ -192,4 +191,4 @@ async def mark_as_read(wamid: str) -> None:
             "message_id": wamid,
         })
     except Exception:
-        logger.warning(f"mark_as_read falló para {wamid}", exc_info=True)
+        logger.warning("mark_as_read falló para %s", wamid, exc_info=True)

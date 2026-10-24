@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -17,7 +18,7 @@ from .client import (
 from .db.connection import async_session
 from .db.models import MessageRecord
 from .db.repository import mark_processed, register_message
-from .normalizer import WhatsAppMessage
+from .normalizer import WhatsAppMessage, _normalize_phone
 
 logger = logging.getLogger("leyia-whatsapp")
 
@@ -62,6 +63,9 @@ def _is_retryable(exc: Exception) -> bool:
 
 async def handle_messages(messages: list[WhatsAppMessage]) -> None:
     for msg in messages:
+        # Normalizar una sola vez al recibir del webhook
+        msg.customer_phone = _normalize_phone(msg.customer_phone)
+
         status = await register_message(msg)
         if status == "processed":
             continue
@@ -103,16 +107,20 @@ async def process_message(msg: WhatsAppMessage) -> None:
     Responde al cliente y, solo si todo sale bien, marca el mensaje como leído.
     Esto evita POSTs a Facebook en cada reintento fallido.
     """
+    wa_id = _normalize_phone(msg.customer_phone)
+
     if msg.message_type not in PROCESSABLE_TYPES or not msg.text:
-        await send_text(msg.customer_phone, MSG_ONLY_TEXT)
+        await send_text(wa_id, MSG_ONLY_TEXT)
     else:
-        reply = await run_agent(msg.customer_phone, msg.text, msg.customer_name)
-        await _deliver(msg.customer_phone, reply)
+        reply = await run_agent(wa_id, msg.text, msg.customer_name)
+        await _deliver(wa_id, reply)
 
     await mark_as_read(msg.message_id)
 
 
 async def run_agent(wa_id: str, text: str, name: str | None) -> dict:
+    wa_id = _normalize_phone(wa_id)
+
     if not AGENT_AVAILABLE:
         return {"text": MSG_ERROR, "interactive": None, "cta": None}
 
@@ -146,11 +154,12 @@ async def run_agent(wa_id: str, text: str, name: str | None) -> dict:
         "text": values.get("response")
                 or "No pude generar una respuesta, ¿puedes repetir tu consulta?",
         "interactive": values.get("response_interactive"),
-        "cta": values.get("response_cta"),          # NUEVO: segundo paquete (texto + CTA URL)
+        "cta": values.get("response_cta"),
     }
 
 
 async def _deliver(to: str, reply: dict) -> None:
+    to = _normalize_phone(to)
     text = (reply.get("text") or "").strip()
 
     interactives = reply.get("interactive")
@@ -158,7 +167,6 @@ async def _deliver(to: str, reply: dict) -> None:
         interactives = [interactives]
     interactives = [i for i in (interactives or []) if isinstance(i, dict)]
 
-    # NUEVO: paquete CTA opcional (ej. "Pincha aquí" post-ficha)
     cta = reply.get("cta") if isinstance(reply.get("cta"), dict) else {}
     cta_text = (cta.get("text") or "").strip()
     cta_inter = cta.get("interactive")
@@ -170,8 +178,6 @@ async def _deliver(to: str, reply: dict) -> None:
             await send_text(to, text)
         return
 
-    # El texto completo viaja como body del PRIMER interactivo si cabe.
-    # Si no, va como mensaje de texto previo (Meta: max 1024 chars en body).
     text_in_first = bool(text) and len(text) <= MAX_INTERACTIVE_BODY
 
     if text and not (interactives and text_in_first):
@@ -190,7 +196,6 @@ async def _deliver(to: str, reply: dict) -> None:
         except ValueError:
             logger.warning("interactive inválido ignorado: %r", inter, exc_info=True)
 
-    # NUEVO: se envía AL FINAL, como mensaje aparte con su propio botón URL
     if cta_inter:
         try:
             await send_interactive(to, cta_text or "Pincha aquí 👇", cta_inter)
@@ -211,7 +216,6 @@ async def _recover_pending() -> None:
     now = datetime.now(timezone.utc)
 
     async with async_session() as session:
-        # Mensajes muy antiguos que nadie pudo recuperar
         await session.execute(
             update(MessageRecord)
             .where(
@@ -221,7 +225,6 @@ async def _recover_pending() -> None:
             .values(status=RETRYABLE_EXHAUSTED_STATUS)
         )
 
-        # Seleccionar candidatos con backoff y límite de reintentos
         rows = (
             await session.execute(
                 select(MessageRecord)
@@ -240,7 +243,6 @@ async def _recover_pending() -> None:
             )
         ).scalars().all()
 
-        # Registrar que vamos a intentarlos
         for row in rows:
             row.retries = (row.retries or 0) + 1
             row.last_attempted_at = now
@@ -250,7 +252,7 @@ async def _recover_pending() -> None:
         msg = WhatsAppMessage(
             message_id=row.whatsapp_message_id,
             phone_number_id=row.phone_number_id,
-            customer_phone=row.customer_phone,
+            customer_phone=_normalize_phone(row.customer_phone),
             message_type=row.message_type,
             text=row.content,
             timestamp="",
@@ -265,7 +267,6 @@ async def _recover_pending() -> None:
             except Exception as exc:
                 logger.exception("Reaper: sigue fallando %s", row.whatsapp_message_id)
 
-                # Errores no recuperables (bugs de código) van directo a dead_letter
                 if not _is_retryable(exc):
                     await _mark_dead_letter(
                         row.id,

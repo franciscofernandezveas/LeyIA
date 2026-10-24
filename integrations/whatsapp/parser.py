@@ -1,4 +1,4 @@
-from .normalizer import WhatsAppMessage
+from .normalizer import WhatsAppMessage, _normalize_phone
 
 
 def _extract_content(msg: dict) -> tuple[str | None, str | None]:
@@ -32,17 +32,23 @@ def parse_webhook_payload(payload: dict) -> list[WhatsAppMessage]:
                 continue
 
             phone_number_id = value.get("metadata", {}).get("phone_number_id", "")
-            contacts = {c["wa_id"]: c for c in value.get("contacts", [])}
+            # Normalizamos wa_id también, por si Meta envía formatos distintos
+            contacts = {
+                _normalize_phone(c["wa_id"]): c
+                for c in value.get("contacts", [])
+            }
 
             for msg in value["messages"]:
                 msg_type = msg.get("type", "unknown")
-                contact = contacts.get(msg.get("from", ""), {})
+                from_raw = msg.get("from", "")
+                from_norm = _normalize_phone(from_raw)
+                contact = contacts.get(from_norm, {})
                 text, interactive_id = _extract_content(msg)
 
                 messages.append(WhatsAppMessage(
                     message_id=msg["id"],
                     phone_number_id=phone_number_id,
-                    customer_phone=msg.get("from", ""),
+                    customer_phone=from_norm,
                     customer_name=contact.get("profile", {}).get("name"),
                     message_type=msg_type,
                     text=text,
