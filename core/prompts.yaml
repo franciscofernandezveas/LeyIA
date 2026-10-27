@@ -325,10 +325,7 @@ atencion:
   #  en booking requiere código. El gate real vive en la ficha de intake.)
   agenda_inicio_aviso: |
     Para agendar su asesoría usaré su nombre, correo y teléfono solo para
-    gestionar su cita y su seguimiento, conforme a nuestra política de
-    privacidad (https://www.manzzo.cl/privacidad). Puede ejercer sus
-    derechos de acceso, rectificación y cancelación escribiendo a
-    privacidad@manzzo.cl.
+    gestionar su cita y su seguimiento.
 
   agenda_pedir_nombre: "Indíqueme su nombre completo para dejarlo registrado en la asesoría:"
 
@@ -672,10 +669,7 @@ classification:
 # ----------------------------------------------------------------------------
 intake:
 
-  apertura_ia: |
-    Hola, soy LeyIA, la asistente virtual de Manzzo y Cía: un sistema
-    automatizado, no una persona. Estoy aquí para escucharle, ayudarle a
-    ordenar su caso y dejarlo preparado para nuestro equipo.
+  
 
   apertura_expectativa: |
     Le haré unas preguntas breves (unos 2 minutos) para registrar su caso

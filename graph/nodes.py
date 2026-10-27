@@ -1,5 +1,20 @@
 """graph/nodes.py — Nodos transversales del agente (Manzzo y Cía).
 
+v22.2 — FIX reapertura de hilos cerrados + hidratación cruzada:
+  - Añade _hidratar_contacto para reconstruir nombre/email desde el historial
+    completo (no solo el turno actual), eliminando la "amnesia" al pasar de
+    booking/intake a handoff y viceversa.
+  - _hidratar_contacto alimenta tanto intake_respuestas como lead_nombre/
+    lead_email, para que booking (que lee lead_*) no repregunte datos ya
+    capturados en otros flujos.
+  - analyze_sentiment reabre hilos cerrados explícitamente ante humano o CTA
+    agendar, limpiando `closed`/`intake_exit` y evitando que handoff_humano
+    caiga en la rama de hilo cerrado sin escalar.
+  - Reapertura por clasificador para rutas accionables; FAQ/fuera_dominio NO
+    reabren el hilo (evita re-escalamientos por pings pasivos).
+  - handoff_humano hidrata y notifica con nombre/email reales, y persiste la
+    hidratación en el checkpoint para turnos posteriores.
+
 v22.1 — FIX salida de booking ante humano/crisis:
   - Agrega _pide_humano_explicito para detectar rechazo de la IA o pedido
     de persona en medio del flujo de agendamiento.
@@ -110,6 +125,14 @@ AGENDA_CAPTURA_TTL_HORAS = int(os.getenv("AGENDA_CAPTURA_TTL_HORAS", "2"))
 
 _AGENDAR_CTA = ("agendar una hora", "agendar", "agendar ahora",
                 "agendar hora", "quiero agendar", "quiero agendar una hora")
+
+# Rutas que, si el hilo estaba cerrado, justifican reabrirlo (intención
+# accionable). ROUTE_FAQ y ROUTE_FUERA_DOMINIO NO reabren: son pings pasivos
+# y reabrir duplicaría notificaciones al equipo sin información nueva.
+_RUTAS_REAPERTURA = (
+    ROUTE_AGENDAR, ROUTE_INTAKE,
+    ROUTE_HANDOFF, ROUTE_HANDOFF_CHOICE, ROUTE_CRISIS,
+)
 
 # Aceptaciones sueltas que, solas, no bastan para confirmar agendamiento.
 _ACEPTACIONES_AMBIGUAS = (
@@ -237,6 +260,66 @@ def _precaptura_contacto(state: AgentState) -> dict | None:
     return resp if resp != (state.get("intake_respuestas") or {}) else None
 
 
+def _hidratar_contacto(state: AgentState) -> dict | None:
+    """Reconstruye datos de contacto desde TODAS las fuentes del hilo.
+
+    Alimenta tanto intake_respuestas (handoff/intake) como lead_nombre/
+    lead_email (booking), sin pisar datos válidos existentes.
+
+    Orden de prioridad:
+      1. intake_respuestas ya existentes
+      2. canal canónico `contacto` / campos lead_* (memoria larga)
+      3. regex (_NOMBRE_RE / _EMAIL_BUSCA) sobre el historial humano completo
+         (state["messages"] sobrevive a RESET_BOOKING vía add_messages)
+
+    Devuelve un dict de updates solo si hay novedades (checkpoint limpio).
+    """
+    resp = dict(state.get("intake_respuestas") or {})
+    contacto = state.get("contacto") or {}
+    updates: dict = {}
+
+    # 1) intake_respuestas: memoria corta del flujo actual
+    if "nombre" not in resp:
+        if n := (contacto.get("nombre") or state.get("lead_nombre")):
+            resp["nombre"] = n
+    if "email" not in resp:
+        if e := (contacto.get("email") or state.get("lead_email")):
+            resp["email"] = e
+
+    # 2) lead_*: memoria larga que booking lee directamente.
+    #    Solo se escriben si faltan; nunca se sobrescriben.
+    if not state.get("lead_nombre") and resp.get("nombre"):
+        updates["lead_nombre"] = resp["nombre"]
+    if not state.get("lead_email") and resp.get("email"):
+        updates["lead_email"] = resp["email"]
+
+    # 3) Fallback al historial humano si aún falta algo
+    if "nombre" not in resp or "email" not in resp:
+        for m in reversed(state.get("messages", [])):
+            if m.type != "human":
+                continue
+            txt = m.content if isinstance(m.content, str) else str(m.content)
+            if "nombre" not in resp and (mm := _NOMBRE_RE.search(txt)):
+                palabras = mm.group(1).split()
+                if len(palabras) >= 2:
+                    resp["nombre"] = " ".join(p.capitalize() for p in palabras)
+            if "email" not in resp and (mm := _EMAIL_BUSCA.search(txt)):
+                resp["email"] = mm.group(0).lower().replace(" ", "")
+            if "nombre" in resp and "email" in resp:
+                break
+
+    # Recalcular lead_* tras parsear historial
+    if not state.get("lead_nombre") and resp.get("nombre"):
+        updates["lead_nombre"] = resp["nombre"]
+    if not state.get("lead_email") and resp.get("email"):
+        updates["lead_email"] = resp["email"]
+
+    if resp != (state.get("intake_respuestas") or {}):
+        updates["intake_respuestas"] = resp
+
+    return updates if updates else None
+
+
 def receive_message(state: AgentState) -> AgentState:
     last_human = next(
         (m for m in reversed(state.get("messages", [])) if m.type == "human"), None
@@ -285,15 +368,34 @@ def analyze_sentiment(state: AgentState) -> AgentState:
             "clf_reason": "crisis: señal de riesgo vital detectada (0-LLM)",
         }
 
-    # Hilos cerrados: solo el CTA exacto post-intake va a agendar.
-    # Cualquier otro mensaje se reclasifica por el LLM, evitando derivar
-    # forzosamente a humano cuando el cliente vuelve con una consulta nueva.
+    # Hilos cerrados: una intención explícita y accionable REABRE el hilo.
+    # Bug corregido: antes se ruteaba sin limpiar `closed` → handoff_humano
+    # caía en la rama "Hilo cerrado" (sin escalar) e intake repreguntaba
+    # datos ya dictados en flujos previos.
     if state.get("closed"):
-        if state.get("intake_completado") \
-                and _norm_simple(query) in _AGENDAR_CTA:
-            return {"route": ROUTE_AGENDAR,
-                    "clf_reason": "CTA agendar post-intake completado (0 LLM)"}
-        # NO retornar ROUTE_HANDOFF por defecto; continuar con clasificación.
+        if _pide_humano_explicito(query):
+            pre = _hidratar_contacto(state)
+            logger.info("[sesión] hilo cerrado reabierto: humano explícito")
+            return {
+                "route": ROUTE_HANDOFF_CHOICE,
+                "closed": False,
+                "intake_exit": None,
+                "crisis": False,  # una crisis ya escalada no debe repetirse
+                **({} if pre is None else pre),
+                "clf_reason": "reapertura: humano explícito en hilo cerrado (0 LLM)",
+            }
+        if _norm_simple(query) in _AGENDAR_CTA:
+            pre = _hidratar_contacto(state)
+            logger.info("[sesión] hilo cerrado reabierto: CTA agendar")
+            return {
+                "route": ROUTE_AGENDAR,
+                "closed": False,
+                "intake_exit": None,
+                **({} if pre is None else pre),
+                "clf_reason": "reapertura: CTA agendar en hilo cerrado (0 LLM)",
+            }
+        # Otro mensaje: reclasificar. Si la ruta final es accionable, el
+        # retorno general (más abajo) reabrirá; FAQ / fuera_dominio no reabren.
 
     en_booking = bool(state.get("booking_stage"))
     en_intake = bool(state.get("intake_activo")) and not state.get("intake_completado")
@@ -326,11 +428,11 @@ def analyze_sentiment(state: AgentState) -> AgentState:
                     "clf_reason": "handoff_choice → ficha breve (0 LLM)",
                 }
             if eleccion == "directo":
-                pre = _precaptura_contacto(state)
+                pre = _hidratar_contacto(state)
                 return {
                     "route": ROUTE_HANDOFF,
                     **RESET_HANDOFF_CHOICE,
-                    **({} if pre is None else {"intake_respuestas": pre}),
+                    **({} if pre is None else pre),
                     "clf_reason": "handoff_choice → contacto directo (0 LLM)",
                 }
             # Respuesta ambigua: dejamos que el LLM decida y re-preguntemos.
@@ -441,12 +543,19 @@ def analyze_sentiment(state: AgentState) -> AgentState:
 
     contacto_updates = {} if (pre := _precaptura_contacto(state)) is None else {"intake_respuestas": pre}
 
+    was_closed = bool(state.get("closed"))
+    reabrir = was_closed and route in _RUTAS_REAPERTURA
+    if reabrir:
+        logger.info("[sesión] hilo cerrado reabierto por clasificador → %s",
+                    route)
+
     return {
         "sentiment": result.sentiment, "urgency": result.urgency,
         "intent": result.intent, "category": result.category,
         "case_category": case_category,
         "clf_reason": reason, "route": route,
         "crisis": crisis or state.get("crisis"),
+        "closed": False if reabrir else state.get("closed", False),
         **contacto_updates,
         **reset,
     }
@@ -542,7 +651,7 @@ def preguntar_preferencia_handoff(state: AgentState) -> AgentState:
     Es defensivo: si faltan las plantillas en config, usa un fallback
     hardcodeado para evitar crash en producción."""
     atn = _cfg()["atencion"]
-    pre = _precaptura_contacto(state)
+    pre = _hidratar_contacto(state)
 
     # v22: fallback de usted, sin emojis, coherente con la voz del sistema.
     fallback_default = (
@@ -585,7 +694,7 @@ def preguntar_preferencia_handoff(state: AgentState) -> AgentState:
         },
         "handoff_choice_pending": True,
         "handoff_choice_en": _ahora_iso(),
-        **({} if pre is None else {"intake_respuestas": pre}),
+        **({} if pre is None else pre),
         "messages": [AIMessage(content=response)],
     }
 
@@ -675,14 +784,23 @@ def handoff_humano(state: AgentState) -> AgentState:
                 "response_interactive": None,
                 "messages": [AIMessage(content=response)]}
 
+    # Consolidar datos ANTES de resumir y notificar: el lead pudo venir de
+    # booking, de una sesión anterior o solo existir en el historial. El
+    # resumen LLM también debe verlos.
+    pre = _hidratar_contacto(state)
+    respuestas = dict(state.get("intake_respuestas") or {})
+    if pre is not None:
+        respuestas.update(pre.get("intake_respuestas", {}))
+    state_para_resumen = {**state, "intake_respuestas": respuestas}
+
     try:
         summary_prompt = ChatPromptTemplate.from_messages([
             ("system", atn["summary_system_prompt"]),
             ("human", "{transcript}"),
         ])
         summary = (summary_prompt | LLM).invoke(
-            {"transcript": _ficha_intake(state) + "CONVERSACIÓN:\n"
-                         + _transcript_resumen(state)}
+            {"transcript": _ficha_intake(state_para_resumen) + "CONVERSACIÓN:\n"
+                         + _transcript_resumen(state_para_resumen)}
         ).content
     except Exception as e:
         logger.exception("LLM de resumen falló: %s", e)
@@ -691,16 +809,14 @@ def handoff_humano(state: AgentState) -> AgentState:
     upsert_conversation(thread_id=tid, status="escalado",
                         summary=summary, closed=True)
 
-    respuestas = state.get("intake_respuestas") or {}
     if respuestas.get("consentimiento_datos") is True:
-                upsert_lead(
+        upsert_lead(
             thread_id=tid,
             intake_respuestas=respuestas,
             category=state.get("case_category") or state.get("category"),
             completed=bool(state.get("intake_completado")),
             notificar_crm=False,   # handoff_humano notifica vía insert_escalation
         )
-
 
     motivo = "hablar_abogada" if state.get("intake_completado") else "contacto_directo"
     notificacion_ok = insert_escalation(
@@ -714,12 +830,18 @@ def handoff_humano(state: AgentState) -> AgentState:
 
     telefono = _telefono_cliente(state)
     wa_link = _wa_link_cliente(state)
+    contacto = state.get("contacto") or {}
     nombre = respuestas.get("nombre") or state.get("lead_nombre") or "Sin nombre"
+    email = respuestas.get("email") or contacto.get("email") or "No disponible"
+    modalidad = (contacto.get("modalidad_preferida")
+                 or respuestas.get("modalidad_preferida") or "—")
     categoria_final = state.get("case_category") or state.get("category") or "otro"
     email_body = f"""
     <h3>Nuevo lead derivado — Manzzo y Cía</h3>
     <p><b>Thread ID:</b> {tid}</p>
     <p><b>Nombre:</b> {nombre}</p>
+    <p><b>Email:</b> {email}</p>
+    <p><b>Modalidad preferida:</b> {modalidad}</p>
     <p><b>Teléfono:</b> {telefono or 'No disponible'}</p>
     <p><b>Categoría:</b> {categoria_final}</p>
     <p><b>Urgencia:</b> {state.get('urgency', 'media')}</p>
@@ -741,7 +863,7 @@ def handoff_humano(state: AgentState) -> AgentState:
     except Exception as e:
         logger.exception("SheetDB (fallback) falló: %s", e)
 
-        # v21.3 — FIX #11 (auditoría): matching contra IntakeExitLabel.
+    # v21.3 — FIX #11 (auditoría): matching contra IntakeExitLabel.
     # Se eliminan "booking" y "agendar" (nunca emitidos; eran código
     # defensivo sin origen). "cta_cierre" se añade explícitamente: hoy
     # queda cubierto también por intake_completado=True, pero hacerlo
@@ -755,6 +877,7 @@ def handoff_humano(state: AgentState) -> AgentState:
             "summary": summary, "closed": True,
             "notificacion_pendiente": not (notificacion_ok or email_ok),
             "intake_exit": None,
+            **({} if pre is None else pre),
         }
 
     response = atn["handoff_message"].format(
@@ -769,4 +892,5 @@ def handoff_humano(state: AgentState) -> AgentState:
         "summary": summary, "closed": True,
         "notificacion_pendiente": not (notificacion_ok or email_ok),
         "messages": [AIMessage(content=response)],
+        **({} if pre is None else pre),
     }

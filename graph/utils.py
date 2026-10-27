@@ -8,7 +8,7 @@ v1.8 — FIX prefijo wa-:
     e integrations/whatsapp/handler.py.
 
 v1.7 — FIX crisis:
-  - RESET_SESION_NUEVA incluye "crisis": None para que el flag de crisis no
+  - RESET_SESION_NUEVA incluye "crisis": False para que el flag de crisis no
     sobreviva entre sesiones de conversación distintas (gatekeeper de
     receive_message).
 """
@@ -86,7 +86,7 @@ RESET_SESION_NUEVA = {
     "notificacion_pendiente": False,
     "case_category": None,
     "cta_agenda_ofrecida": False,
-    "crisis": None,                    # v1.7: no sobrevive entre sesiones
+    "crisis": False,                   # v1.7: no sobrevive entre sesiones
     **RESET_INTAKE,
     **RESET_HANDOFF_CHOICE,
     **RESET_BOOKING,
@@ -248,7 +248,7 @@ def _wa_texto_intake(state: dict) -> str:
 
 
 def _wa_link_diagnostico(state: dict) -> str:
-    return _wa_link_display(_wa_texto_intake(state), display="Hablar con un humano")
+    return _wa_link_display(_wa_texto_intake(state), display="Habler con un humano")
 
 
 def _wa_link_cliente(state: dict) -> str:

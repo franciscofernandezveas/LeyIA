@@ -1,5 +1,10 @@
 """graph/intake/nodes.py — Acciones del sub-agente INTAKE.
 
+v18.1 — FIX lead_* en estado:
+  - intake ahora copia nombre/email capturados a lead_nombre/lead_email
+    (memoria larga del hilo) en todas las salidas del subgrafo. Booking
+    lee lead_* directamente y así no repregunta datos ya dados en la ficha.
+
 v18 — Fix "saltar" en campos opcionales:
   - Detección robusta de intención de salto (no solo coincidencia exacta).
   - Campos opcionales saltados se registran como None y el intake avanza.
@@ -685,6 +690,21 @@ def _aplicar_extraccion(respuestas: dict, decision: dict,
                         qid, raw, err)
 
 
+def _lead_updates(respuestas: dict) -> dict:
+    """Copia nombre/email capturados en intake a lead_nombre/lead_email.
+
+    Booking y handoff_humano leen estos canales como memoria larga del
+    lead, por lo que es crítico sincronizarlos al salir del intake.
+    No sobrescribe si ya existen.
+    """
+    updates = {}
+    if respuestas.get("nombre"):
+        updates["lead_nombre"] = respuestas["nombre"]
+    if respuestas.get("email"):
+        updates["lead_email"] = respuestas["email"]
+    return updates
+
+
 def _persistir_parcial(state: AgentState, respuestas: dict) -> None:
     if respuestas.get("consentimiento_datos") is not True:
         return
@@ -702,8 +722,7 @@ def _persistir_parcial(state: AgentState, respuestas: dict) -> None:
 def _texto_ficha_wa(respuestas: dict, thread_id: str,
                     categoria: str) -> str:
     """Ficha comprimida para el wa.me. v17: la categoría llega por parámetro
-    (antes se leía de respuestas, donde nunca existió → siempre decía
-    'consulta_general')."""
+    (antes se leía de respuestas, donde nunca existió → "consulta_general")."""
     nombre = respuestas.get("nombre") or ""
     email = respuestas.get("email") or ""
     telefono = respuestas.get("telefono") or ""
@@ -794,8 +813,6 @@ def iniciar_ficha(state: AgentState) -> AgentState:
         "intake_attempts": 0,
         "intake_exit": None,
         "intake_resume": False,
-        "intake_started_en": _ahora_iso(),
-        "intake_completado": False,
         "intake_decision": None,
         "intake_stage": "preguntando",
         "intake_oferta_qid": None,
@@ -984,6 +1001,7 @@ def _completar_ficha(state: AgentState, respuestas: dict,
         "intake_stage": "completado",
         "intake_oferta_qid": None,
         "intake_skipped": skipped or set(),
+        **_lead_updates(respuestas),
     }
 
 
@@ -1109,6 +1127,7 @@ def _derivar_parcial(state: AgentState, respuestas: dict,
         "intake_decision": None,
         "intake_oferta_qid": None,
         "intake_skipped": skipped or set(),
+        **_lead_updates(respuestas),
     }
 
 
@@ -1159,6 +1178,7 @@ def _derivar_urgente(state: AgentState, respuestas: dict,
         "intake_decision": None,
         "intake_oferta_qid": None,
         "intake_skipped": skipped or set(),
+        **_lead_updates(respuestas),
     }
 
 
@@ -1194,6 +1214,7 @@ def abandonar_ficha(state: AgentState) -> AgentState:
         "intake_oferta_qid": None,
         "closed": True,
         "intake_skipped": skipped,
+        **_lead_updates(respuestas),
     }
 
 
@@ -1227,4 +1248,5 @@ def sin_consentimiento(state: AgentState, respuestas: dict | None = None) -> Age
         "intake_oferta_qid": None,
         "closed": True,
         "intake_skipped": skipped,
+        **_lead_updates(respuestas or {}),
     }
