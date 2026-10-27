@@ -40,11 +40,14 @@ from urllib.parse import quote
 from core.contracts import EMAIL_RE, AgentState
 from core.db_client import upsert_conversation, upsert_lead
 from graph.intake.utils import _evento_intake, _pack
+
+
 from graph.utils import (
     RESET_INTAKE,
-    _ahora_iso, _cfg, _guardar_ai, _primer_nombre, _recent_messages,
+    _ahora_iso, _cfg, _ejecutiva_number, _guardar_ai, _primer_nombre, _recent_messages,
     _telefono_cliente, _wa_link, _wa_link_diagnostico, _wa_link_display,
 )
+
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +160,6 @@ DEFAULT_URGENTE = (
 )
 
 # Número de la ejecutiva para el CTA wa.me (override vía env var).
-WA_EJECUTIVA = os.getenv("WA_EJECUTIVA", "56942313989")
 
 
 def _sin_tildes(s: str) -> str:
@@ -767,7 +769,7 @@ def _cta_humano_con_ficha(respuestas: dict, thread_id: str,
                           categoria: str) -> dict:
     """CTA URL 'Pincha aquí' que abre wa.me con la ficha prellenada."""
     texto = _texto_ficha_wa(respuestas, thread_id, categoria)
-    url = f"https://wa.me/{WA_EJECUTIVA}?text={quote(texto)}"
+    url = f"https://wa.me/{_ejecutiva_number()}?text={quote(texto)}"
     return {
         "text": DEFAULT_CIERRE_CTA,
         "interactive": {
@@ -776,6 +778,7 @@ def _cta_humano_con_ficha(respuestas: dict, thread_id: str,
             "url": url,
         },
     }
+
 
 
 def iniciar_ficha(state: AgentState) -> AgentState:
