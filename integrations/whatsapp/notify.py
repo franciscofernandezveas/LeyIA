@@ -95,7 +95,7 @@ def _send_template(to: str, titulo: str, detalle: str) -> bool:
         "type": "template",
         "template": {
             "name": template,
-            "language": {"code": os.getenv("NOTIFY_TEMPLATE_LANG", "es")},
+            "language": {"code": os.getenv("NOTIFY_TEMPLATE_LANG", "es_CL")},
             "components": [{
                 "type": "body",
                 "parameters": [
