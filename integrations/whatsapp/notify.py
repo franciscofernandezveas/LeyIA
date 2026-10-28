@@ -34,20 +34,6 @@ def _clip(text, limit: int = 900) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
-def _template_param(text, limit: int = 900) -> str:
-    """Sanitiza un parámetro de plantilla WhatsApp.
-
-    Meta rechaza newlines, tabs y más de 4 espacios consecutivos en los
-    parámetros de tipo text (error #132018).
-    """
-    text = (text or "").strip()
-    text = text.replace("\n", " ").replace("\t", " ")
-    # Colapsar espacios múltiples
-    while "  " in text:
-        text = text.replace("  ", " ")
-    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
-
-
 def _wa_cliente(telefono: str | None) -> str:
     t = (telefono or "").replace("+", "").strip()
     return f"\n💬 Contactar: https://wa.me/{t}" if t else ""
@@ -90,53 +76,36 @@ def _post(payload: dict) -> tuple[bool, int | None]:
         except Exception:
             pass
         logger.error("[notify] WA %s (code=%s, msg_id=%s): %s",
-                     r.status_code, code, msg_id, r.text[:300])
+                     r.status_code, code, msg_id, r.text[:500])
         return False, code
     except Exception:
         logger.exception("[notify] falló el POST a %s (type=%s)", to, msg_type)
         return False, None
 
 
-def _build_template_payload(to: str, template: str, lang: str,
-                            titulo: str, detalle: str) -> dict:
-    return {
+def _send_text(to: str, body: str) -> tuple[bool, int | None]:
+    return _post({
         "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to,
+        "type": "text",
+        "text": {"body": body},
+    })
+
+
+def _send_static_template(to: str, template: str, lang: str = "es_CL") -> bool:
+    """Template sin variables. Solo abre la ventana de 24h."""
+    logger.info("[notify] abriendo ventana 24h con template estático '%s'", template)
+    ok, _ = _post({
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
         "to": to,
         "type": "template",
         "template": {
             "name": template,
-            "language": {"code": lang},
-            "components": [{
-                "type": "body",
-                "parameters": [
-                    {"type": "text", "text": _template_param(titulo, 60)},
-                    {"type": "text", "text": _template_param(detalle, 900)},
-                ],
-            }],
+            "language": {"code": lang, "policy": "deterministic"},
         },
-    }
-
-
-def _send_template(to: str, titulo: str, detalle: str) -> bool:
-    template = os.getenv("NOTIFY_TEMPLATE", "").strip()
-    if not template:
-        logger.error("[notify] rechazado por ventana 24h y NOTIFY_TEMPLATE no configurada")
-        return False
-
-    # FIX: tu template leyia_alerta_interna está creado en Meta como
-    # "Spanish (CHL)" → language code = es_CL. Muchos .env tenían "es"
-    # heredado, lo que provocaba 404 (#132001). Se fuerza es_CL.
-    lang = "es_CL"
-    logger.info("[notify] enviando plantilla '%s' a %s | lang=%s | titulo=%s",
-                template, to, lang, titulo)
-
-    ok, code = _post(_build_template_payload(to, template, lang, titulo, detalle))
-
-    # Fallback defensivo: si es_CL no existe, intentar con es genérico.
-    if not ok and code == 132001:
-        logger.warning("[notify] %s no existe en %s; reintentando con es", template, lang)
-        ok, _ = _post(_build_template_payload(to, template, "es", titulo, detalle))
-
+    })
     return ok
 
 
@@ -147,8 +116,28 @@ def _send_alert(titulo: str, body: str) -> bool:
         return False
 
     logger.info("[notify] alerta '%s' → %s", titulo, to)
-    return _send_template(to, titulo, body)
 
+    # Intento 1: texto plano (más rico: emojis, saltos de línea, links)
+    ok, code = _send_text(to, f"*{titulo}*\n\n{body}")
+    if ok:
+        return True
+
+    # Intento 2: si la ventana está cerrada, abrirla con template estático
+    # y reenviar el texto con los detalles.
+    if code in _TEMPLATE_FALLBACK_CODES:
+        template = os.getenv("NOTIFY_TEMPLATE", "").strip()
+        if not template:
+            logger.error("[notify] ventana cerrada y NOTIFY_TEMPLATE no configurada")
+            return False
+
+        logger.info("[notify] texto rechazado por ventana 24h → usando template estático")
+        if _send_static_template(to, template):
+            # Reintentar el texto ahora que la ventana debería estar abierta
+            ok2, _ = _send_text(to, f"*{titulo}*\n\n{body}")
+            return ok2
+        return False
+
+    return False
 
 
 def notify_new_lead(lead: dict) -> bool:

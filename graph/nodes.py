@@ -1,5 +1,12 @@
 """graph/nodes.py — Nodos transversales del agente (Manzzo y Cía).
 
+v22.3 — FIX: _hidratar_contacto devuelve updates completos
+  - Corrige la regresión de v22.2: _hidratar_contacto vuelve a emitir
+    lead_nombre/lead_email e intake_respuestas, preservando el contrato
+    que consumen handoff_humano y preguntar_preferencia_handoff.
+  - Los nodos llamadores usan el dict completo; handoff_humano extrae
+    intake_respuestas desde pre["intake_respuestas"].
+
 v22.2 — FIX reapertura de hilos cerrados + hidratación cruzada:
   - Añade _hidratar_contacto para reconstruir nombre/email desde el historial
     completo (no solo el turno actual), eliminando la "amnesia" al pasar de
@@ -31,9 +38,8 @@ v22 — FIX "agendar forzado" + crisis + routing cerrado:
     • Guarda anti-ambigüedad: aceptaciones sueltas ("sí", "dale", "ok"...)
       solo rutear a agendamiento si el último mensaje del asistente ofreció
       agendar; si no, se reclasifican a FAQ.
-    • Hilos cerrados: solo el CTA exacto de agendar va a booking; cualquier
-      otro mensaje se reclasifica por el LLM (evita derivar por defecto a
-      humano cuando el cliente vuelve con una consulta nueva).
+    • Hilos cerrados: una intención explícita y accionable REABRE el hilo;
+      FAQ / fuera_dominio no reabren (evita re-escalamientos por pings).
     • Fix merge de resets: TTL de booking conserva resets acumulados
       ({**reset, **RESET_BOOKING}).
   - handoff_humano:
@@ -108,7 +114,7 @@ from core.llm import LLM, with_structured_output
 from core.notifications import notificar_email
 from graph.utils import (
     RESET_BOOKING, RESET_HANDOFF_CHOICE, RESET_INTAKE, RESET_SESION_NUEVA,
-    _ahora_iso, _cfg, _expirado, _ficha_intake, _format_few_shots,
+    _ahora_iso, _apertura_pres, _cfg, _expirado, _ficha_intake, _format_few_shots,
     _guardar_ai, _norm_simple, _persist_escalation,
     _primer_nombre, _recent_messages, _telefono_cliente,
     _transcript_resumen, _upsert_conversacion_abierta, _wa_link_cliente,
@@ -488,7 +494,7 @@ def analyze_sentiment(state: AgentState) -> AgentState:
 
     route = compute_route(result)
     reason = result.reason
-    crisis = _es_crisis_clasificador(result)
+    crisis = _es_crisis_clasificador(result) or result.riesgo
 
     # 1) Crisis semántica gana sobre intake activo y handoff_choice pendiente.
     if crisis:
@@ -676,8 +682,7 @@ def preguntar_preferencia_handoff(state: AgentState) -> AgentState:
             key,
         )
 
-    disclosure = atn.get("disclosure", "Soy LeyIA, la asistente virtual de Manzzo y Cía.")
-    response = template.format(disclosure=disclosure)
+    response = template.format(apertura=_apertura_pres(state))
 
     _guardar_ai(state, response)
     return {
@@ -694,6 +699,7 @@ def preguntar_preferencia_handoff(state: AgentState) -> AgentState:
         },
         "handoff_choice_pending": True,
         "handoff_choice_en": _ahora_iso(),
+        "asistente_presentado": True,
         **({} if pre is None else pre),
         "messages": [AIMessage(content=response)],
     }
@@ -701,11 +707,15 @@ def preguntar_preferencia_handoff(state: AgentState) -> AgentState:
 
 def respuesta_fuera_dominio(state: AgentState) -> AgentState:
     atn = _cfg()["atencion"]
-    response = atn["fuera_dominio_message"].format(disclosure=atn["disclosure"])
+    response = atn["fuera_dominio_message"].format(apertura=_apertura_pres(state))
     _guardar_ai(state, response)
-    return {"response": response, "response_bubbles": [response],
-            "response_interactive": None,
-            "messages": [AIMessage(content=response)]}
+    return {
+        "response": response,
+        "response_bubbles": [response],
+        "response_interactive": None,
+        "messages": [AIMessage(content=response)],
+        "asistente_presentado": True,
+    }
 
 
 def handoff_humano(state: AgentState) -> AgentState:
@@ -881,7 +891,7 @@ def handoff_humano(state: AgentState) -> AgentState:
         }
 
     response = atn["handoff_message"].format(
-        disclosure=atn["disclosure"],
+        apertura=_apertura_pres(state),
         whatsapp_ejecutiva=_wa_link_cliente(state),
         thread_id=tid,
     )
@@ -892,5 +902,6 @@ def handoff_humano(state: AgentState) -> AgentState:
         "summary": summary, "closed": True,
         "notificacion_pendiente": not (notificacion_ok or email_ok),
         "messages": [AIMessage(content=response)],
+        "asistente_presentado": True,
         **({} if pre is None else pre),
     }

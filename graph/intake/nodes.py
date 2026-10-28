@@ -1,5 +1,11 @@
 """graph/intake/nodes.py — Acciones del sub-agente INTAKE.
 
+v18.2 — Fix saludos reiterados:
+  - iniciar_ficha gatea la burbuja de apertura con `_apertura_pres` para no
+    volver a presentarse si el asistente ya lo hizo en el hilo.
+  - DEFAULT_AP_IA pasa a voz LeyIA (usted, sin emojis) como fallback seguro.
+  - Todos los nodos emisores de burbujas levantan `asistente_presentado=True`.
+
 v18.1 — FIX lead_* en estado:
   - intake ahora copia nombre/email capturados a lead_nombre/lead_email
     (memoria larga del hilo) en todas las salidas del subgrafo. Booking
@@ -44,8 +50,9 @@ from graph.intake.utils import _evento_intake, _pack
 
 from graph.utils import (
     RESET_INTAKE,
-    _ahora_iso, _cfg, _ejecutiva_number, _guardar_ai, _primer_nombre, _recent_messages,
-    _telefono_cliente, _wa_link, _wa_link_diagnostico, _wa_link_display,
+    _ahora_iso, _apertura_pres, _cfg, _ejecutiva_number, _guardar_ai,
+    _primer_nombre, _recent_messages, _telefono_cliente, _wa_link,
+    _wa_link_diagnostico, _wa_link_display,
 )
 
 
@@ -122,9 +129,7 @@ _URGENTE_RE = re.compile(
     re.IGNORECASE,
 )
 
-DEFAULT_AP_IA = ("👋 ¡Hola! Soy el *asistente virtual* de Manzzo y Cía — "
-                 "un sistema automatizado, no una persona, pero estoy aquí "
-                 "para ayudarte.")
+DEFAULT_AP_IA = "Soy LeyIA, la asistente virtual de Manzzo y Cía. "
 DEFAULT_AP_EXP = ("Te haré unas preguntas rápidas (unos 2 minutos) para "
                 "preparar tu caso.\nEn cualquier momento puedes hacer una "
                 "pregunta, pedir *hablar con una persona* o escribir "
@@ -799,8 +804,13 @@ def iniciar_ficha(state: AgentState) -> AgentState:
     pend = _pendientes(state, respuestas)
     q0 = pend[0]
 
-    burbujas = [
-        sec.get("apertura_ia") or (sec.get("apertura") or DEFAULT_AP_IA),
+    # Solo presentarnos si el asistente aún no lo hizo en este hilo
+    burbujas = []
+    apertura_txt = _apertura_pres(state)
+    if apertura_txt:
+        burbujas.append(sec.get("apertura_ia") or sec.get("apertura") or DEFAULT_AP_IA)
+
+    burbujas += [
         sec.get("apertura_expectativa") or DEFAULT_AP_EXP,
         _form_pregunta(state, q0, respuestas),
     ]
@@ -820,6 +830,7 @@ def iniciar_ficha(state: AgentState) -> AgentState:
         "intake_stage": "preguntando",
         "intake_oferta_qid": None,
         "intake_skipped": skipped,
+        "asistente_presentado": True,
     }
 
 
@@ -849,6 +860,7 @@ def procesar_respuesta(state: AgentState) -> AgentState:
             "intake_attempts": attempts,
             "intake_decision": None,
             "intake_skipped": skipped,
+            "asistente_presentado": True,
         }
 
     error_key = None
@@ -912,6 +924,7 @@ def procesar_respuesta(state: AgentState) -> AgentState:
                 "intake_decision": None,
                 "intake_oferta_qid": q_actual["id"],
                 "intake_skipped": skipped,
+                "asistente_presentado": True,
             }
 
         burbujas = []
@@ -932,6 +945,7 @@ def procesar_respuesta(state: AgentState) -> AgentState:
             "intake_attempts": attempts,
             "intake_decision": None,
             "intake_skipped": skipped,
+            "asistente_presentado": True,
         }
 
     _persistir_parcial(state, respuestas)
@@ -951,6 +965,7 @@ def procesar_respuesta(state: AgentState) -> AgentState:
         "intake_oferta_qid": None,
         "intake_decision": None,
         "intake_skipped": skipped,
+        "asistente_presentado": True,
     }
 
 
@@ -1004,6 +1019,7 @@ def _completar_ficha(state: AgentState, respuestas: dict,
         "intake_stage": "completado",
         "intake_oferta_qid": None,
         "intake_skipped": skipped or set(),
+        "asistente_presentado": True,
         **_lead_updates(respuestas),
     }
 
@@ -1024,6 +1040,7 @@ def pausar_ficha(state: AgentState) -> AgentState:
         "intake_decision": None,
         "intake_oferta_qid": None,
         "intake_skipped": skipped,
+        "asistente_presentado": True,
     }
 
 
@@ -1095,7 +1112,7 @@ def reanudar(state: AgentState) -> AgentState:
     _guardar_ai(state, nuevo["response"])
 
     _evento_intake("intake_reanudado", state, pregunta=q["id"])
-    return {**base, **pack}
+    return {**base, **pack, "asistente_presentado": True}
 
 
 def derivar_parcial(state: AgentState) -> AgentState:
@@ -1130,6 +1147,7 @@ def _derivar_parcial(state: AgentState, respuestas: dict,
         "intake_decision": None,
         "intake_oferta_qid": None,
         "intake_skipped": skipped or set(),
+        "asistente_presentado": True,
         **_lead_updates(respuestas),
     }
 
@@ -1181,6 +1199,7 @@ def _derivar_urgente(state: AgentState, respuestas: dict,
         "intake_decision": None,
         "intake_oferta_qid": None,
         "intake_skipped": skipped or set(),
+        "asistente_presentado": True,
         **_lead_updates(respuestas),
     }
 
@@ -1217,6 +1236,7 @@ def abandonar_ficha(state: AgentState) -> AgentState:
         "intake_oferta_qid": None,
         "closed": True,
         "intake_skipped": skipped,
+        "asistente_presentado": True,
         **_lead_updates(respuestas),
     }
 
@@ -1251,5 +1271,6 @@ def sin_consentimiento(state: AgentState, respuestas: dict | None = None) -> Age
         "intake_oferta_qid": None,
         "closed": True,
         "intake_skipped": skipped,
+        "asistente_presentado": True,
         **_lead_updates(respuestas or {}),
     }

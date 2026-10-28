@@ -1,5 +1,15 @@
 """graph/utils.py — Helpers transversales del grafo padre e intake.
 
+v1.9 — FIX saludos reiterados + bug riesgo + contrato intake_skipped:
+  - Añade `_apertura_pres` para que solo la primera respuesta del hilo
+    anteponga el disclosure.
+  - Actualiza TEMPLATE_ARGS para validar los nuevos placeholders
+    `{apertura}` e `{instruccion_apertura}` de prompts.yaml v4.2.3.
+  - RESET_SESION_NUEVA incluye `asistente_presentado: False` (una
+    presentación por sesión).
+  - RESET_INTAKE incluye `intake_skipped: set()` (ahora canal declarado).
+  - `_format_few_shots` ahora incluye la etiqueta `riesgo`.
+
 v1.8 — FIX prefijo wa-:
   - _canal_desconocido reconoce "wa-" como canal whatsapp.
   - _telefono_cliente extrae el número de "wa-56912345678".
@@ -54,6 +64,7 @@ RESET_INTAKE = {
     "intake_started_en": None,
     "intake_completado": False,
     "intake_oferta_qid": None,
+    "intake_skipped": set(),      # ← v1.9: canal ahora declarado en AgentState
 }
 
 RESET_HANDOFF_CHOICE = {
@@ -87,6 +98,7 @@ RESET_SESION_NUEVA = {
     "case_category": None,
     "cta_agenda_ofrecida": False,
     "crisis": False,                   # v1.7: no sobrevive entre sesiones
+    "asistente_presentado": False,     # ← v1.9: una presentación por sesión
     **RESET_INTAKE,
     **RESET_HANDOFF_CHOICE,
     **RESET_BOOKING,
@@ -113,9 +125,15 @@ REQUIRED_KEYS = {
 }
 
 TEMPLATE_ARGS = {
-    "atencion.faq_system_prompt": {"disclosure", "tono", "context"},
-    "atencion.fuera_dominio_message": {"disclosure"},
-    "atencion.handoff_message": {"disclosure", "whatsapp_ejecutiva", "thread_id"},
+    "atencion.faq_system_prompt": {"tono", "context",
+                                  "instruccion_apertura"},      # ← v1.9
+    "atencion.fuera_dominio_message": {"apertura"},             # ← v1.9
+    "atencion.handoff_message": {"apertura", "whatsapp_ejecutiva",
+                                 "thread_id"},                  # ← v1.9
+    "atencion.handoff_fallback_message": {"apertura", "whatsapp_ejecutiva",
+                                          "thread_id"},          # ← v1.9
+    "atencion.handoff_choice_message": {"apertura"},              # ← v1.9
+    "atencion.handoff_choice_retry_message": set(),               # ← v1.9
     "atencion.hilo_cerrado_message": {"whatsapp_ejecutiva", "thread_id"},
     "atencion.cta_agendar": set(),
     "atencion.agenda_inicio_aviso": set(),
@@ -131,7 +149,7 @@ TEMPLATE_ARGS = {
     "atencion.agenda_eleccion_ambigua": {"opciones"},
     "atencion.agenda_abortado": set(),
     "atencion.agenda_lateral_system": {"opciones"},
-    "intake.apertura_ia": set(),
+    "intake.apertura_ia": set(),           # ← v1.9
     "intake.apertura_expectativa": set(),
     "intake.aviso_saltar": set(),
     "intake.sin_consentimiento": {"wa_link"},
@@ -141,7 +159,7 @@ TEMPLATE_ARGS = {
     "intake.error_no_saltar": set(),
     "intake.cierre_listo": {"nombre"},
     "intake.cierre_sla": set(),
-    "intake.cierre_ctas": {"wa_link"},
+    "intake.cierre_ctas": set(),            # ← v1.9: plantilla sin placeholders
     "intake.derivacion_parcial": {"wa_link", "nombre"},
     "intake.cierre_abandono": {"wa_link"},
 }
@@ -174,6 +192,21 @@ def _cfg() -> dict:
     if bad:
         raise ValueError("prompts.yaml — placeholders desalineados:\n" + "\n".join(bad))
     return cfg
+
+
+def _apertura_pres(state: dict) -> str:
+    """Texto de apertura (disclosure) si el asistente aún no se presentó.
+
+    Usa el flag asistente_presentado; como defensa adicional, si ya hay
+    mensajes AI en el historial y el flag no está, no saluda.
+    """
+    if state.get("asistente_presentado"):
+        return ""
+    msgs = state.get("messages", [])
+    if any(getattr(m, "type", None) == "ai" for m in msgs):
+        return ""
+    disclosure = _cfg()["atencion"].get("disclosure", "")
+    return (disclosure + " ").strip() if disclosure else ""
 
 
 def _truncar_burbuja(texto: str, max_len: int = WA_TEXTO_MAX) -> str:
@@ -293,7 +326,9 @@ def _format_few_shots(examples: list[dict]) -> str:
     return "\n\n".join(
         f'ENTRADA: "{ex["input"]}"\n'
         f"sentiment={ex['sentiment']} | urgency={ex['urgency']} | "
-        f"intent={ex['intent']} | category={ex['category']} | reason={ex['reason']}"
+        f"intent={ex['intent']} | category={ex['category']} | "
+        f"riesgo={ex.get('riesgo', 'false')} | "     # ← v1.9
+        f"reason={ex['reason']}"
         for ex in examples
     )
 

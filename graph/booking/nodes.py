@@ -1,5 +1,11 @@
 """graph/booking/nodes.py — Acciones del sub-agente BOOKING.
 
+v8.8 — Fix saludos reiterados:
+  - responder_lateral incluye historial y la plantilla prohíbe saludar.
+  - Todos los nodos que emiten burbujas levantan `asistente_presentado=True`
+    para que el FAQ y otros sub-agentes sepan que la identidad ya fue
+    anunciada.
+
 v8.5 — UX horarios: cuando hay interactive nativo (buttons/lista), el mensaje
        de texto solo muestra la introducción; la lista numerada ya no se
        duplica en el cuerpo. Los horarios se leen exclusivamente desde los
@@ -17,7 +23,7 @@ import unicodedata
 from datetime import datetime, timedelta
 
 from langchain_core.messages import AIMessage
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from core.contracts import AgentState, EMAIL_RE, HitlPayload, TipoHITL
 from core.db_client import (
@@ -27,7 +33,7 @@ from core.db_client import (
 from core.llm import LLM
 from graph.utils import (
     RESET_BOOKING,
-    _cfg, _guardar_ai, _parse_dt, _primer_nombre, _telefono_cliente,
+    _cfg, _guardar_ai, _parse_dt, _primer_nombre, _recent_messages, _telefono_cliente,
 )
 from tools.google_calendar import (
     DIRECCION_OFICINA, LeadCalendar, TZ as GCAL_TZ,
@@ -322,7 +328,8 @@ def proponer_slots(state: AgentState) -> AgentState:
             "booking_match": None,
             "booking_match_candidatos": [],
             "booking_attempts": 0,
-            "messages": [AIMessage(content=response)]}
+            "messages": [AIMessage(content=response)],
+            "asistente_presentado": True}
 
 
 # ---------------------------------------------------------------------------
@@ -353,7 +360,8 @@ def pedir_nombre(state: AgentState, _pre: dict | None = None) -> AgentState:
            "response_bubbles": burbujas,
            "response_interactive": None,
            "booking_stage": "captura_nombre",
-           "messages": [AIMessage(content=response)]}
+           "messages": [AIMessage(content=response)],
+           "asistente_presentado": True}
     if aviso:
         # One-shot: se escribe únicamente al emitir. Si aviso es None porque
         # el flag ya estaba levantado, NO se devuelve la clave → se conserva.
@@ -382,7 +390,8 @@ def pedir_email(state: AgentState, _pre: dict | None = None) -> AgentState:
             "response_bubbles": [response],
             "response_interactive": None,
             "booking_stage": "captura_email",
-            "messages": [AIMessage(content=response)]}
+            "messages": [AIMessage(content=response)],
+            "asistente_presentado": True}
 
 
 def pedir_modalidad(state: AgentState, _pre: dict | None = None) -> AgentState:
@@ -410,7 +419,8 @@ def pedir_modalidad(state: AgentState, _pre: dict | None = None) -> AgentState:
             "response_bubbles": burbujas,
             "response_interactive": _BOTONES_MODALIDAD,
             "booking_stage": "captura_modalidad",
-            "messages": [AIMessage(content=response)]}
+            "messages": [AIMessage(content=response)],
+            "asistente_presentado": True}
 
 
 def procesar_captura(state: AgentState) -> AgentState:
@@ -457,7 +467,8 @@ def procesar_captura(state: AgentState) -> AgentState:
             return {**updates, "response": response,
                     "response_bubbles": [response],
                     "response_interactive": None,
-                    "messages": [AIMessage(content=response)]}
+                    "messages": [AIMessage(content=response)],
+                    "asistente_presentado": True}
         res = pedir_email({**state, **updates, "lead_nombre": val})
         return {**updates, "lead_nombre": val, **res}
 
@@ -470,7 +481,8 @@ def procesar_captura(state: AgentState) -> AgentState:
             return {**updates, "response": response,
                     "response_bubbles": [response],
                     "response_interactive": None,
-                    "messages": [AIMessage(content=response)]}
+                    "messages": [AIMessage(content=response)],
+                    "asistente_presentado": True}
         res = pedir_modalidad({**state, **updates, "lead_email": val})
         return {**updates, "lead_email": val, **res}
 
@@ -483,7 +495,8 @@ def procesar_captura(state: AgentState) -> AgentState:
             return {**updates, "response": response,
                     "response_bubbles": [response],
                     "response_interactive": _BOTONES_MODALIDAD,
-                    "messages": [AIMessage(content=response)]}
+                    "messages": [AIMessage(content=response)],
+                    "asistente_presentado": True}
         updates["lead_modalidad"] = val
 
         estado_intermedio = {**state, **updates, "booking_stage": "propuesta",
@@ -525,7 +538,8 @@ def reintentar_eleccion(state: AgentState) -> AgentState:
             "response_bubbles": [response],
             "response_interactive": interactive,
             "booking_attempts": (state.get("booking_attempts") or 0) + 1,
-            "messages": [AIMessage(content=response)]}
+            "messages": [AIMessage(content=response)],
+            "asistente_presentado": True}
 
 
 def aclarar_eleccion(state: AgentState) -> AgentState:
@@ -547,7 +561,8 @@ def aclarar_eleccion(state: AgentState) -> AgentState:
             "response_bubbles": [response],
             "response_interactive": interactive,
             "booking_attempts": (state.get("booking_attempts") or 0) + 1,
-            "messages": [AIMessage(content=response)]}
+            "messages": [AIMessage(content=response)],
+            "asistente_presentado": True}
 
 
 def responder_lateral(state: AgentState) -> AgentState:
@@ -555,10 +570,12 @@ def responder_lateral(state: AgentState) -> AgentState:
     try:
         prompt = ChatPromptTemplate.from_messages([
             ("system", atn["agenda_lateral_system"]),
+            MessagesPlaceholder("history"),
             ("human", "{query}"),
         ])
         respuesta = (prompt | LLM).invoke({
             "query": state["query"],
+            "history": _recent_messages(state, k=6)[:-1],
             "opciones": _opciones(_slots(state)) or "(aún sin horarios)",
         }).content
     except Exception as e:
@@ -569,7 +586,8 @@ def responder_lateral(state: AgentState) -> AgentState:
     return {"response": respuesta,
             "response_bubbles": [respuesta],
             "response_interactive": None,
-            "messages": [AIMessage(content=respuesta)]}
+            "messages": [AIMessage(content=respuesta)],
+            "asistente_presentado": True}
 
 
 # ---------------------------------------------------------------------------
@@ -593,7 +611,8 @@ def confirmar_y_crear(state: AgentState) -> AgentState:
                 "response_bubbles": [response],
                 "response_interactive": None,
                 "booking_stage": "propuesta",
-                "messages": [AIMessage(content=response)]}
+                "messages": [AIMessage(content=response)],
+                "asistente_presentado": True}
 
     elegido = slots[state["booking_match"]]
     hoy = datetime.now(GCAL_TZ).date()
@@ -660,6 +679,7 @@ def confirmar_y_crear(state: AgentState) -> AgentState:
                 "response_bubbles": [response],
                 "response_interactive": None,
                 "messages": [AIMessage(content=response)],
+                "asistente_presentado": True,
                 **RESET_BOOKING,
             }
 
@@ -681,6 +701,7 @@ def confirmar_y_crear(state: AgentState) -> AgentState:
             "response_bubbles": [response],
             "response_interactive": None,
             "messages": [AIMessage(content=response)],
+            "asistente_presentado": True,
             **RESET_BOOKING,
         }
 
@@ -729,6 +750,7 @@ def confirmar_y_crear(state: AgentState) -> AgentState:
         "booking": payload,
         "closed": False,
         "messages": [AIMessage(content=response)],
+        "asistente_presentado": True,
         **RESET_BOOKING,
     }
 
@@ -742,6 +764,7 @@ def ofrecer_ejecutiva(state: AgentState) -> AgentState:
         "response_bubbles": [response],
         "response_interactive": None,
         "messages": [AIMessage(content=response)],
+        "asistente_presentado": True,
         **RESET_BOOKING,
     }
 
@@ -755,5 +778,6 @@ def cerrar_booking(state: AgentState) -> AgentState:
         "response_bubbles": [response],
         "response_interactive": None,
         "messages": [AIMessage(content=response)],
+        "asistente_presentado": True,
         **RESET_BOOKING,
     }

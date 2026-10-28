@@ -1,5 +1,14 @@
 """graph/faq/nodes.py — Acciones del sub-agente FAQ.
 
+v3.4 — Fix saludos reiterados:
+  - El FAQ ya no decide por sí mismo cuándo presentarse: el sistema le
+    entrega una instrucción de apertura computada ({instruccion_apertura}).
+  - Todos los emisores de burbujas levantan `asistente_presentado=True` para
+    que el resto del grafo sepa que la identidad ya fue anunciada.
+  - fuera_dominio_message usa {apertura} mediante `_apertura_pres`.
+
+v3.3 — ledger one-shot de sugerir_agendar.
+
 v3.2 — Fix #2 (auditoría): derivar_a_ejecutiva señala ROUTE_HANDOFF_CHOICE
        (antes ROUTE_INTAKE), alineando la política con analyze_sentiment
        para intent=hablar_humano. Antes, el padre no honraba la señal y el
@@ -31,7 +40,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from core.contracts import ROUTE_HANDOFF_CHOICE, AgentState
 from core.llm import LLM
 from core.rag import retrieve
-from graph.utils import _cfg, _guardar_ai, _recent_messages, _wa_link
+from graph.utils import _apertura_pres, _cfg, _guardar_ai, _recent_messages, _wa_link
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +50,18 @@ logger = logging.getLogger(__name__)
 # agendar_asesoria sin costo de ambigüedad.
 _BOTON_AGENDAR = {"kind": "buttons",
                   "buttons": [{"id": "agendar", "title": "Agendar una hora"}]}
+
+_INSTRUCCION_PRIMERA_VEZ = (
+    "Esta es tu primera respuesta del hilo. Preséntate en una sola línea "
+    "como 'Soy LeyIA, la asistente virtual de Manzzo y Cía.', indica que "
+    "estás a disposición y luego responde la consulta."
+)
+
+_INSTRUCCION_YA_PRESENTADO = (
+    "El cliente ya te conoce y está en conversación contigo. Queda "
+    "PROHIBIDO saludar, presentarte o decir quién eres. Responde "
+    "directamente a lo sustantivo, sin frases de apertura."
+)
 
 
 def responder_pregunta(state: AgentState) -> AgentState:
@@ -55,7 +76,13 @@ def responder_pregunta(state: AgentState) -> AgentState:
     context = "\n\n---\n\n".join(d.page_content for d in docs) or "Sin contexto."
 
     tono = atn["tonos"].get(state.get("sentiment", "neutro"), atn["tonos"]["neutro"])
-    es_primer_contacto = not any(m.type == "ai" for m in state.get("messages", []))
+
+    # ¿Ya nos presentamos? Flag primero; como defensa, historial AI.
+    hay_historial_ai = any(
+        getattr(m, "type", None) == "ai" for m in state.get("messages", [])
+    )
+    ya_presentado = bool(state.get("asistente_presentado")) or hay_historial_ai
+
     history = _recent_messages(state, k=7)[:-1]
 
     prompt = ChatPromptTemplate.from_messages([
@@ -68,9 +95,11 @@ def responder_pregunta(state: AgentState) -> AgentState:
             "context": context,
             "query": state["query"],
             "history": history,
-            "disclosure": (atn["disclosure"] if es_primer_contacto
-                           else "Eres el asistente virtual de Manzzo y Cía (ya te presentaste)."),
             "tono": tono,
+            "instruccion_apertura": (
+                _INSTRUCCION_PRIMERA_VEZ if not ya_presentado
+                else _INSTRUCCION_YA_PRESENTADO
+            ),
         }).content
     except Exception as e:
         logger.exception("[faq] LLM falló: %s", e)
@@ -83,6 +112,7 @@ def responder_pregunta(state: AgentState) -> AgentState:
         "response_interactive": None,
         "context": [d.page_content for d in docs],
         "messages": [AIMessage(content=response)],
+        "asistente_presentado": True,
     }
 
 
@@ -90,10 +120,13 @@ def pedir_clarificacion(state: AgentState) -> AgentState:
     atn = _cfg()["atencion"]
     response = atn["faq_clarificacion"]
     _guardar_ai(state, response)
-    return {"response": response,
-            "response_bubbles": [response],
-            "response_interactive": None,
-            "messages": [AIMessage(content=response)]}
+    return {
+        "response": response,
+        "response_bubbles": [response],
+        "response_interactive": None,
+        "messages": [AIMessage(content=response)],
+        "asistente_presentado": True,
+    }
 
 
 def sugerir_agendar(state: AgentState) -> AgentState:
@@ -104,11 +137,14 @@ def sugerir_agendar(state: AgentState) -> AgentState:
     atn = _cfg()["atencion"]
     response = atn["cta_agendar"]
     _guardar_ai(state, response)
-    return {"response": response,
-            "response_bubbles": [response],
-            "response_interactive": _BOTON_AGENDAR,
-            "cta_agenda_ofrecida": True,              # ← v3.3: ledger one-shot
-            "messages": [AIMessage(content=response)]}
+    return {
+        "response": response,
+        "response_bubbles": [response],
+        "response_interactive": _BOTON_AGENDAR,
+        "cta_agenda_ofrecida": True,
+        "messages": [AIMessage(content=response)],
+        "asistente_presentado": True,
+    }
 
 
 
@@ -140,9 +176,12 @@ def derivar_a_fuera_dominio(state: AgentState) -> AgentState:
     responde; si la ficha estaba pausada (duda lateral), el padre la
     reanudará después vía route_post_faq."""
     atn = _cfg()["atencion"]
-    response = atn["fuera_dominio_message"].format(disclosure=atn["disclosure"])
+    response = atn["fuera_dominio_message"].format(apertura=_apertura_pres(state))
     _guardar_ai(state, response)
-    return {"response": response,
-            "response_bubbles": [response],
-            "response_interactive": None,
-            "messages": [AIMessage(content=response)]}
+    return {
+        "response": response,
+        "response_bubbles": [response],
+        "response_interactive": None,
+        "messages": [AIMessage(content=response)],
+        "asistente_presentado": True,
+    }

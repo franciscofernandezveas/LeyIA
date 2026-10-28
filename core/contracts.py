@@ -1,5 +1,15 @@
 """Contratos centrales: estado del grafo, thread_id y esquemas estructurados.
 
+v6.7 — FIX saludos reiterados + bug riesgo:
+  - Añade `asistente_presentado`, `crisis` e `intake_skipped` al AgentState.
+    `asistente_presentado` es el ledger de una sola presentación por sesión.
+    `crisis` ya se escribía desde graph/nodes.py pero no estaba declarado.
+    `intake_skipped` ya lo devolvían los nodos del intake pero faltaba en
+    el contrato.
+  - Añade `riesgo: bool` a AnalisisResult, alineando el esquema con lo que
+    pide el system prompt de clasificación (v4.2.1). El fallback conserva
+    `riesgo=False`.
+
 v6.6 — FIX #11 (auditoría): tipado de intake_exit + eliminación de faq_stage.
   - Nuevo IntakeExitLabel = Literal["faq","pausa","handoff","end","cta_cierre"]
     reemplaza `intake_exit: str | None`. Elimina valores muertos que nunca
@@ -193,6 +203,12 @@ class AgentState(TypedDict, total=False):
     # --- Sesión (v6.5: canal del estado; lo escribe receive_message) ---
     session_id: str | None
 
+    # --- Presentación del asistente ---
+    asistente_presentado: bool        # ← NUEVO v6.7
+
+    # --- Crisis (v6.7: ya se escribe desde graph/nodes.py) ---
+    crisis: bool                      # ← NUEVO v6.7
+
     # --- Clasificación unificada (nodo analyze_sentiment) ---
     sentiment: SentimentLabel
     urgency: UrgencyLabel
@@ -244,6 +260,7 @@ class AgentState(TypedDict, total=False):
     intake_exit: IntakeExitLabel | None    # v6.6: tipado (antes str | None)
     intake_resume: bool
     intake_oferta_qid: NotRequired[str | None]
+    intake_skipped: NotRequired[set]      # ← NUEVO v6.7
 
     # --- Bifurcación handoff: ficha breve vs contacto directo (v6.4) ---
     handoff_choice_pending: bool
@@ -265,6 +282,10 @@ class AgentState(TypedDict, total=False):
 # --------------------------------------------------------------------------
 class AnalisisResult(BaseModel):
     """Salida del clasificador unificado (nodo analyze_sentiment).
+
+    v7.1 — Añade `riesgo: bool` para alinear el esquema con el system prompt
+    de clasificación (v4.2.1), que ya pide la etiqueta riesgo=true|false.
+    El campo es false por defecto; el fallback conserva ese valor.
 
     v7 — 'reason' ANTES de las etiquetas (el LLM genera en orden de campos:
     razona primero, clasifica después) + descriptions operativas calibradas
@@ -345,6 +366,14 @@ class AnalisisResult(BaseModel):
             "mencionado; si no hay tema claro → consulta_general."
         )
     )
+    riesgo: bool = Field(                # ← NUEVO v6.7 / v7.1
+        default=False,
+        description=(
+            "true si el mensaje menciona violencia actual, peligro inmediato, "
+            "riesgo para menores o ideas de autolesión; false en cualquier "
+            "otro caso. En caso de duda, false."
+        ),
+    )
 
 
 class IntakeExtract(BaseModel):
@@ -367,6 +396,7 @@ def fallback_analisis(motivo: str = "error de parseo") -> AnalisisResult:
     return AnalisisResult(
         sentiment="neutro", urgency="media",
         intent="respuestas_faq", category="otro",
+        riesgo=False,                       # ← NUEVO v6.7
         reason=f"fallback por {motivo}",
     )
 
