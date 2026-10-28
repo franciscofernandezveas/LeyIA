@@ -133,7 +133,7 @@ TEMPLATE_ARGS = {
     "atencion.handoff_fallback_message": {"apertura", "whatsapp_ejecutiva",
                                           "thread_id"},          # ← v1.9
     "atencion.handoff_choice_message": {"apertura"},              # ← v1.9
-    "atencion.handoff_choice_retry_message": set(),               # ← v1.9
+    "atencion.handoff_choice_retry_message": {"apertura"},
     "atencion.hilo_cerrado_message": {"whatsapp_ejecutiva", "thread_id"},
     "atencion.cta_agendar": set(),
     "atencion.agenda_inicio_aviso": set(),
