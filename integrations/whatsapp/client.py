@@ -1,3 +1,17 @@
+"""integraciones/whatsapp/client.py — Adaptador Meta Cloud API.
+
+v1.1 — FIX CTA URL:
+  - display_text recortado a 25 caracteres (límite real de Meta para
+    cta_url; antes 80 y Meta rechazaba el mensaje con error 400).
+  - URL exigida en https:// (Meta rechaza http:// en cta_url).
+
+Restricciones Meta vigentes:
+  - buttons: ≤3 botones, title ≤ 20.
+  - list: ≤10 filas totales, title ≤ 24, desc ≤ 72, CTA ≤ 20.
+  - cta_url: 1 botón por mensaje, display_text ≤ 25, https obligatorio,
+    NO combinable con botones de respuesta en el mismo mensaje.
+"""
+
 import logging
 import re
 
@@ -16,6 +30,7 @@ MAX_ROW_DESC = 72
 MAX_LIST_ROWS = 10
 MAX_LIST_CTA = 20
 MAX_SECTION_TITLE = 24
+MAX_CTA_DISPLAY = 25  # v1.1: límite real de Meta para display_text de cta_url
 
 _BR_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
 
@@ -97,13 +112,15 @@ def _build_interactive(interactive: dict, body: str) -> dict:
 
     elif kind == "cta":
         url = str(interactive.get("url") or "").strip()
-        if not url.lower().startswith(("https://", "http://")):
-            raise ValueError(f"cta sin URL válida: {url!r}")
+        # v1.1: Meta exige https; http:// es rechazado con error 400.
+        if not url.lower().startswith("https://"):
+            raise ValueError(f"cta requiere URL https: {url!r}")
         wa["type"] = "cta_url"
         wa["action"] = {
             "name": "cta_url",
             "parameters": {
-                "display_text": _clip(interactive.get("text") or "Pincha aquí", 80),
+                # v1.1: 25 es el límite real de Meta; antes 80 (rompía).
+                "display_text": _clip(interactive.get("text") or "Pincha aquí", MAX_CTA_DISPLAY),
                 "url": url,
             },
         }

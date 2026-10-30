@@ -1,45 +1,38 @@
 """Contratos centrales: estado del grafo, thread_id y esquemas estructurados.
 
+v6.8 — PLAN A: limpieza de crisis + alineación intent con prompts v5.0.0:
+  - Elimina ROUTE_CRISIS y su entrada en VALID_ROUTES (nadie la emite:
+    graph/nodes.py v22.4 ya no contiene backstops ni guardas de crisis, y
+    handoff_humano perdió su bloque de crisis).
+  - Elimina `crisis` del AgentState: ya ningún nodo lo lee ni lo escribe.
+    Checkpoints antiguos pueden conservar la clave sin efecto (TypedDict
+    total=False; los lectores la ignoran).
+  - `riesgo` PERMANECE en AnalisisResult: es contrato con el clasificador
+    (prompts v5.0.0). Ya no activa ruta alguna; nodes.py v22.4 solo lo
+    loguea como warning y deriva por el flujo estándar (hablar_humano +
+    urgency alta).
+  - FIX descripción de `intent`: el texto heredado (pre-v4.1) definía
+    agendar_asesoria como "(b) necesito abogado / (c) angustia aguda /
+    (d) lead no-familia", contradiciendo la política vigente (agendar SOLO
+    ante pedido explícito o aceptación de oferta). Como el esquema viaja
+    al LLM vía with_structured_output, la descripción vieja sobre-disparaba
+    agendamientos. Ahora calza con classification.system_prompt v5.0.0.
+  - Pendiente fuera de este archivo: quitar el mapping de ROUTE_CRISIS del
+    conditional edge en graph/builder.py y del reset en graph/utils.py si
+    lo incluye; test_toda_ruta_tiene_nodo sigue verde al iterar
+    VALID_ROUTES ya depurado.
+
 v6.7 — FIX saludos reiterados + bug riesgo:
-  - Añade `asistente_presentado`, `crisis` e `intake_skipped` al AgentState.
-    `asistente_presentado` es el ledger de una sola presentación por sesión.
-    `crisis` ya se escribía desde graph/nodes.py pero no estaba declarado.
-    `intake_skipped` ya lo devolvían los nodos del intake pero faltaba en
-    el contrato.
-  - Añade `riesgo: bool` a AnalisisResult, alineando el esquema con lo que
-    pide el system prompt de clasificación (v4.2.1). El fallback conserva
-    `riesgo=False`.
+  - Añade `asistente_presentado` e `intake_skipped` al AgentState.
+  - Añade `riesgo: bool` a AnalisisResult; el fallback conserva False.
 
-v6.6 — FIX #11 (auditoría): tipado de intake_exit + eliminación de faq_stage.
-  - Nuevo IntakeExitLabel = Literal["faq","pausa","handoff","end","cta_cierre"]
-    reemplaza `intake_exit: str | None`. Elimina valores muertos que nunca
-    fueron emitidos por ningún nodo ("agendar", "cta_escala", "booking") y
-    que vivían solo en la documentación o en lectores defensivos.
-  - route_post_intake en graph/nodes.py ahora hace matching exhaustivo con
-    rama explícita para "cta_cierre" (antes caía por acoplamiento al
-    fallback intake_completado=True).
-  - Elimina faq_stage de AgentState: era dead code (siempre "respondiendo",
-    ningún nodo lo leía, y su semántica era incorrecta cuando la acción era
-    pedir_clarificacion). FAQStageLabel en graph/faq/contracts.py se
-    mantiene como contrato interno del subagente.
-
-v6.5 — FIX CRÍTICO sesión: session_id estaba declarado como anotación de
-  módulo FUERA del TypedDict AgentState, por lo que no era un canal del
-  estado. Ahora vive DENTRO de AgentState.
-
-v6.4 — Handoff choice: bifurcación previa al intake que pregunta ficha breve
-  vs contacto directo. Añade ROUTE_HANDOFF_CHOICE y estado handoff_choice_*
-  en AgentState.
-
-v6.3 — Cierre dual post-intake + fix EMAIL_RE:
-  - EMAIL_RE acepta dominios con un solo punto (gmail.com, yahoo.cl).
-  - intake_exit incluye nuevos valores "cta_cierre" y "cta_escala"
-    para el cierre dual: Agendar / Hablar con abogada.
-    (v6.6: "cta_escala" se elimina por ser dead code — nunca emitido.)
-
-v6.2 — Refactor intake: ...
-v6.1 — Booking signal/estado extendidos: ...
-v6 — BOOKING migrado a subgrafo (graph/booking/): ...
+v6.6 — FIX #11 (auditoría): IntakeExitLabel tipado; faq_stage eliminado.
+v6.5 — FIX CRÍTICO sesión: session_id dentro del TypedDict AgentState.
+v6.4 — Handoff choice: ROUTE_HANDOFF_CHOICE + estado handoff_choice_*.
+v6.3 — Cierre dual post-intake + fix EMAIL_RE.
+v6.2 — Refactor intake.
+v6.1 — Booking signal/estado extendidos.
+v6   — BOOKING migrado a subgrafo.
 
 Changelog anterior:
   v5 - Integración del nodo de INTAKE (ficha proactiva + IntakeExtract).
@@ -64,7 +57,7 @@ from typing_extensions import TypedDict, NotRequired
 SentimentLabel = Literal["positivo", "neutro", "negativo"]
 UrgencyLabel = Literal["alta", "media", "baja"]
 IntentLabel = Literal[
-    "agendar_asesoria",   # pide explícitamente agendar/hora o que un abogado tome su caso
+    "agendar_asesoria",   # pide explícitamente agendar/hora/cita o acepta la oferta
     "respuestas_faq",     # pregunta info general O describe su caso buscando orientación
     "hablar_humano",      # pide hablar con persona/ejecutiva, o ACEPTA la oferta
     "fuera_de_dominio",
@@ -103,10 +96,11 @@ VALID_LABELS = {
 # ⚠️ Las rutas DEBEN estar registradas como nodos en graph/builder.py
 #    (test de contrato: test_toda_ruta_tiene_nodo). ROUTE_AGENDAR es un
 #    subgrafo compilado registrado como nodo — el invariante no se toca.
-# ⚠️ El intake v16+ emite intake_exit="cta_cierre" cuando la ficha se
-#    completa con el cierre dual (Agendar / Hablar con la abogada); el
-#    padre route_post_intake lo deriva a ROUTE_HANDOFF (v6.6 fija la rama
-#    explícita — antes dependía del fallback intake_completado=True).
+# ⚠️ El intake emite intake_exit="cta_cierre" cuando la ficha se completa
+#    con el cierre dual; route_post_intake lo deriva a ROUTE_HANDOFF (rama
+#    explícita desde v6.6).
+# v6.8 (Plan A): no existe ruta de crisis; un mensaje con riesgo entra por
+# hablar_humano → handoff estándar con urgencia alta (sin contención).
 # --------------------------------------------------------------------------
 ROUTE_HANDOFF: str = "handoff_humano"
 ROUTE_HANDOFF_CHOICE: str = "handoff_choice"
@@ -114,10 +108,9 @@ ROUTE_AGENDAR: str = "agendar_asesoria"
 ROUTE_FAQ: str = "respuestas_faq"
 ROUTE_FUERA_DOMINIO: str = "respuesta_fuera_dominio"
 ROUTE_INTAKE: str = "intake_lead"
-ROUTE_CRISIS: str = "crisis"   # ← NUEVO
 
 VALID_ROUTES = {ROUTE_HANDOFF, ROUTE_HANDOFF_CHOICE, ROUTE_AGENDAR, ROUTE_FAQ,
-                ROUTE_FUERA_DOMINIO, ROUTE_INTAKE, ROUTE_CRISIS}  # ← NUEVO
+                ROUTE_FUERA_DOMINIO, ROUTE_INTAKE}
 
 
 # --------------------------------------------------------------------------
@@ -130,7 +123,7 @@ ModalidadLabel = Literal["online", "presencial"]
 # graph/booking/contracts.py → FRANJA_HORAS.
 FranjaLabel = Literal["manana", "tarde"]
 
-# Étapa del sub-flujo de booking. None = fuera del sub-flujo.
+# Etapa del sub-flujo de booking. None = fuera del sub-flujo.
 # El short-circuit de analyze_sentiment lee SOLO este flag (v9 nodes.py).
 BookingStageLabel = Literal["captura_nombre", "captura_email", "captura_modalidad", "propuesta"]
 
@@ -181,10 +174,6 @@ ComoConocioLabel = Literal["google", "instagram", "tiktok",
 #   "handoff"    → _derivar_parcial
 #   "end"        → abandonar_ficha / sin_consentimiento
 #   "cta_cierre" → _completar_ficha (cierre dual: Agendar / Hablar con abogada)
-# Valores eliminados (nunca emitidos por ningún nodo):
-#   "agendar"    → jamás se emitió; route_post_intake tenía rama muerta
-#   "cta_escala" → documentado en v6.3 pero sin emisor
-#   "booking"    → solo aparecía en handoff_humano.intake_ya_despidio (lectura)
 # Agregar un valor requiere: (1) incluirlo aquí, (2) emitirlo en algún nodo,
 # (3) manejar la rama en route_post_intake — el test
 # test_route_post_intake_cobertura_exhaustiva verifica el punto (3).
@@ -204,10 +193,7 @@ class AgentState(TypedDict, total=False):
     session_id: str | None
 
     # --- Presentación del asistente ---
-    asistente_presentado: bool        # ← NUEVO v6.7
-
-    # --- Crisis (v6.7: ya se escribe desde graph/nodes.py) ---
-    crisis: bool                      # ← NUEVO v6.7
+    asistente_presentado: bool
 
     # --- Clasificación unificada (nodo analyze_sentiment) ---
     sentiment: SentimentLabel
@@ -224,10 +210,6 @@ class AgentState(TypedDict, total=False):
 
     # --- Sub-flujo de FAQ (subgrafo graph/faq/) ---
     faq_decision: dict | None        # dump de FAQDecision (turno actual)
-    # v6.6: faq_stage ELIMINADO — era dead code (siempre "respondiendo",
-    # ningún nodo lo leía, y su semántica era incorrecta cuando la acción
-    # era pedir_clarificacion). FAQStageLabel vive en graph/faq/contracts.py
-    # como contrato interno del subagente y no cruza al estado del padre.
     cta_agenda_ofrecida: bool
 
     # --- Sub-flujo de BOOKING (subgrafo graph/booking/) ---
@@ -257,10 +239,10 @@ class AgentState(TypedDict, total=False):
     intake_decision: dict | None
     intake_stage: str | None
     intake_attempts: int
-    intake_exit: IntakeExitLabel | None    # v6.6: tipado (antes str | None)
+    intake_exit: IntakeExitLabel | None
     intake_resume: bool
     intake_oferta_qid: NotRequired[str | None]
-    intake_skipped: NotRequired[set]      # ← NUEVO v6.7
+    intake_skipped: NotRequired[set]
 
     # --- Bifurcación handoff: ficha breve vs contacto directo (v6.4) ---
     handoff_choice_pending: bool
@@ -274,6 +256,9 @@ class AgentState(TypedDict, total=False):
 
     response_bubbles: NotRequired[list[str]]
     response_interactive: NotRequired[dict | None]
+    # Canal CTA preexistente (cierre dual del intake). Si tu dispatcher ya
+    # lo envía como cta_url, úsalo en vez de response_interactive kind="cta"
+    # — pero nunca ambos en el mismo turno (duplicarías el mensaje).
     response_cta: NotRequired[dict | None]
 
 
@@ -283,9 +268,12 @@ class AgentState(TypedDict, total=False):
 class AnalisisResult(BaseModel):
     """Salida del clasificador unificado (nodo analyze_sentiment).
 
-    v7.1 — Añade `riesgo: bool` para alinear el esquema con el system prompt
-    de clasificación (v4.2.1), que ya pide la etiqueta riesgo=true|false.
-    El campo es false por defecto; el fallback conserva ese valor.
+    v6.8 — FIX descripción de `intent`: alineada con la política vigente
+    (prompts v4.1+/v5.0.0): agendar_asesoria SOLO ante pedido explícito de
+    hora/cita o aceptación de oferta. La descripción heredada pre-v4.1
+    ("necesito abogado", "angustia aguda", "lead no-familia" → agendar)
+    viajaba al LLM en el esquema y sobre-disparaba agendamientos.
+    `riesgo` se conserva (contrato con el prompt) pero no activa rutas.
 
     v7 — 'reason' ANTES de las etiquetas (el LLM genera en orden de campos:
     razona primero, clasifica después) + descriptions operativas calibradas
@@ -301,7 +289,7 @@ class AnalisisResult(BaseModel):
         description=(
             "Emoción dominante hacia su situación o el servicio. "
             "negativo: sufrimiento, frustración o enojo EXPRESADO — explícito "
-            "('desesperado', 'chato', 'injusto', garabatos, 'esperaba algo mejor de ustedes') o implícito "
+            "('desesperado', 'chato', 'injusto', garabatos) o implícito "
             "(sarcasmo, 'esperaba algo mejor de ustedes'). La cortesía de "
             "envoltura ('hola buenas, disculpa la hora') NO lo atenúa. "
             "neutro: consulta tranquila; INCLUYE preocupación hipotética o "
@@ -317,7 +305,7 @@ class AnalisisResult(BaseModel):
             "con calma sigue siendo alta. "
             "alta: coacción judicial VIGENTE o plazo — demanda notificada, "
             "embargo, medidas de apremio (licencia retenida, registro de "
-            "deudores), o inmediatez exclamada ('YA'). "
+            "deudores) — o inmediatez exclamada ('YA'). "
             "media: pregunta sobre su propio caso (proceso, escenarios, "
             "hipótesis legales), quiere avanzar pronto ('lo antes posible', "
             "'esta semana', pide contacto humano), o ya ocurrió un evento "
@@ -333,22 +321,25 @@ class AnalisisResult(BaseModel):
             "La emoción NO cambia la intención: una pregunta factual con "
             "garabatos sigue siendo respuestas_faq. "
             "'fuera_de_dominio': nada relacionado con servicios legales "
-            "(celulares, contador, psicólogo). "
+            "(contador, psicólogo, celulares). "
             "'hablar_humano': pide ser atendido por una persona/ejecutiva "
             "('quiero hablar con alguien', 'que me atienda un abogado "
             "directamente') o ACEPTA la oferta humana previa ('sí, que me "
-            "contacte la ejecutiva'). No confundir con pedir que un abogado "
-            "tome su caso. "
-            "'agendar_asesoria': (a) pide agendar/reservar hora; (b) pide "
-            "explícitamente ayuda profesional ('necesito abogado', 'quiero "
-            "que me ayuden', 'quiero que se termine'); (c) describe su caso "
-            "con ANGUSTIA AGUDA pidiendo auxilio ('estoy desesperado, ¿qué "
-            "hago?'); (d) pregunta por un servicio cubierto PERO no de "
-            "familia (laboral/civil/penal) describiendo su caso → lead "
-            "calificado. "
-            "'respuestas_faq': pregunta informativa O describe/pregunta sobre "
-            "su caso buscando orientación, SIN auxilio explícito ni angustia "
-            "aguda (el agente orienta primero)."
+            "contacte la ejecutiva'). También aplica a mensajes con riesgo "
+            "vital (violencia actual, peligro, autolesión): se derivan por "
+            "este mismo flujo con urgency alta. No confundir con pedir que "
+            "un abogado tome su caso. "
+            "'agendar_asesoria': SOLO (a) pide explícitamente agendar/"
+            "reservar una hora/cita/asesoría, o (b) ACEPTA una oferta de "
+            "agendamiento hecha en el turno anterior ('sí, agendemos', "
+            "'me interesa la asesoría, ¿para cuándo hay hora?'). Jamás "
+            "inferirlo del relato del caso, del tono ni de la angustia. "
+            "'respuestas_faq': pregunta informativa O describe/pregunta por "
+            "su caso buscando orientación — con calma o con angustia — SIN "
+            "pedido explícito de hora. Incluye 'necesito un abogado' o "
+            "'quiero que tomen mi caso' sin pedido de hora: el FAQ orienta "
+            "y sugiere la asesoría; si el cliente acepta, el turno siguiente "
+            "ya entra como agendar_asesoria."
         )
     )
     category: CategoryLabel = Field(
@@ -361,17 +352,19 @@ class AnalisisResult(BaseModel):
             "deudores. divorcio / compensacion_economica: según materia. "
             "consulta_general: preguntas sobre la FIRMA (precios, contacto, "
             "cobertura, horarios, proceso de contratación). otro: temas "
-            "no-familia sin categoría propia (laboral, civil, penal) o sin "
-            "tema identificable. Agradecimientos: la categoría del caso "
-            "mencionado; si no hay tema claro → consulta_general."
+            "no-familia sin categoría propia (laboral, civil, penal), "
+            "violencia intrafamiliar, o sin tema identificable. "
+            "Agradecimientos: la categoría del caso mencionado; si no hay "
+            "tema claro → consulta_general."
         )
     )
-    riesgo: bool = Field(                # ← NUEVO v6.7 / v7.1
+    riesgo: bool = Field(
         default=False,
         description=(
             "true si el mensaje menciona violencia actual, peligro inmediato, "
             "riesgo para menores o ideas de autolesión; false en cualquier "
-            "otro caso. En caso de duda, false."
+            "otro caso. En caso de duda, false. (v6.8: solo metadata para "
+            "logs/alertas del equipo; no activa rutas del grafo.)"
         ),
     )
 
@@ -396,7 +389,7 @@ def fallback_analisis(motivo: str = "error de parseo") -> AnalisisResult:
     return AnalisisResult(
         sentiment="neutro", urgency="media",
         intent="respuestas_faq", category="otro",
-        riesgo=False,                       # ← NUEVO v6.7
+        riesgo=False,
         reason=f"fallback por {motivo}",
     )
 

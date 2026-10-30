@@ -1,95 +1,40 @@
 """graph/nodes.py — Nodos transversales del agente (Manzzo y Cía).
 
-v22.3 — FIX: _hidratar_contacto devuelve updates completos
-  - Corrige la regresión de v22.2: _hidratar_contacto vuelve a emitir
-    lead_nombre/lead_email e intake_respuestas, preservando el contrato
-    que consumen handoff_humano y preguntar_preferencia_handoff.
-  - Los nodos llamadores usan el dict completo; handoff_humano extrae
-    intake_respuestas desde pre["intake_respuestas"].
+v22.4 — PLAN A: eliminación de la ruta de crisis + enlaces como botón CTA:
+  - Ruta de crisis eliminada del grafo padre (coherente con prompts v4.5.0,
+    que ya no contiene crisis_message ni contención):
+    • analyze_sentiment: fuera backstop de keywords (_CRISIS_KEYWORDS,
+      _es_crisis_keyword) y guardas semánticas (_es_crisis_clasificador).
+      El campo de estado `crisis` queda en desuso: checkpoints antiguos lo
+      conservan, pero ya nadie lo lee.
+    • Un mensaje con riesgo sigue clasificándose igual (el clasificador lo
+      etiqueta intent=hablar_humano, urgency=alta, riesgo=true) y se deriva
+      por el flujo estándar (handoff_choice → equipo), sin mensaje de
+      contención ni números de emergencia. Se loguea como warning.
+    • handoff_humano: eliminado el bloque de crisis (crisis_message, email
+      "RIESGO VITAL", motivo crisis_riesgo_vital).
+    • ROUTE_CRISIS ya no se importa ni se emite; permanece en contracts.py
+      para compatibilidad de VALID_ROUTES (limpieza pendiente allí).
+  - Enlaces estéticos: WhatsApp NO permite ocultar URLs en texto plano.
+    hilo_cerrado y handoff adjuntan response_interactive kind="cta"
+    (contrato ya soportado por client.py): botón "Escribir al equipo" que
+    abre el wa.me sin mostrar la URL. Requiere plantillas v4.5.1 (sin la
+    URL en el cuerpo); str.format ignora los kwargs extra, así que las
+    firmas no cambian.
+  - Email al equipo: el anchor del wa.me pasa a "Abrir chat con el cliente".
+  - Fallback de handoff_choice alineado a la voz vigente ("tú"; en v22
+    quedó en "usted" antes del cambio de voz de prompts v4.4.0).
+  - Import limpio: se retira _wa_link_display (importado y nunca usado).
 
-v22.2 — FIX reapertura de hilos cerrados + hidratación cruzada:
-  - Añade _hidratar_contacto para reconstruir nombre/email desde el historial
-    completo (no solo el turno actual), eliminando la "amnesia" al pasar de
-    booking/intake a handoff y viceversa.
-  - _hidratar_contacto alimenta tanto intake_respuestas como lead_nombre/
-    lead_email, para que booking (que lee lead_*) no repregunte datos ya
-    capturados en otros flujos.
-  - analyze_sentiment reabre hilos cerrados explícitamente ante humano o CTA
-    agendar, limpiando `closed`/`intake_exit` y evitando que handoff_humano
-    caiga en la rama de hilo cerrado sin escalar.
-  - Reapertura por clasificador para rutas accionables; FAQ/fuera_dominio NO
-    reabren el hilo (evita re-escalamientos por pings pasivos).
-  - handoff_humano hidrata y notifica con nombre/email reales, y persiste la
-    hidratación en el checkpoint para turnos posteriores.
-
-v22.1 — FIX salida de booking ante humano/crisis:
-  - Agrega _pide_humano_explicito para detectar rechazo de la IA o pedido
-    de persona en medio del flujo de agendamiento.
-  - Si el cliente está en booking y pide humano explícitamente, o hay
-    señales de crisis, el parent sale del sub-flujo booking (RESET_BOOKING)
-    y reclasifica el mensaje, permitiendo derivación inmediata.
-
-v22 — FIX "agendar forzado" + crisis + routing cerrado:
-  - analyze_sentiment:
-    • Backstop determinista de crisis por keywords al inicio (precedencia
-      máxima).
-    • Backstop semántico de crisis: si reason del clasificador empieza con
-      "RIESGO:", se impone ROUTE_CRISIS por sobre intake/handoff_choice.
-    • Guarda anti-ambigüedad: aceptaciones sueltas ("sí", "dale", "ok"...)
-      solo rutear a agendamiento si el último mensaje del asistente ofreció
-      agendar; si no, se reclasifican a FAQ.
-    • Hilos cerrados: una intención explícita y accionable REABRE el hilo;
-      FAQ / fuera_dominio no reabren (evita re-escalamientos por pings).
-    • Fix merge de resets: TTL de booking conserva resets acumulados
-      ({**reset, **RESET_BOOKING}).
-  - handoff_humano:
-    • Si state["crisis"] está activo, emite crisis_message, escala con
-      motivo "crisis_riesgo_vital" y salta los branches closed /
-      intake_ya_despidio para no quedarse sin respuesta.
-  - preguntar_preferencia_handoff:
-    • Fallback hardcodeado pasa a "usted" y sin emojis.
-
-v21.2 — FIX #6 (auditoría): analyze_sentiment deja de interceptar aborts de
-        booking. El parent SOLO aplica TTL por expiración; toda decisión
-        de abort vive en el subgrafo (booking/planner.py). Antes, el
-        substring "no quiero" en _parece_abort abortaba el booking con
-        mensajes legítimos como "no quiero online, mejor presencial" y
-        reemplazaba el cierre amable agenda_abortado por una respuesta
-        FAQ aleatoria de RAG. Se elimina el import de _parece_abort
-        (ya no se usa en este módulo).
-
-v21.1 — FIX #2 (auditoría): route_post_faq honra las señales route de los
-        nodos internos del FAQ (ROUTE_HANDOFF_CHOICE desde
-        derivar_a_ejecutiva v3.2, y ROUTE_INTAKE legacy como defensa).
-        Antes, hablar_humano detectado por el planner FAQ terminaba en END
-        SIN emitir respuesta al cliente.
-
-v21 — FIX handoff_choice: response_interactive usa el contrato del canal
-       ("kind": "buttons", sin "body"); el body viaja por separado en
-       send_interactive. Títulos de botones recortados a ≤ 20 chars
-       (límite de Meta Cloud API, ver client.MAX_BUTTON_TITLE).
-
-v20 — Gatekeeper de sesión en receive_message: detecta cambio de
-       conversation_id y resetea el estado de flujo (intake, handoff_choice,
-       booking) conservando la memoria larga del cliente.
-       Resets centralizados en graph.utils (RESET_INTAKE,
-       RESET_HANDOFF_CHOICE, RESET_BOOKING, RESET_SESION_NUEVA).
-
-v19 — Añade handoff_choice: bifurcación previa a handoff/intake que pregunta
-       al usuario si prefiere rellenar una ficha breve o recibir contacto
-       directo, reduciendo la fricción de forzar siempre el intake completo.
-
-v18 — FIX import: verificado, sin constantes de booking en core.contracts.
-       Este archivo solo importa AgentState, AnalisisResult, rutas y
-       fallback_analisis del módulo central.
-
-v17 — Refactor crítico:
-  - Helpers compartidos movidos a graph/utils.py; rompe ciclo de imports con
-    graph/intake/nodes.py.
-  - route_post_intake reconoce intake_exit == "agendar" y rutea a booking.
-  - route_post_intake termina el turno (END) para abandono/sin_consentimiento.
-  - _precaptura_contacto normaliza email sin depender de EMAIL_RE.
-  - handoff_humano reconoce intake_exit="agendar" como "ya despidió".
+v22.3 — FIX: _hidratar_contacto devuelve updates completos.
+v22.2 — FIX reapertura de hilos cerrados + hidratación cruzada.
+v22.1 — FIX salida de booking ante humano explícito.
+v22   — FIX "agendar forzado" + routing cerrado.
+v21.2 — FIX #6: parent deja de interceptar aborts de booking.
+v21.1 — FIX #2: route_post_faq honra señales route de nodos internos FAQ.
+v21   — FIX handoff_choice: contrato del canal "kind" (no "type").
+v20   — Gatekeeper de sesión en receive_message.
+v19   — handoff_choice: ficha breve vs contacto directo.
 """
 
 import logging
@@ -103,7 +48,7 @@ from langgraph.graph import END
 from core.contracts import (
     AgentState, AnalisisResult,
     ROUTE_AGENDAR, ROUTE_FAQ, ROUTE_FUERA_DOMINIO, ROUTE_HANDOFF, ROUTE_INTAKE,
-    ROUTE_HANDOFF_CHOICE, ROUTE_CRISIS,
+    ROUTE_HANDOFF_CHOICE,
     VALID_ROUTES, fallback_analisis,
 )
 from core.db_client import (
@@ -118,7 +63,6 @@ from graph.utils import (
     _guardar_ai, _norm_simple, _persist_escalation,
     _primer_nombre, _recent_messages, _telefono_cliente,
     _transcript_resumen, _upsert_conversacion_abierta, _wa_link_cliente,
-    _wa_link_display,
 )
 
 
@@ -129,6 +73,10 @@ WA_TEXTO_MAX = 900
 INTAKE_TTL_HORAS = int(os.getenv("INTAKE_TTL_HORAS", "24"))
 AGENDA_CAPTURA_TTL_HORAS = int(os.getenv("AGENDA_CAPTURA_TTL_HORAS", "2"))
 
+# v22.4: texto del botón CTA (contrato kind="cta" de client.py;
+# display_text ≤ 25 caracteres, límite Meta).
+CTA_TEXTO_EQUIPO = "Escribir al equipo"
+
 _AGENDAR_CTA = ("agendar una hora", "agendar", "agendar ahora",
                 "agendar hora", "quiero agendar", "quiero agendar una hora")
 
@@ -137,7 +85,7 @@ _AGENDAR_CTA = ("agendar una hora", "agendar", "agendar ahora",
 # y reabrir duplicaría notificaciones al equipo sin información nueva.
 _RUTAS_REAPERTURA = (
     ROUTE_AGENDAR, ROUTE_INTAKE,
-    ROUTE_HANDOFF, ROUTE_HANDOFF_CHOICE, ROUTE_CRISIS,
+    ROUTE_HANDOFF, ROUTE_HANDOFF_CHOICE,
 )
 
 # Aceptaciones sueltas que, solas, no bastan para confirmar agendamiento.
@@ -146,21 +94,7 @@ _ACEPTACIONES_AMBIGUAS = (
     "me gustaria", "me gustaría", "perfecto",
 )
 
-# Backstop de crisis: señales de riesgo vital. Falso positivo = mostrar
-# números de emergencia de más; falso negativo = peligro. Se prioriza sensibilidad.
-_CRISIS_KEYWORDS = (
-    "me golpea", "me golpeó", "me pegó", "me pega", "golpea a mis hijos",
-    "golpea a los niños", "me va a matar", "amenaza con matarme",
-    "me quiere matar", "me amenaza de muerte", "matarme",
-    "quitarme la vida", "no quiero vivir", "quiero morir",
-    "suicid", "hacerme daño", "hacerme dano",
-    "no aguanto más", "no aguanto mas", "me quiere hacer daño",
-    "no me deja salir", "me controla el celular", "me encierra",
-    "me amenaza con un cuchillo", "cuchillo", "arma", "me apunta",
-)
-
-
-# v22.1: keywords de rechazo a la IA / pedido explícito de humano.
+# Keywords de rechazo a la IA / pedido explícito de humano.
 # Debe coincidir con _HUMANO_EXPLICITO de graph/faq/planner.py.
 _HUMANO_EXPLICITO_KW = (
     "hablar con una ejecutiva", "hablar con una persona",
@@ -199,21 +133,10 @@ _ELECCION_DIRECTO = tuple(_norm_simple(k) for k in _ELECCION_DIRECTO_RAW)
 _DIGITO_RE = re.compile(r"(?<!\d)([12])(?!\d)")
 
 
-def _es_crisis_keyword(query: str) -> bool:
-    """Backstop 0-LLM para señales de riesgo vital."""
-    t = _norm_simple(query)
-    return any(k in t for k in _CRISIS_KEYWORDS)
-
-
 def _pide_humano_explicito(query: str) -> bool:
-    """v22.1: detecta rechazo de la IA o pedido explícito de persona."""
+    """Detecta rechazo de la IA o pedido explícito de persona."""
     t = _norm_simple(query)
     return any(k in t for k in _HUMANO_EXPLICITO_KW)
-
-
-def _es_crisis_clasificador(result: AnalisisResult) -> bool:
-    """Señal semántica de crisis emitida por el clasificador."""
-    return result.reason.strip().upper().startswith("RIESGO:")
 
 
 def _aceptacion_ambigua_agendar(query: str) -> bool:
@@ -230,6 +153,19 @@ def _ultima_ai_ofrecio_agendar(state: AgentState) -> bool:
                 "agendar", "asesor", "cita", "hora", "le interesa"
             ))
     return False
+
+
+def _cta_equipo(state: AgentState) -> dict:
+    """v22.4: bloque interactivo CTA-URL (kind="cta", contrato de client.py).
+
+    WhatsApp no permite enmascarar enlaces en texto plano: el botón es la
+    única forma nativa de mostrar "Escribir al equipo" en vez de la URL.
+    """
+    return {
+        "kind": "cta",
+        "text": CTA_TEXTO_EQUIPO,
+        "url": _wa_link_cliente(state),
+    }
 
 
 def _interpretar_eleccion_handoff(q: str) -> str | None:
@@ -342,11 +278,6 @@ def receive_message(state: AgentState) -> AgentState:
     updates: dict = {"query": q}
 
     # --- Gatekeeper de sesión -------------------------------------------
-    # Si la conversación activa es OTRA distinta a la que veía el checkpoint,
-    # el "caso" anterior quedó atrás: el cliente puede no haber podido nunca
-    # salir de un hilo cerrado/escalado. Se resetea TODO el estado de flujo
-    # (intake, handoff_choice, booking, closed) y se conserva la memoria
-    # larga (lead_nombre / lead_email / booking_privacidad_dicha).
     sid_actual = get_active_conversation_id(tid)
     sid_prev = state.get("session_id")
     if sid_actual:
@@ -363,21 +294,7 @@ def receive_message(state: AgentState) -> AgentState:
 def analyze_sentiment(state: AgentState) -> AgentState:
     query = state["query"]
 
-    # 0) Crisis: precedencia máxima, 0-LLM. No espera a nada.
-    if _es_crisis_keyword(query):
-        logger.warning("[crisis] backstop keyword → ROUTE_CRISIS")
-        return {
-            "route": ROUTE_CRISIS,
-            "sentiment": "negativo",
-            "urgency": "alta",
-            "crisis": True,
-            "clf_reason": "crisis: señal de riesgo vital detectada (0-LLM)",
-        }
-
     # Hilos cerrados: una intención explícita y accionable REABRE el hilo.
-    # Bug corregido: antes se ruteaba sin limpiar `closed` → handoff_humano
-    # caía en la rama "Hilo cerrado" (sin escalar) e intake repreguntaba
-    # datos ya dictados en flujos previos.
     if state.get("closed"):
         if _pide_humano_explicito(query):
             pre = _hidratar_contacto(state)
@@ -386,7 +303,6 @@ def analyze_sentiment(state: AgentState) -> AgentState:
                 "route": ROUTE_HANDOFF_CHOICE,
                 "closed": False,
                 "intake_exit": None,
-                "crisis": False,  # una crisis ya escalada no debe repetirse
                 **({} if pre is None else pre),
                 "clf_reason": "reapertura: humano explícito en hilo cerrado (0 LLM)",
             }
@@ -445,15 +361,13 @@ def analyze_sentiment(state: AgentState) -> AgentState:
             choice_pendiente = True
 
     if en_booking:
-        # v21.2 — FIX #6 (auditoría): el parent YA NO intercepta aborts.
-        # Toda decisión de abort vive en el subgrafo (booking/planner.py).
-        # v22.1 — Excepto pedido explícito de humano o crisis: ahí sí
-        # salimos del booking para derivar inmediatamente.
+        # El parent NO intercepta aborts: esa decisión vive en el subgrafo
+        # (booking/planner.py). Excepción: pedido explícito de humano.
         if _expirado(state.get("agenda_started_en"), AGENDA_CAPTURA_TTL_HORAS):
             logger.info("booking expirado por TTL → reclasificar")
             reset = {**reset, **RESET_BOOKING}
-        elif _es_crisis_keyword(query) or _pide_humano_explicito(query):
-            logger.info("booking: cliente pide humano o crisis → salir de booking")
+        elif _pide_humano_explicito(query):
+            logger.info("booking: cliente pide humano → salir de booking")
             reset = {**reset, **RESET_BOOKING}
         else:
             return {"route": ROUTE_AGENDAR,
@@ -494,25 +408,21 @@ def analyze_sentiment(state: AgentState) -> AgentState:
 
     route = compute_route(result)
     reason = result.reason
-    crisis = _es_crisis_clasificador(result) or result.riesgo
 
-    # 1) Crisis semántica gana sobre intake activo y handoff_choice pendiente.
-    if crisis:
-        route = ROUTE_CRISIS
-        reason = f"crisis detectada por clasificador | {result.reason}"
+    # v22.4 (Plan A): sin ruta de crisis. El riesgo se deriva por el flujo
+    # estándar (el clasificador ya lo etiqueta hablar_humano + alta).
+    if result.riesgo:
+        logger.warning(
+            "[riesgo] clasificador marcó riesgo=true; derivación por flujo "
+            "estándar (sin contención) | %s", result.reason
+        )
 
-    # 2) Guarda anti-ambigüedad: aceptación suelta sin oferta previa → FAQ.
+    # Guarda anti-ambigüedad: aceptación suelta sin oferta previa → FAQ.
     if route == ROUTE_AGENDAR and _aceptacion_ambigua_agendar(query) \
             and not _ultima_ai_ofrecio_agendar(state):
         route = ROUTE_FAQ
         result = result.model_copy(update={"intent": "respuestas_faq"})
         reason = f"aceptación ambigua sin oferta de agenda previa → FAQ | {result.reason}"
-
-    # 3) Crisis nunca pasa por handoff_choice; va directo a handoff con flag.
-    if route == ROUTE_HANDOFF_CHOICE and (crisis or state.get("crisis")):
-        route = ROUTE_HANDOFF
-        crisis = True
-        reason = f"crisis: bypass handoff_choice → handoff directo | {reason}"
 
     if choice_pendiente:
         if route == ROUTE_HANDOFF_CHOICE:
@@ -527,7 +437,7 @@ def analyze_sentiment(state: AgentState) -> AgentState:
         else:
             # El usuario cambió de tema (faq/agendar): limpiar elección pendiente.
             reset = {**reset, **RESET_HANDOFF_CHOICE}
-    elif forzar_intake and not crisis:
+    elif forzar_intake:
         route = ROUTE_INTAKE
         reason = f"intake activo (clasificación solo metadata) | {result.reason}"
 
@@ -540,9 +450,9 @@ def analyze_sentiment(state: AgentState) -> AgentState:
     ):
         case_category = new_category
 
-    logger.info("clf | %s/%s/%s/%s → %s | crisis=%s | %s",
+    logger.info("clf | %s/%s/%s/%s → %s | riesgo=%s | %s",
                 result.sentiment, result.urgency, result.intent,
-                result.category, route, crisis, reason)
+                result.category, route, result.riesgo, reason)
 
     upsert_conversation(thread_id=state.get("thread_id", ""),
                         intent=result.intent, category=result.category)
@@ -560,7 +470,6 @@ def analyze_sentiment(state: AgentState) -> AgentState:
         "intent": result.intent, "category": result.category,
         "case_category": case_category,
         "clf_reason": reason, "route": route,
-        "crisis": crisis or state.get("crisis"),
         "closed": False if reabrir else state.get("closed", False),
         **contacto_updates,
         **reset,
@@ -588,9 +497,7 @@ def route_query(state: AgentState) -> str:
 def route_post_intake(state: AgentState) -> str:
     """Router de salida del subgrafo intake.
 
-    v21.3 — FIX #11 (auditoría): matching exhaustivo contra IntakeExitLabel.
-    Cada valor del Literal tiene su rama explícita (el test
-    test_route_post_intake_cobertura_exhaustiva lo verifica):
+    Matching exhaustivo contra IntakeExitLabel:
 
       "faq"        → ROUTE_FAQ       (duda lateral; se reanudará después)
       "pausa"      → END             (espera próximo mensaje del cliente)
@@ -610,8 +517,6 @@ def route_post_intake(state: AgentState) -> str:
     if exit_ == "handoff":
         return ROUTE_HANDOFF
     if exit_ == "cta_cierre":
-        # v21.3: rama explícita. Antes dependía del fallback
-        # (intake_completado=True) — funcionaba por acoplamiento.
         return ROUTE_HANDOFF
     if exit_ == "end":
         return END
@@ -622,25 +527,8 @@ def route_post_intake(state: AgentState) -> str:
     return END
 
 
-
 def route_post_faq(state: AgentState) -> str:
-    """Router de salida del subgrafo FAQ.
-
-    v21.1 — FIX #2 (auditoría): honra la señal route emitida por nodos
-    internos del FAQ (derivar_a_ejecutiva). Antes solo miraba intake_resume,
-    por lo que hablar_humano dentro de FAQ terminaba en END SIN emitir
-    respuesta al cliente.
-
-    Reglas:
-      - route == ROUTE_HANDOFF_CHOICE → preguntar_preferencia_handoff
-        (ruta emitida por derivar_a_ejecutiva v3.2; política unificada con
-        analyze_sentiment para intent=hablar_humano).
-      - route == ROUTE_INTAKE        → intake_lead (o handoff si la ficha
-        ya estaba completa). Rama defensiva: cubre señales legacy.
-      - intake_resume + intake_activo + !completado → intake_lead
-        (round-trip lateral de duda dentro de la ficha).
-      - resto → END.
-    """
+    """Router de salida del subgrafo FAQ."""
     route = state.get("route")
     if route == ROUTE_HANDOFF_CHOICE:
         return ROUTE_HANDOFF_CHOICE
@@ -659,13 +547,13 @@ def preguntar_preferencia_handoff(state: AgentState) -> AgentState:
     atn = _cfg()["atencion"]
     pre = _hidratar_contacto(state)
 
-    # v22: fallback de usted, sin emojis, coherente con la voz del sistema.
+    # v22.4: fallback alineado a la voz vigente ("tú"), sin emojis.
     fallback_default = (
-        "Para derivarle con nuestro equipo, ¿cómo prefiere continuar?\n\n"
-        "1) *Ficha breve* (2 min): nuestro equipo legal revisa su caso y le\n"
+        "Para derivarte con nuestro equipo, ¿cómo prefieres continuar?\n\n"
+        "1) *Ficha breve* (2 min): nuestro equipo legal revisa tu caso y te\n"
         "   contacta con todo el contexto.\n"
-        "2) *Contacto directo*: le entrego ahora el WhatsApp del equipo.\n\n"
-        "Responda *1* o *2*."
+        "2) *Contacto directo*: te entrego ahora el WhatsApp del equipo.\n\n"
+        "Responde *1* o *2*."
     )
 
     choice_attempts = state.get("handoff_choice_attempts") or 0
@@ -689,8 +577,6 @@ def preguntar_preferencia_handoff(state: AgentState) -> AgentState:
         "response": response,
         "response_bubbles": [response],
         "response_interactive": {
-            # v21: contrato del canal = "kind" (no "type"); el body viaja
-            # aparte en send_interactive. Títulos ≤ 20 chars (Meta).
             "kind": "buttons",
             "buttons": [
                 {"id": "hc_ficha",   "title": "1 Rellenar ficha"},
@@ -721,78 +607,23 @@ def respuesta_fuera_dominio(state: AgentState) -> AgentState:
 def handoff_humano(state: AgentState) -> AgentState:
     atn = _cfg()["atencion"]
     tid = state.get("thread_id", "")
-    en_crisis = bool(state.get("crisis"))
+    wa_link = _wa_link_cliente(state)
 
-    # ------------------------------------------------------------------
-    # Crisis: mensaje de contención + escalamiento prioritario. Tiene
-    # precedencia sobre hilo cerrado y sobre intake_ya_despidio para no
-    # quedarse sin respuesta ante una emergencia.
-    # ------------------------------------------------------------------
-    if en_crisis:
-        response = atn["crisis_message"].strip()
-        _guardar_ai(state, response)
-
-        try:
-            summary_prompt = ChatPromptTemplate.from_messages([
-                ("system", atn["summary_system_prompt"]),
-                ("human", "{transcript}"),
-            ])
-            summary = (summary_prompt | LLM).invoke(
-                {"transcript": _ficha_intake(state) + "CONVERSACIÓN:\n"
-                             + _transcript_resumen(state)}
-            ).content
-        except Exception as e:
-            logger.exception("LLM de resumen de crisis falló: %s", e)
-            summary = f"RIESGO: {state.get('query', '')[:300]}"
-
-        upsert_conversation(thread_id=tid, status="escalado",
-                            summary=summary, closed=True)
-
-        notificacion_ok = insert_escalation(
-            thread_id=tid,
-            summary=summary,
-            motivo="crisis_riesgo_vital",
-            notificar=True,
-        )
-
-        _persist_escalation(state, summary)
-
-        telefono = _telefono_cliente(state)
-        wa_link = _wa_link_cliente(state)
-        email_body = f"""
-        <h3>Nuevo lead derivado — RIESGO VITAL — Manzzo y Cía</h3>
-        <p><b>Thread ID:</b> {tid}</p>
-        <p><b>Teléfono:</b> {telefono or 'No disponible'}</p>
-        <p><b>Urgencia:</b> alta</p>
-        <p><b>Resumen:</b> {summary}</p>
-        <p><b>Link WhatsApp cliente:</b> <a href="{wa_link}">{wa_link}</a></p>
-        """
-        email_ok = notificar_email(
-            subject=f"[Manzzo Bot] RIESGO VITAL: {tid}",
-            body_html=email_body,
-        )
-
-        return {
-            "response": response,
-            "response_bubbles": [response],
-            "response_interactive": {
-                "kind": "buttons",
-                "buttons": [{"id": "hc_directo", "title": "Contacto directo"}],
-            },
-            "summary": summary, "closed": True,
-            "notificacion_pendiente": not (notificacion_ok or email_ok),
-            "messages": [AIMessage(content=response)],
-        }
-
-    # Hilo cerrado sin crisis: mensaje de seguimiento.
+    # Hilo cerrado: mensaje de seguimiento + botón CTA (v22.4). La URL ya
+    # no viaja en el texto; el kwarg whatsapp_ejecutiva queda por si la
+    # plantilla aún lo usa (str.format ignora argumentos extra).
     if state.get("closed"):
         response = atn["hilo_cerrado_message"].format(
-            whatsapp_ejecutiva=_wa_link_cliente(state), thread_id=tid,
+            whatsapp_ejecutiva=wa_link, thread_id=tid,
         )
         _guardar_ai(state, response)
-        return {"response": response, "response_bubbles": [response],
-                "response_interactive": None,
-                "messages": [AIMessage(content=response)]}
+        return {
+            "response": response, "response_bubbles": [response],
+            "response_interactive": {
+                "kind": "cta", "text": CTA_TEXTO_EQUIPO, "url": wa_link,
+            },
+            "messages": [AIMessage(content=response)],
+        }
 
     # Consolidar datos ANTES de resumir y notificar: el lead pudo venir de
     # booking, de una sesión anterior o solo existir en el historial. El
@@ -839,7 +670,6 @@ def handoff_humano(state: AgentState) -> AgentState:
     _persist_escalation(state, summary)
 
     telefono = _telefono_cliente(state)
-    wa_link = _wa_link_cliente(state)
     contacto = state.get("contacto") or {}
     nombre = respuestas.get("nombre") or state.get("lead_nombre") or "Sin nombre"
     email = respuestas.get("email") or contacto.get("email") or "No disponible"
@@ -856,7 +686,7 @@ def handoff_humano(state: AgentState) -> AgentState:
     <p><b>Categoría:</b> {categoria_final}</p>
     <p><b>Urgencia:</b> {state.get('urgency', 'media')}</p>
     <p><b>Resumen:</b> {summary}</p>
-    <p><b>Link WhatsApp cliente:</b> <a href="{wa_link}">{wa_link}</a></p>
+    <p><b>WhatsApp del cliente:</b> <a href="{wa_link}">Abrir chat con el cliente</a></p>
     <p><b>Ficha completa:</b> {respuestas}</p>
     """
     email_ok = notificar_email(
@@ -873,12 +703,7 @@ def handoff_humano(state: AgentState) -> AgentState:
     except Exception as e:
         logger.exception("SheetDB (fallback) falló: %s", e)
 
-    # v21.3 — FIX #11 (auditoría): matching contra IntakeExitLabel.
-    # Se eliminan "booking" y "agendar" (nunca emitidos; eran código
-    # defensivo sin origen). "cta_cierre" se añade explícitamente: hoy
-    # queda cubierto también por intake_completado=True, pero hacerlo
-    # explícito documenta la intención y sobrevive a un refactor que
-    # desacople ambos.
+    # Matching contra IntakeExitLabel.
     intake_ya_despidio = state.get("intake_exit") in ("handoff", "cta_cierre") \
         or bool(state.get("intake_completado"))
 
@@ -890,15 +715,18 @@ def handoff_humano(state: AgentState) -> AgentState:
             **({} if pre is None else pre),
         }
 
+    # v22.4: la URL no viaja en el texto; el botón CTA la reemplaza.
     response = atn["handoff_message"].format(
         apertura=_apertura_pres(state),
-        whatsapp_ejecutiva=_wa_link_cliente(state),
+        whatsapp_ejecutiva=wa_link,
         thread_id=tid,
     )
     _guardar_ai(state, response)
     return {
         "response": response, "response_bubbles": [response],
-        "response_interactive": None,
+        "response_interactive": {
+            "kind": "cta", "text": CTA_TEXTO_EQUIPO, "url": wa_link,
+        },
         "summary": summary, "closed": True,
         "notificacion_pendiente": not (notificacion_ok or email_ok),
         "messages": [AIMessage(content=response)],
