@@ -1,28 +1,27 @@
 """graph/builder.py — Grafo padre con 3 sub-agentes especializados.
 
-v5.4 — FIX crisis:
-  - Importa y registra ROUTE_CRISIS en el mapeo de analyze_sentiment.
-  - ROUTE_CRISIS se rutea al nodo handoff_humano ya existente (no se
-    agrega nodo nuevo). El propio handoff_humano detecta state["crisis"]
-    y emite crisis_message + escalamiento prioritario.
-  - route_post_faq ya propagaba ROUTE_HANDOFF_CHOICE y ROUTE_INTAKE;
-    no se requiere cambio para ROUTE_CRISIS porque el padre la maneja
-    directamente desde analyze_sentiment.
+v5.5 — PLAN A: eliminación de la ruta de crisis:
+  - Se quita ROUTE_CRISIS del import (ya no existe en core.contracts v6.8)
+    y del mapeo de analyze_sentiment.
+  - Nadie la emitía ya: graph/nodes.py v22.4 eliminó los backstops y las
+    guardas de crisis; el clasificador etiqueta riesgo=true como
+    hablar_humano + urgency alta y deriva por el flujo estándar.
+  - Red de seguridad intacta: route_query (nodes.py) cae a ROUTE_FAQ con
+    warning si algún estado viejo trajera route="crisis" (ya no está en
+    VALID_ROUTES).
+  - Si aplicaste el parche temporal `ROUTE_CRISIS` deprecated en
+    contracts.py para desbloquear el arranque, elimínalo ahora.
 
-v5.3 — Handoff choice: bifurcación previa a handoff/intake que pregunta
-       ficha breve vs contacto directo. Nodo intermedio que reduce fricción.
-
-v5.2 — Compatibilidad con intake v13:
-  - route_post_intake puede devolver ROUTE_AGENDAR cuando el cierre del
-    intake ofrece el CTA de agendar.
-  - Mantiene FAQ → intake → handoff.
+v5.4 — FIX crisis: ROUTE_CRISIS ruteada a handoff_humano (eliminada en v5.5).
+v5.3 — Handoff choice: bifurcación ficha breve vs contacto directo.
+v5.2 — Compatibilidad con intake v13.
 """
 from langgraph.graph import END, START, StateGraph
 
 from core.contracts import (
     AgentState,
     ROUTE_AGENDAR, ROUTE_FAQ, ROUTE_FUERA_DOMINIO, ROUTE_HANDOFF,
-    ROUTE_INTAKE, ROUTE_HANDOFF_CHOICE, ROUTE_CRISIS,  # v5.4
+    ROUTE_INTAKE, ROUTE_HANDOFF_CHOICE,
 )
 from core.persistence import checkpointer
 from graph.booking.builder import build_booking_graph
@@ -62,7 +61,6 @@ def build_graph() -> StateGraph:
             ROUTE_HANDOFF: ROUTE_HANDOFF,
             ROUTE_FUERA_DOMINIO: ROUTE_FUERA_DOMINIO,
             ROUTE_HANDOFF_CHOICE: ROUTE_HANDOFF_CHOICE,
-            ROUTE_CRISIS: ROUTE_HANDOFF,  # v5.4: crisis reusa handoff_humano
         },
     )
 
