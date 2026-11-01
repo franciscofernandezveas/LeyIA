@@ -1,49 +1,47 @@
 """graph/intake/nodes.py — Acciones del sub-agente INTAKE.
 
-v21 — Fixes de producción (sin tocar contracts; sigue compat core v6.8 /
-intake v17). Evidencia en log del 2026-11-01:
+v22 — Cierra la raíz del "retry fantasma" (transcript 2026-10-31, toque de
+lista de área respondido con retry de etapa). Sin tocar contracts.
 
-  BUG 1 — "Saltar" pausaba la ficha:
-    El planner (IntakeDecision.tipo) leyó "Saltar" como 'pausar' y el router
-    ejecutó pausar_ficha: _detecta_salto jamás corrió.
-    → pausar_ficha ahora tiene GUARDA: si el input es un salto válido para
-      la pregunta activa, registra el campo como None (skipped) y AVANZA.
-      Si la pregunta es requerida, explica y repregunta. Jamás pausa por
-      un salto. La pausa genuina queda intacta.
+  RAÍZ, con mecánica exacta:
+    1) El planner (1 LLM/turno) RELLENA campos sin señal: en el turno del
+       correo extrae area_caso del historial (incluido el EJEMPLO del
+       propio prompt del bot) y situacion_actual=<el correo>.
+    2) En el turno del toque de lista, area_caso ya está llena → la pregunta
+       activa es etapa → el toque "Pensión de alimentos" lo rechaza el
+       validador de etapa → retry injusto.
 
-  BUG 2 — Retry fantasma tras tocar la lista:
-    Log: "validador rechazó etapa_proceso: 'Pensión de alimentos'".
-    El usuario tocó la lista de ÁREA mientras el sistema creía activa la
-    pregunta ETAPA (el planner había contaminado area_caso re-extrayendo
-    del historial — incluido el EJEMPLO del propio prompt del bot).
-    → RESCATE CRUZADO (_rescue_pendiente): si el input no valida para la
-      pregunta activa pero calza con EXACTAMENTE UNA otra pendiente de
-      opciones, se adjudica ahí y el turno cuenta como éxito (ack propio,
-      cero attempts, siguiente pregunta real).
-    → EL USUARIO MANDA SOBRE LA EXTRACCIÓN: _aplicar_extraccion solo llena
-      campos AUSENTES y marca lo que llenó en la clave interna "_extraidos".
-      Si el usuario responde explícitamente un campo extraído con otro
-      valor, su input lo sobrescribe (_fijar_por_usuario).
-    → ANTI-CONTAMINACIÓN: valores de texto libre que contienen frases del
-      propio bot ("si te entendí bien", el ejemplo «me demandaron por la
-      pensión», etc.) o un email en situacion_actual se descartan.
-      (El transcript mostraba al usuario reenviando/citando burbujas del
-      bot; sin este filtro el planner se autoalimenta.)
+  FIX ESTRUCTURAL:
+  - ANCLAJE DE EXTRACCIÓN (_aplicar_extraccion + query): toda opción con
+    label_map (área/etapa/rol/ingresos) y detenido=True solo se acepta si
+    el MENSAJE DEL USUARIO del turno contiene señal de esa opción
+    (keyword, título o número válido). Sin señal → se descarta con log.
+    La extracción legítima no se toca: si el usuario cuenta su caso, las
+    keywords están en su propio mensaje y el anclaje pasa.
+  - RESCATE DE EXTRAÍDOS (_rescue_extraidos): si el input no calza con la
+    pregunta activa ni con otra pendiente, pero calza con exactamente UNA
+    aplicable ya llena POR EXTRACCIÓN, el usuario la confirma/corrige y se
+    repregunta la pendiente con prompt normal — NUNCA con "No lo ubiqué".
+    Limpia además la basura persistida en sesiones viejas.
+  - Situación real: situacion_actual valida con _v_relato (rechaza correos
+    y texto del propio bot) en extracción Y en validate directo. El campo
+    relato VUELVE a preguntarse tras el correo (antes se saltaba por la
+    contaminación y la ficha llegaba al abogado sin relato).
+  - Prompts sin ejemplos de materia («me demandaron por la pensión» era un
+    imán de autocontaminación cuando el usuario citaba/reenviaba la burbuja).
+  - Ack del campo respondido se emite siempre que tiene valor (cubre el
+    caso "confirma lo extraído con el mismo valor").
 
-  Además:
-    - La traducción de inputs interactivos ahora incluye los TÍTULOS de las
-      opciones (el dispatcher en producción entrega el título: "Pensión de
-      alimentos", "Aún no he iniciado nada"), no solo los ids.
-    - _avance_normal: un solo camino para "éxito / salto opcional /
-      rescate" (lo usan procesar_respuesta y pausar_ficha).
+  De v21 (se mantiene): guarda de salto en pausar_ficha (ya probada OK en
+  producción), rescate cruzado a pendientes, el usuario sobrescribe lo
+  extraído, extracción solo-ausentes + marca "_extraidos", confirmación de
+  área 1-toque con claves internas "_area_sugerida"/"_area_rechazada" (sin
+  tocar AgentState), mapa numérico legado del contrato (1-7, apremio→
+  pensión), bandas de confianza solo si el planner la calibra (>0),
+  _salida_intake, _cerrar_con_status, _pack_pregunta, _detecta_salto
+  endurecido, _es_urgencia solo afirmativo/vigente, notificar_crm=False.
 
-  De v20 (se mantiene): numeración IVR fuera, confirmación de área 1-toque
-  con "_area_sugerida" como clave INTERNA de intake_respuestas (nada de
-  claves top-level nuevas en AgentState), mapa numérico alineado al orden
-  legado del contrato (1-7, apremio→pensión), bandas de confianza solo si
-  el planner la calibra (>0), _salida_intake, _cerrar_con_status,
-  _pack_pregunta, _detecta_salto endurecido ("eso ya pasó" no es salto),
-  _es_urgencia solo afirmativo/vigente, notificar_crm=False en parcial.
+v20/v19/v18/v17 — ver historial previo.
 """
 import re
 import logging
@@ -88,11 +86,19 @@ _CONFIRMA_NO = frozenset({
     "no es eso no", "no exactamente", "en realidad no", "cambia", "cambiar",
 })
 
-# Bandas de IntakeDecision.confianza. SOLO se aplican si el planner manda
-# confianza > 0; con el default del contrato (0.0) la extracción fija el
-# dato directo, como siempre (cero regresión).
 _UMBRAL_AREA_DIRECTA = 0.75
 _UMBRAL_AREA_SUGERIDA = 0.40
+
+# Frases que SOLO puede decir el bot. Se usan para detectar eco del propio
+# asistente (el usuario cita/reenvía burbujas). NUNCA incluir frases que un
+# cliente pueda escribir como relato real ("me notificaron", "pensión", etc).
+_FRASES_BOT = (
+    "si te entendi bien", "gracias por contarmelo",
+    "para llevarte con la abogada", "toca la lista", "elige la opcion",
+    "se me escapo algo", "no lo ubique", "cuentame brevemente",
+    "a que correo te enviamos", "se que no siempre es facil",
+    "cual de estas se parece", "seguro que no siempre es facil",
+)
 
 
 # ===========================================================================
@@ -115,9 +121,6 @@ def _recortar(s, n: int) -> str:
 
 # ===========================================================================
 # FUENTES ÚNICAS DE OPCIONES
-# De AREAS/ETAPAS/ROLES/INGRESOS se derivan: títulos UI, interactivos,
-# label_maps (extracción del planner), keywords (validador) y ramas.
-# Keywords SIN tildes (se comparan contra _norm).
 # ===========================================================================
 
 AREAS: list[dict] = [
@@ -274,8 +277,20 @@ _INGRESOS_LABEL_MAP = {ext: g["canon"] for g in INGRESOS
 _CATS_FAMILIA = frozenset(
     ext for a in AREAS if a["rama"] == "familia" for ext in a["ids_ext"])
 
-# Mapa numérico alineado al orden LEGADO del contrato del planner
-# (_AREA_DESDE_NUMERO, 1-7) — no al orden de la UI (6, sin apremio).
+# v22 — catálogo de keywords por pregunta con opciones: lo usa el ANCLAJE
+# de la extracción (la opción extraída debe tener señal en el mensaje del
+# usuario; mata la alucinación del planner en mensajes sin señal, ej. el
+# turno del correo).
+_KW_POR_QID = {
+    "area_caso": _AREA_KEYWORDS,
+    "etapa_proceso": _ETAPA_KEYWORDS,
+    "rol_penal": _ROL_KEYWORDS,
+    "ingresos_rango": _INGRESOS_KEYWORDS,
+}
+
+_DETENIDO_KW = ("detenid", "detuvi", "carcel", "comisaria", "preso",
+                "presa", "aprehend", "control de detencion")
+
 _AREA_NUMEROS_LEGACY = [
     "pensión de alimentos",              # 1
     "régimen de visitas",                # 2
@@ -286,8 +301,6 @@ _AREA_NUMEROS_LEGACY = [
     "otro tema",                         # 7
 ]
 
-# Traducción de inputs interactivos: ids nativos Y títulos de opción.
-# (En producción el dispatcher entrega el TÍTULO: "Pensión de alimentos".)
 _TITULO_A_CANON = {
     _norm(o["ui"]): o["canon"]
     for fuente in (AREAS, ETAPAS, ROLES, INGRESOS) for o in fuente
@@ -311,8 +324,7 @@ def _traducir_id(raw: str) -> str:
 
 
 def traducir_input_interactivo(raw: str) -> str:
-    """API pública para el PLANNER del intake (mismo paquete): traducir ids/
-    títulos nativos → texto ANTES de llamar al LLM."""
+    """API pública para el PLANNER del intake (mismo paquete)."""
     return _traducir_id(raw)
 
 
@@ -321,8 +333,6 @@ def traducir_input_interactivo(raw: str) -> str:
 # ===========================================================================
 
 def _detecta_salto(raw: str) -> bool:
-    """"paso/pasar/pasa" solo cuenta si abre el mensaje o es ≤2 palabras:
-    "eso ya pasó hace tiempo" es RESPUESTA, no salto."""
     t = _norm(_traducir_id(raw))
     if not t:
         return False
@@ -368,7 +378,7 @@ def _detecta_humano(raw: str) -> bool:
 
 
 # ===========================================================================
-# URGENCIA — detección determinista (refuerzo 0-LLM al campo `detenido`)
+# URGENCIA — detección determinista
 # ===========================================================================
 _URGENTE_RE = re.compile(
     r"(me|lo|la|nos)\s+detuvieron"
@@ -392,7 +402,7 @@ _NEGACION_MED_RE = re.compile(
 )
 
 # ===========================================================================
-# TEXTOS POR DEFECTO (override por _cfg()["intake"])
+# TEXTOS POR DEFECTO
 # ===========================================================================
 DEFAULT_AP_IA = "Soy LeyIA, la asistente virtual de Manzzo y Cía. "
 DEFAULT_AP_EXP = ("Te haré unas preguntas rápidas (unos 2 minutos) para "
@@ -466,6 +476,22 @@ def _v_email(s):
     return s, None
 
 
+def _v_relato(s):
+    """v22 — situacion_actual: rechaza correos y eco del propio bot tanto en
+    extracción como en respuesta directa. Antes (validate=_v_text(8)) un
+    correo quedaba guardado como 'relato' y la ficha llegaba al abogado sin
+    los hechos."""
+    s = (s or "").strip()
+    if len(s) < 8:
+        return None, "relato muy corto"
+    t = _norm(s)
+    if EMAIL_RE.fullmatch(t.replace(" ", "")):
+        return None, "parece un correo, no un relato"
+    if any(f in t for f in _FRASES_BOT):
+        return None, "parece texto del asistente, no un relato"
+    return s, None
+
+
 def _v_si_no(s):
     t = _norm(_traducir_id(s))
     if t in ("si", "sipo", "sip", "yes", "claro", "por supuesto",
@@ -480,7 +506,6 @@ def _v_si_no(s):
 
 
 def _score_kw(t: str, catalogo: dict) -> list[tuple[str, int]]:
-    """keywords contenidas EN el mensaje (frases valen doble)."""
     scores: dict[str, int] = {}
     for canon, kws in catalogo.items():
         for kw in kws:
@@ -491,9 +516,6 @@ def _score_kw(t: str, catalogo: dict) -> list[tuple[str, int]]:
 
 def _v_opciones_nl(catalogo_kw: dict, aliases: dict | None = None,
                    numeros: list[str] | None = None):
-    """Validador por keywords: tolera frases naturales, aliases, títulos e
-    ids de opciones, y números. `numeros` fija el orden numérico (área usa
-    el legado del contrato)."""
     alias_map = {_norm(k): v for k, v in (aliases or {}).items()}
     orden = numeros or list(catalogo_kw)
 
@@ -528,8 +550,6 @@ def _v_nombre(s):
 
 
 def _match_confirmacion(texto_raw: str, sugerida: str) -> str | None:
-    """'si' | 'no' | None. Keywords de OTRA área pesan más que el sí/no:
-    "no, en realidad es por las visitas" clasifica a visitas."""
     t = _norm(texto_raw)
     alfa = " ".join(
         "".join(c for c in t if c.isalpha() or c.isspace()).split())
@@ -620,7 +640,10 @@ def _es_urgencia(state, respuestas: dict) -> bool:
 
 
 # ===========================================================================
-# QUESTIONS — tronco común + módulos por rama
+# QUESTIONS
+# v22: sin ejemplos de MATERIA en prompts de opciones (eran imán de
+# autocontaminación: el usuario cita la burbuja y el planner "aprende" el
+# ejemplo como si fuera el caso del cliente).
 # ===========================================================================
 QUESTIONS: list[dict] = [
     {"id": "consentimiento_datos", "requerida": True, "extractable": False,
@@ -665,17 +688,17 @@ QUESTIONS: list[dict] = [
                       "cuándo*? (si es un tema penal, solo lo general — "
                       "sin detalles sensibles del hecho)"),
      "ack": None,
-     "validate": _v_text(8)},
+     "validate": _v_relato},
 
     {"id": "area_caso", "requerida": True,
      "label": "el tipo de caso",
      "skip_if": lambda s, r=None: not _area_pendiente(s, r),
      "prompt": ("Para llevarte con la abogada correcta: ¿cuál de estas se "
                 "parece más a tu caso? 👇\nSi ninguna calza, cuéntamelo en "
-                "una frase corta y yo lo ubico — por ejemplo: *«me "
-                "demandaron por la pensión»*"),
+                "una frase corta y yo lo ubico."),
      "retry_prompt": ("No lo ubiqué 😅 Toca la lista aquí abajo y elige la "
-                      "que más se acerque, o escríbemelo en una frase corta."),
+                      "que más se acerque, o cuéntamelo en una frase corta "
+                      "(qué pasó y con quién)."),
      "ack": "Perfecto, con eso ya sé a quién derivarte ✓",
      "interactive": _INTERACTIVE_AREA,
      "label_map": _AREA_LABEL_MAP,
@@ -807,7 +830,7 @@ def _pendientes(state: AgentState, respuestas: dict) -> list[dict]:
 
 
 # ===========================================================================
-# CLAVES INTERNAS (sin tocar AgentState: viajan en intake_respuestas con
+# CLAVES INTERNAS (sin tocar AgentState: viven en intake_respuestas con
 # prefijo "_" y se excluyen de upsert_lead / ficha wa.me vía _publicas)
 # ===========================================================================
 
@@ -822,7 +845,7 @@ def _publicas(respuestas: dict) -> dict:
 
 def _fijar_por_usuario(respuestas: dict, qid: str, val) -> None:
     """El input explícito del usuario SIEMPRE manda: fija el valor y saca
-    el campo de la marca de extraídos (ya no es sobrescribible por nadie)."""
+    el campo de la marca de extraídos."""
     extraidos = [x for x in (respuestas.get(_K_EXTRAIDOS) or []) if x != qid]
     if extraidos:
         respuestas[_K_EXTRAIDOS] = extraidos
@@ -832,13 +855,33 @@ def _fijar_por_usuario(respuestas: dict, qid: str, val) -> None:
 
 
 def _rescue_pendiente(raw_eff: str, pend: list[dict]):
-    """v21 — Si el input calza con EXACTAMENTE UNA otra pendiente DE
-    OPCIONES, devolver (question, valor). Absorbe el descuadre entre la
-    pregunta mostrada y la que el sistema creía activa (ej: el usuario toca
-    la lista de área cuando el estado apuntaba a etapa)."""
+    """Si el input calza con EXACTAMENTE UNA otra pendiente DE OPCIONES,
+    devolver (question, valor)."""
     hits = []
     for q in pend[1:]:
-        if "label_map" not in q:  # solo preguntas de opciones cerradas
+        if "label_map" not in q:
+            continue
+        val, err = q["validate"](raw_eff)
+        if err is None and val is not None:
+            hits.append((q, val))
+            if len(hits) > 1:
+                return None
+    return hits[0] if hits else None
+
+
+def _rescue_extraidos(raw_eff: str, state: AgentState, respuestas: dict):
+    """v22 — Si el input calza con EXACTAMENTE UNA aplicable ya llena POR
+    EXTRACCIÓN, devolver (question, valor): el usuario está confirmando o
+    corrigiendo lo que el planner anotó. Cubre el descuadre en que la
+    pregunta activa ya no corresponde a la mostrada, y limpia basura
+    persistida en sesiones viejas."""
+    extraidos = respuestas.get(_K_EXTRAIDOS) or []
+    if not extraidos:
+        return None
+    hits = []
+    for q in _aplicables(state, respuestas):
+        qid = q["id"]
+        if qid not in extraidos or "label_map" not in q:
             continue
         val, err = q["validate"](raw_eff)
         if err is None and val is not None:
@@ -858,7 +901,7 @@ def _inferir_area_sugerida(respuestas: dict) -> str | None:
     if len(ranked) > 1 and ranked[1][1] == ranked[0][1]:
         return None
     if ranked[0][0] == respuestas.get(_K_RECHAZADA):
-        return None  # jamás re-sugerir la que el cliente descartó
+        return None
     return ranked[0][0]
 
 
@@ -897,8 +940,6 @@ def _form_pregunta(state: AgentState, q: dict, respuestas: dict,
 def _pack_pregunta(state: AgentState, respuestas: dict, skipped: set,
                    *, prefijo: list[str] | None = None,
                    nombre: str | None = None):
-    """(pack, pregunta, area_sugerida) para la siguiente pendiente; siembra/
-    limpia la hipótesis interna. None si no quedan pendientes."""
     pend = _pendientes(state, respuestas)
     if not pend:
         return None
@@ -958,13 +999,14 @@ def _join_labels(labels: list[str]) -> str:
 
 
 def _acks_turno(q_respondida: dict, antes: dict, respuestas: dict) -> list[str]:
-    """Acks del turno. q_respondida es la pregunta efectivamente respondida
-    (la activa, o la rescatada si el input calzó con otra pendiente)."""
+    """v22: el ack del campo respondido se emite siempre que tiene valor
+    (cubre "confirma con el mismo valor" — antes el usuario tocaba la lista
+    y no recibía confirmación alguna de SU respuesta)."""
     acks: list[str] = []
     qid = q_respondida["id"]
-    if respuestas.get(qid) is not None and respuestas.get(qid) != antes.get(qid):
+    if respuestas.get(qid) is not None:
         acks.append(_ack_campo(qid, respuestas))
-    elif qid in respuestas and respuestas[qid] is None and qid not in antes:
+    elif qid not in antes:
         acks.append("Ningún problema, lo dejamos así ✓")
     extras = _extras_turno(q_respondida, antes, respuestas,
                            excluir=frozenset({qid}))
@@ -973,18 +1015,6 @@ def _acks_turno(q_respondida: dict, antes: dict, respuestas: dict) -> list[str]:
                     + _join_labels([_BY_ID[q]["label"] for q in extras])
                     + " 👌")
     return acks
-
-
-# Frases que SOLO puede decir el bot: si aparecen en un valor extraído, el
-# planner se autocontaminó con el historial (ej: el usuario cita/reenvía la
-# burbuja del asistente) y el valor se descarta.
-_FRASES_BOT = (
-    "si te entendi bien", "gracias por contarmelo",
-    "para llevarte con la abogada", "toca la lista", "elige la opcion",
-    "se me escapo algo", "me demandaron por la pension", "no lo ubique",
-    "aun no parto", "ya me notificaron", "se que no siempre es facil",
-    "cuentame brevemente", "a que correo te enviamos",
-)
 
 
 def _valor_contaminado(qid: str, raw_txt, respuestas: dict) -> bool:
@@ -1003,55 +1033,81 @@ def _valor_contaminado(qid: str, raw_txt, respuestas: dict) -> bool:
 
 
 def _aplicar_extraccion(respuestas: dict, decision: dict,
-                        skipped: set | None = None) -> None:
-    """v21 — Tres guardas sobre la extracción del planner:
-      (1) SOLO llena campos ausentes: jamás sobrescribe lo que ya está
-          (el planner re-lee el historial cada turno y puede degradar).
-      (2) Lo que llena queda marcado en "_extraidos": el input explícito
-          del usuario puede sobrescribirlo después (_fijar_por_usuario).
-      (3) Texto libre contaminado con frases del propio bot se descarta.
-      Bandas de confianza (v20): solo si confianza > 0.
+                        skipped: set | None = None,
+                        query: str | None = None) -> None:
+    """v22 — Guardas sobre la extracción del planner:
+      (1) SOLO llena campos ausentes (jamás sobrescribe).
+      (2) Lo que llena queda marcado en "_extraidos": el usuario puede
+          sobrescribirlo después con input explícito.
+      (3) Texto libre con eco del propio bot o un email en el relato → fuera.
+      (4) ANCLAJE: las opciones con label_map (y detenido=True) solo se
+          aceptan si el mensaje del usuario del turno contiene señal de esa
+          opción (keyword / título / número). Un correo o un nombre no
+          anclan NADA → la alucinación del planner muere aquí.
     """
     conf = decision.get("confianza") or 0.0
     extraidos = list(respuestas.get(_K_EXTRAIDOS) or [])
+    t_query = _norm(_traducir_id(query or ""))
+
     for qid, qdef in _BY_ID.items():
         if qid in (skipped or set()):
             continue
         if not qdef.get("extractable", True):
             continue
-        if qid in respuestas:                       # guarda (1)
+        if qid in respuestas:                            # guarda (1)
             continue
         raw = decision.get(qid)
         if raw is None:
             continue
+
         if isinstance(raw, bool):
+            # guarda (4b): detenido=True exige señal en el mensaje
+            if (qid == "detenido" and raw is True and t_query
+                    and not any(k in t_query for k in _DETENIDO_KW)):
+                logger.info("[intake] detenido=True sin señal en el "
+                            "mensaje del usuario → descartado")
+                continue
             respuestas[qid] = raw
             if qid not in extraidos:
                 extraidos.append(qid)
             continue
+
         if "label_map" in qdef:
             canon = qdef["label_map"].get(str(raw))
             if canon is None:
                 logger.info("[intake] extracción sin label_map: %s=%r "
                             "(agregar el id a la fuente única)", qid, raw)
                 continue
+            # guarda (4): anclaje al mensaje del usuario
+            catalogo = _KW_POR_QID.get(qid)
+            if catalogo is not None and t_query:
+                kws = catalogo.get(canon) or set()
+                if not any(kw in t_query for kw in kws):
+                    val_q, err_q = qdef["validate"](t_query)
+                    if err_q is not None or val_q != canon:
+                        logger.info("[intake] extracción sin anclaje: "
+                                    "%s=%r no tiene señal en el mensaje "
+                                    "→ descartada", qid, canon)
+                        continue
             raw = canon
         elif _valor_contaminado(qid, raw, respuestas):   # guarda (3)
-            logger.info("[intake] extracción descartada (autocontaminación "
-                        "del historial): %s=%r", qid, str(raw)[:60])
+            logger.info("[intake] extracción descartada (eco del bot o "
+                        "email): %s=%r", qid, str(raw)[:60])
             continue
+
         if qid == "area_caso" and conf > 0:
             if conf < _UMBRAL_AREA_SUGERIDA:
-                logger.info("[intake] área extraída con confianza %.2f "
-                            "< %.2f → se ignora", conf, _UMBRAL_AREA_SUGERIDA)
+                logger.info("[intake] área con confianza %.2f < %.2f → "
+                            "ignorada", conf, _UMBRAL_AREA_SUGERIDA)
                 continue
             if conf < _UMBRAL_AREA_DIRECTA:
                 respuestas.setdefault(_K_SUGERIDA, str(raw))
                 continue
+
         val, err = qdef["validate"](raw)
         if err is None and val is not None:
             respuestas[qid] = val
-            if qid not in extraidos:                # guarda (2)
+            if qid not in extraidos:                     # guarda (2)
                 extraidos.append(qid)
         else:
             logger.info("[intake] extracción rechazada por validador: "
@@ -1073,8 +1129,7 @@ def _persistir_parcial(state: AgentState, respuestas: dict) -> None:
     if respuestas.get("consentimiento_datos") is not True:
         return
     try:
-        # notificar_crm=False: persistir por turno no spamea el CRM;
-        # handoff_humano es el emisor único (FIX #10).
+        # notificar_crm=False: handoff_humano es el emisor único (FIX #10).
         upsert_lead(
             thread_id=state.get("thread_id", ""),
             intake_respuestas=_publicas(respuestas),
@@ -1145,7 +1200,7 @@ def _cta_humano_con_ficha(respuestas: dict, thread_id: str,
 
 
 # ===========================================================================
-# SALIDA ÚNICA
+# SALIDA ÚNICA + AVANCE
 # ===========================================================================
 
 def _salida_intake(pack: dict, *, respuestas: dict, skipped: set,
@@ -1171,8 +1226,8 @@ def _salida_intake(pack: dict, *, respuestas: dict, skipped: set,
 
 def _avance_normal(state: AgentState, respuestas: dict, skipped: set,
                    q_respondida: dict | None, antes: dict) -> AgentState:
-    """Camino único de avance: éxito de validación, rescate cruzado o salto
-    opcional (lo usan procesar_respuesta y pausar_ficha v21)."""
+    """Camino único de avance: éxito, rescate (pendiente o extraído) o salto
+    opcional."""
     if respuestas.get("consentimiento_datos") is False:
         return sin_consentimiento(state, respuestas)
     if _es_urgencia(state, respuestas):
@@ -1216,7 +1271,7 @@ def iniciar_ficha(state: AgentState) -> AgentState:
         respuestas["telefono"] = tel
 
     _aplicar_extraccion(respuestas, state.get("intake_decision") or {},
-                        skipped=skipped)
+                        skipped=skipped, query=state.get("query"))
 
     if _es_urgencia(state, respuestas):
         return _derivar(state, respuestas, skipped=skipped, urgente=True)
@@ -1304,12 +1359,12 @@ def procesar_respuesta(state: AgentState) -> AgentState:
             logger.info("[intake] campo opcional saltado: %s",
                         q_actual["id"])
     else:
-        _aplicar_extraccion(respuestas, decision, skipped=skipped)
+        _aplicar_extraccion(respuestas, decision, skipped=skipped,
+                            query=raw)
 
         if q_actual["id"] in respuestas:
             campo_respondido = q_actual
-            # v21: si el planner la llenó ESTE turno y el usuario respondió
-            # algo distinto y válido, el usuario corrige la extracción.
+            # El usuario corrige lo que el planner acaba de extraer (v21).
             if q_actual["id"] in (respuestas.get(_K_EXTRAIDOS) or []):
                 val2, err2 = q_actual["validate"](raw_eff)
                 if (err2 is None and val2 is not None
@@ -1344,10 +1399,9 @@ def procesar_respuesta(state: AgentState) -> AgentState:
                         "intake_skipped": skipped,
                         "asistente_presentado": True,
                     }
-                # Otro texto → validate / rescate (c.2).
 
-            # (c.2) Validación directa; si falla, RESCATE cruzado (v21):
-            # el input se adjudica a la pendiente con la que SÍ calza.
+            # (c.2) Validación directa → rescate a pendiente (v21) →
+            # rescate a extraído (v22). Solo si todo falla: retry.
             if campo_respondido is None and q_actual["id"] not in respuestas:
                 val, err = q_actual["validate"](raw_eff)
                 if err is None and val is not None:
@@ -1358,6 +1412,10 @@ def procesar_respuesta(state: AgentState) -> AgentState:
                     campo_respondido = q_actual
                 else:
                     hit = _rescue_pendiente(raw_eff, pend)
+                    origen = "pendiente"
+                    if hit is None:
+                        hit = _rescue_extraidos(raw_eff, state, respuestas)
+                        origen = "extraído"
                     if hit:
                         q_resc, val_r = hit
                         _fijar_por_usuario(respuestas, q_resc["id"], val_r)
@@ -1366,9 +1424,9 @@ def procesar_respuesta(state: AgentState) -> AgentState:
                             respuestas.pop(_K_RECHAZADA, None)
                         campo_respondido = q_resc
                         logger.info(
-                            "[intake] rescate: input %r adjudicado a '%s' "
-                            "(la activa era '%s')", raw_eff[:50],
-                            q_resc["id"], q_actual["id"])
+                            "[intake] rescate(%s): input %r adjudicado a "
+                            "'%s' (la activa era '%s')", origen,
+                            raw_eff[:50], q_resc["id"], q_actual["id"])
                     else:
                         logger.info("[intake] validador rechazó %s: %s",
                                     q_actual["id"], err)
@@ -1389,8 +1447,8 @@ def procesar_respuesta(state: AgentState) -> AgentState:
         attempts += 1
 
     if not extras and attempts >= MAX_INTENTOS_CAMPO:
-        # Anti-bucle (P1): clasificar mal el área es barato; atrapar al
-        # usuario es carísimo. Fallback + revisión manual, y se AVANZA.
+        # Anti-bucle: clasificar mal el área es barato; atrapar al usuario
+        # es carísimo. Fallback + revisión manual, y se AVANZA.
         if q_actual["id"] == "area_caso":
             _fijar_por_usuario(respuestas, "area_caso", "otro tema")
             respuestas["area_revision_manual"] = True
@@ -1504,11 +1562,9 @@ def _completar_ficha(state: AgentState, respuestas: dict,
 
 
 def pausar_ficha(state: AgentState) -> AgentState:
-    """v21 — GUARDA anti-bug: el planner a veces clasifica "saltar" como
-    'pausar'. Si el input es un salto válido para la pregunta activa, NO se
-    pausa: la opcional queda en None (skipped) y se avanza; la requerida se
-    explica y se repregunta. La pausa genuina queda intacta.
-    """
+    """Guarda (fix probado en producción): "saltar" nunca pausa — la opcional
+    queda en None y se avanza; la requerida se repregunta. Pausa genuina
+    intacta."""
     sec = _cfg()["intake"]
     respuestas = dict(state.get("intake_respuestas") or {})
     skipped = set(state.get("intake_skipped") or ())
@@ -1542,7 +1598,6 @@ def pausar_ficha(state: AgentState) -> AgentState:
                 "asistente_presentado": True,
             }
 
-        # Salto legítimo de opcional: registrar como None y AVANZAR.
         antes = dict(respuestas)
         _fijar_por_usuario(respuestas, q["id"], None)
         skipped.add(q["id"])
@@ -1550,7 +1605,6 @@ def pausar_ficha(state: AgentState) -> AgentState:
                     "opcional: %s → avanza", q["id"])
         return _avance_normal(state, respuestas, skipped, q, antes)
 
-    # Pausa genuina.
     pack = _pack(["Perfecto, quedo aquí esperando. Cuando quieras retomar, "
                   "solo escríbeme 🤙"])
     _guardar_ai(state, pack["response"])
@@ -1650,7 +1704,7 @@ def derivar_urgente(state: AgentState) -> AgentState:
     respuestas = dict(state.get("intake_respuestas") or {})
     skipped = set(state.get("intake_skipped") or ())
     _aplicar_extraccion(respuestas, state.get("intake_decision") or {},
-                        skipped=skipped)
+                        skipped=skipped, query=state.get("query"))
     return _derivar(state, respuestas, skipped=skipped, urgente=True)
 
 
