@@ -1,9 +1,13 @@
 """integraciones/whatsapp/client.py — Adaptador Meta Cloud API.
 
-v1.1 — FIX CTA URL:
-  - display_text recortado a 25 caracteres (límite real de Meta para
-    cta_url; antes 80 y Meta rechazaba el mensaje con error 400).
-  - URL exigida en https:// (Meta rechaza http:// en cta_url).
+v1.2 — FIX CTA robusto + fallback a texto:
+  - _coerce_https_url(): normaliza URLs que llegan envueltas en markdown
+    [texto](https://...) o con puntuación colgante.
+  - _normalize_cta_payload(): extrae url del markdown y usa el texto del
+    enlace como display_text si éste viene vacío o es markdown.
+  - send_interactive(): si _build_interactive() falla por payload inválido,
+    se degrada el mensaje a send_text() con el body + URL rescatada, en
+    lugar de perderlo (era el bug de "interactive inválido ignorado").
 
 Restricciones Meta vigentes:
   - buttons: ≤3 botones, title ≤ 20.
@@ -30,9 +34,16 @@ MAX_ROW_DESC = 72
 MAX_LIST_ROWS = 10
 MAX_LIST_CTA = 20
 MAX_SECTION_TITLE = 24
-MAX_CTA_DISPLAY = 25  # v1.1: límite real de Meta para display_text de cta_url
+MAX_CTA_DISPLAY = 25
+MAX_URL_LEN = 2000
 
 _BR_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
+_MD_LINK_RE = re.compile(
+    r"\[\s*(?P<text>[^\]]*?)\s*\]\(\s*(?P<url>https?://[^\s)]+?)\s*\)",
+    re.IGNORECASE,
+)
+_BARE_URL_RE = re.compile(r"https?://[^\s)\]}]+", re.IGNORECASE)
+_URL_TRIM = "<>\"'`()[] \t\r\n"
 
 
 def _wa_clean(text: str) -> str:
@@ -59,6 +70,67 @@ def _row(o: dict) -> dict:
     if o.get("description"):
         row["description"] = _clip(o["description"], MAX_ROW_DESC)
     return row
+
+
+def _coerce_https_url(*candidates: str) -> str | None:
+    """Extrae y limpia una URL https válida de cualquier candidato.
+
+    Acepta URLs desnudas o envueltas en markdown [texto](https://...).
+    Devuelve None si no encuentra nada usable.
+    """
+    for raw in candidates:
+        if not raw:
+            continue
+        text = str(raw).strip()
+        if not text:
+            continue
+
+        m = _MD_LINK_RE.search(text)
+        url = m.group("url") if m else None
+        if not url:
+            m2 = _BARE_URL_RE.search(text)
+            url = m2.group(0) if m2 else None
+        if not url:
+            continue
+
+        url = url.strip(_URL_TRIM).rstrip(".,;:!?")
+        if url.lower().startswith("http://"):
+            url = "https://" + url[len("http://"):]
+        if not url.lower().startswith("https://"):
+            continue
+        if len(url) > MAX_URL_LEN:
+            continue
+        return url
+    return None
+
+
+def _normalize_cta_payload(interactive: dict) -> dict | None:
+    """Normaliza {text, url} para cta_url. Devuelve None si no es recuperable."""
+    raw_url = str(interactive.get("url") or "")
+    raw_text = str(interactive.get("text") or "").strip()
+
+    url = _coerce_https_url(raw_url, raw_text)
+    if not url:
+        return None
+
+    display_text = raw_text
+    if (not display_text
+            or _MD_LINK_RE.search(display_text)
+            or "http" in display_text.lower()):
+        md = _MD_LINK_RE.search(raw_url) or _MD_LINK_RE.search(raw_text)
+        display_text = (md.group("text").strip() if md else "") or "Abrir"
+
+    return {"text": _clip(display_text, MAX_CTA_DISPLAY), "url": url}
+
+
+def _salvage_url_for_fallback(interactive: dict) -> str | None:
+    """Best-effort: rescata una URL https del payload roto para adjuntarla al texto."""
+    return _coerce_https_url(
+        str(interactive.get("url") or ""),
+        str(interactive.get("text") or ""),
+        str(interactive.get("link") or ""),
+        str(interactive.get("cta") or ""),
+    )
 
 
 def _build_interactive(interactive: dict, body: str) -> dict:
@@ -111,17 +183,22 @@ def _build_interactive(interactive: dict, body: str) -> dict:
         }
 
     elif kind == "cta":
-        url = str(interactive.get("url") or "").strip()
-        # v1.1: Meta exige https; http:// es rechazado con error 400.
-        if not url.lower().startswith("https://"):
-            raise ValueError(f"cta requiere URL https: {url!r}")
+        cta = _normalize_cta_payload(interactive)
+        if cta is None:
+            raise ValueError(
+                f"cta requiere URL https válida; url={interactive.get('url')!r}"
+            )
+        if cta["url"] != str(interactive.get("url") or "").strip():
+            logger.info(
+                "[whatsapp] cta URL normalizada: %r -> %r",
+                interactive.get("url"), cta["url"],
+            )
         wa["type"] = "cta_url"
         wa["action"] = {
             "name": "cta_url",
             "parameters": {
-                # v1.1: 25 es el límite real de Meta; antes 80 (rompía).
-                "display_text": _clip(interactive.get("text") or "Pincha aquí", MAX_CTA_DISPLAY),
-                "url": url,
+                "display_text": cta["text"],
+                "url": cta["url"],
             },
         }
     else:
@@ -186,16 +263,35 @@ async def send_text(to: str, body: str) -> None:
 
 async def send_interactive(to: str, body: str, interactive: dict) -> dict:
     kind = interactive.get("kind") or interactive.get("type") or "unknown"
+    clean_body = _wa_clean(body)
     logger.info(
         "[whatsapp] interactivo a %s | kind=%s | body=%.120s%s",
-        to, kind, body, "..." if len(body) > 120 else ""
+        to, kind, clean_body, "..." if len(clean_body) > 120 else ""
     )
+
+    try:
+        wa_payload = _build_interactive(interactive, clean_body)
+    except (ValueError, KeyError, TypeError) as exc:
+        # Regla de oro: NUNCA perder el mensaje principal por un CTA mal formado.
+        logger.warning(
+            "[whatsapp] interactive inválido (%s); fallback a texto a %s | %r",
+            exc, to, interactive,
+        )
+        fallback = clean_body
+        url = _salvage_url_for_fallback(interactive)
+        if url and url not in fallback:
+            fallback = f"{fallback}\n\n{url}".strip()
+        if not fallback:
+            fallback = "No pude completar la acción solicitada."
+        await send_text(to, fallback)
+        return {"fallback": "text", "reason": str(exc), "messages": []}
+
     return await _post({
         "messaging_product": "whatsapp",
         "recipient_type": "individual",
         "to": to,
         "type": "interactive",
-        "interactive": _build_interactive(interactive, _wa_clean(body)),
+        "interactive": wa_payload,
     })
 
 
