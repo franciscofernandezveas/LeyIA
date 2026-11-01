@@ -1,69 +1,49 @@
 """graph/intake/nodes.py — Acciones del sub-agente INTAKE.
 
-v20 — Todo lo de v19, pero SIN TOCAR CONTRACTS (compat core v6.8 / intake v17):
+v21 — Fixes de producción (sin tocar contracts; sigue compat core v6.8 /
+intake v17). Evidencia en log del 2026-11-01:
 
-  - La hipótesis de área YA NO es clave top-level del estado: viaja como
-    clave INTERNA "_area_sugerida" / "_area_rechazada" dentro de
-    intake_respuestas (dict libre, ya tipado en AgentState). Las claves con
-    prefijo "_" se excluyen de upsert_lead (ver _publicas). Cuando el PR de
-    contracts declare intake_area_sugerida en AgentState, migrar es trivial.
-  - Los NÚMEROS del validador de área usan el orden legado del contrato
-    (_AREA_DESDE_NUMERO: 1-7, con medidas_apremio en 4 → pensión), no el
-    orden de la nueva UI de 6 ítems: un "5" tecleado significa lo mismo
-    para el planner y para este nodo. Etapa/rol/ingresos ya calzaban (1-4 /
-    1-3 / 1-4) y se derivan de las fuentes únicas.
-  - La banda de confianza del planner (IntakeDecision.confianza) solo se
-    aplica si el valor es > 0 (planner calibrado). Con el default 0.0 el
-    comportamiento es el de siempre: la extracción fija el dato directo.
-  - Se exporta traducir_input_interactivo() para que el PLANNER del intake
-    (mismo paquete, modificable sin tocar contracts) traduzca ids nativos
-    WA → texto antes de llamar al LLM. Red de seguridad local ya incluida.
+  BUG 1 — "Saltar" pausaba la ficha:
+    El planner (IntakeDecision.tipo) leyó "Saltar" como 'pausar' y el router
+    ejecutó pausar_ficha: _detecta_salto jamás corrió.
+    → pausar_ficha ahora tiene GUARDA: si el input es un salto válido para
+      la pregunta activa, registra el campo como None (skipped) y AVANZA.
+      Si la pregunta es requerida, explica y repregunta. Jamás pausa por
+      un salto. La pausa genuina queda intacta.
 
-  P0 (bugs, igual que v19):
-  - _BUTTON_ID_MAP: ids de listas/botones nativos ("area_3", "etapa_1",
-    "retry", "humano", "area_ok") se traducen a su texto ANTES de
-    validar → fin del bucle "elige de la lista".
-  - RESPUESTAS_HUMANO por fin se usa (_detecta_humano): pedir humano o
-    tocar el botón deriva de inmediato.
-  - _AREA_LABEL_MAP derivado de fuente única: rebaja_pension /
-    terminacion_pension / compensacion_economica ya no se descartan.
+  BUG 2 — Retry fantasma tras tocar la lista:
+    Log: "validador rechazó etapa_proceso: 'Pensión de alimentos'".
+    El usuario tocó la lista de ÁREA mientras el sistema creía activa la
+    pregunta ETAPA (el planner había contaminado area_caso re-extrayendo
+    del historial — incluido el EJEMPLO del propio prompt del bot).
+    → RESCATE CRUZADO (_rescue_pendiente): si el input no valida para la
+      pregunta activa pero calza con EXACTAMENTE UNA otra pendiente de
+      opciones, se adjudica ahí y el turno cuenta como éxito (ack propio,
+      cero attempts, siguiente pregunta real).
+    → EL USUARIO MANDA SOBRE LA EXTRACCIÓN: _aplicar_extraccion solo llena
+      campos AUSENTES y marca lo que llenó en la clave interna "_extraidos".
+      Si el usuario responde explícitamente un campo extraído con otro
+      valor, su input lo sobrescribe (_fijar_por_usuario).
+    → ANTI-CONTAMINACIÓN: valores de texto libre que contienen frases del
+      propio bot ("si te entendí bien", el ejemplo «me demandaron por la
+      pensión», etc.) o un email en situacion_actual se descartan.
+      (El transcript mostraba al usuario reenviando/citando burbujas del
+      bot; sin este filtro el planner se autoalimenta.)
 
-  P0 (UX, igual que v19):
-  - Sin numeración IVR en area_caso / etapa_proceso / rol_penal /
-    ingresos_rango: la lista nativa ES el elemento visual.
-  - Confirmación en vez de interrogación: si el relato (o el planner en
-    banda media de confianza) sugiere el área, se confirma con los botones
-    [Así es / No, es otra cosa]. "No" re-pregunta sin penalizar intentos y
-    no vuelve a sugerir la misma hipótesis.
-  - _form_pregunta sin contador "_1 de 7_".
+  Además:
+    - La traducción de inputs interactivos ahora incluye los TÍTULOS de las
+      opciones (el dispatcher en producción entrega el título: "Pensión de
+      alimentos", "Aún no he iniciado nada"), no solo los ids.
+    - _avance_normal: un solo camino para "éxito / salto opcional /
+      rescate" (lo usan procesar_respuesta y pausar_ficha).
 
-  P1:
-  - Validador _v_opciones_nl por keywords (kw ∈ mensaje, no mensaje ⊂
-    opción): entiende "me demandaron por la pensión de mi ex".
-  - Anti-bucle en area_caso: 2 fallos → "otro tema" +
-    area_revision_manual=True y se AVANZA (visible en el lead y el wa.me).
-  - Apremio subordinado a pensión en la UI (las keywords de apremio
-    puntúan a pensión); el detalle sigue en medidas_apremio.
-
-  P2 (estructura):
-  - Fuentes únicas AREAS/ETAPAS/ROLES/INGRESOS → derivan UI, interactivos,
-    label_maps, keywords y ramas.
-  - _salida_intake único (antes el mismo dict armado a mano ×5).
-  - derivar_parcial/derivar_urgente → un solo cuerpo _derivar.
-  - abandonar_ficha/sin_consentimiento → _cerrar_con_status (con defaults;
-    ya no hay KeyError si falta la config).
-  - _pack_pregunta único para "siguiente pregunta" (lo armaban 3 nodos).
-  - _pendientes calcula _aplicables una sola vez.
-  - _detecta_salto: "paso/pasar/pasa" ya no traga "eso ya pasó hace tiempo".
-  - _es_urgencia: medidas_apremio exige formulación afirmativa y descarta
-    negaciones/hipótesis ("aún no tengo orden de arresto pero me amenazaron").
-  - _persistir_parcial pasa notificar_crm=False (handoff_humano es el
-    emisor único — FIX #10).
-
-  intake_idx se sigue escribiendo (compat) pero queda DEPRECADO: la lógica
-  deriva de respuestas. Candidato a huérfano en el próximo PR de contracts.
-
-v18.2/v18.1/v18/v17/v16/v15 — ver historial previo.
+  De v20 (se mantiene): numeración IVR fuera, confirmación de área 1-toque
+  con "_area_sugerida" como clave INTERNA de intake_respuestas (nada de
+  claves top-level nuevas en AgentState), mapa numérico alineado al orden
+  legado del contrato (1-7, apremio→pensión), bandas de confianza solo si
+  el planner la calibra (>0), _salida_intake, _cerrar_con_status,
+  _pack_pregunta, _detecta_salto endurecido ("eso ya pasó" no es salto),
+  _es_urgencia solo afirmativo/vigente, notificar_crm=False en parcial.
 """
 import re
 import logging
@@ -98,8 +78,6 @@ RESPUESTAS_HUMANO = ("hablar con humano", "hablar con una persona",
                      "hablar con la ejecutiva", "hablar con un abogado",
                      "hablar con una abogada")
 
-# Confirmación de área (degradado nivel 2). El match es por prefijo sobre
-# texto alfanumérico para tolerar títulos de botón con emoji ("Así es 🙌").
 _CONFIRMA_SI = frozenset({
     "si", "sipo", "sip", "yes", "asi es", "exacto", "exactamente",
     "correcto", "claro", "eso", "eso mismo", "afirmativo", "de acuerdo",
@@ -111,10 +89,10 @@ _CONFIRMA_NO = frozenset({
 })
 
 # Bandas de IntakeDecision.confianza. SOLO se aplican si el planner manda
-# confianza > 0; con el default del contrato (0.0, "no calibrado") la
-# extracción fija el dato directo, como hasta ahora (sin regresión).
-_UMBRAL_AREA_DIRECTA = 0.75   # ≥ → se fija sin preguntar
-_UMBRAL_AREA_SUGERIDA = 0.40  # [sugerida, directa) → confirmación 1 toque
+# confianza > 0; con el default del contrato (0.0) la extracción fija el
+# dato directo, como siempre (cero regresión).
+_UMBRAL_AREA_DIRECTA = 0.75
+_UMBRAL_AREA_SUGERIDA = 0.40
 
 
 # ===========================================================================
@@ -136,10 +114,10 @@ def _recortar(s, n: int) -> str:
 
 
 # ===========================================================================
-# FUENTES ÚNICAS DE OPCIONES (P2)
+# FUENTES ÚNICAS DE OPCIONES
 # De AREAS/ETAPAS/ROLES/INGRESOS se derivan: títulos UI, interactivos,
 # label_maps (extracción del planner), keywords (validador) y ramas.
-# Las keywords van SIN tildes (se comparan contra _norm).
+# Keywords SIN tildes (se comparan contra _norm).
 # ===========================================================================
 
 AREAS: list[dict] = [
@@ -149,8 +127,6 @@ AREAS: list[dict] = [
      "rama": "familia",
      "ids_ext": {"pension_alimentos", "rebaja_pension", "terminacion_pension",
                  "medidas_apremio", "alimentos"},
-     # Apremio subordinado: en Chile el apremio familiar ES cobranza de
-     # pensión; el detalle se pide después en medidas_apremio.
      "kw": {"pension", "alimento", "alimentos", "alimentaria",
             "cuota alimentaria", "cuota", "rebajar", "rebaja", "rebajarla",
             "aumento de pension", "aumentar la pension", "dejar de pagar",
@@ -224,7 +200,6 @@ ETAPAS: list[dict] = [
      "kw": {"causa", "juicio", "tribunal", "en tramite", "tramitacion",
             "abogado actual", "ya tengo abogado", "mediacion", "rit",
             "rol de la causa"}},
-    # "audiencia" queda fuera a propósito: es ambigua con penal.
     {"canon": "sentencia o acuerdo previa",
      "ui": "Hay sentencia o acuerdo",
      "ids_ext": {"sentencia_previa", "acuerdo_previo"},
@@ -299,28 +274,30 @@ _INGRESOS_LABEL_MAP = {ext: g["canon"] for g in INGRESOS
 _CATS_FAMILIA = frozenset(
     ext for a in AREAS if a["rama"] == "familia" for ext in a["ids_ext"])
 
-# v20: el orden NUMÉRICO del validador de área sigue el mapa legado del
-# contrato del planner (_AREA_DESDE_NUMERO, 1-7) — no el orden de la nueva
-# UI (sin apremio en 4). Un "4" tecleado significa lo mismo en ambos
-# caminos. Cuando el PR de contracts actualice el mapa a 6, alinear aquí.
+# Mapa numérico alineado al orden LEGADO del contrato del planner
+# (_AREA_DESDE_NUMERO, 1-7) — no al orden de la UI (6, sin apremio).
 _AREA_NUMEROS_LEGACY = [
     "pensión de alimentos",              # 1
     "régimen de visitas",                # 2
     "divorcio / compensación económica", # 3
-    "pensión de alimentos",              # 4: era "medidas_apremio" → subordinado
+    "pensión de alimentos",              # 4: apremio → subordinado
     "derecho penal",                     # 5
     "laboral / civil",                   # 6
     "otro tema",                         # 7
 ]
 
-# id de opción/botón nativo → texto canónico. Se aplica a TODO input del
-# usuario antes de interpretarlo (validador, salto, humano, reintento,
-# confirmación).
+# Traducción de inputs interactivos: ids nativos Y títulos de opción.
+# (En producción el dispatcher entrega el TÍTULO: "Pensión de alimentos".)
+_TITULO_A_CANON = {
+    _norm(o["ui"]): o["canon"]
+    for fuente in (AREAS, ETAPAS, ROLES, INGRESOS) for o in fuente
+}
 _BUTTON_ID_MAP = {
     **{f"area_{i + 1}": a["canon"] for i, a in enumerate(AREAS)},
     **{f"etapa_{i + 1}": e["canon"] for i, e in enumerate(ETAPAS)},
     **{f"rol_{i + 1}": r["canon"] for i, r in enumerate(ROLES)},
     **{f"ing_{i + 1}": g["canon"] for i, g in enumerate(INGRESOS)},
+    **_TITULO_A_CANON,
     "retry": "lo intento de nuevo",
     "humano": "hablar con humano",
     "area_ok": "asi es",
@@ -329,16 +306,13 @@ _BUTTON_ID_MAP = {
 
 
 def _traducir_id(raw: str) -> str:
-    """Si `raw` es el id de una opción/botón interactivo, devuelve su texto
-    canónico; si no, devuelve `raw` tal cual. P0: las listas/botones WA
-    devuelven el ID, no el título."""
+    """id o título de opción/botón nativo → texto canónico; si no, raw."""
     return _BUTTON_ID_MAP.get(_norm(raw), raw)
 
 
 def traducir_input_interactivo(raw: str) -> str:
-    """API pública para el PLANNER del intake (mismo paquete): traducir ids
-    nativos WhatsApp → texto ANTES de llamar al LLM. Uso de una línea en el
-    planner:  query_eff = traducir_input_interactivo(query)"""
+    """API pública para el PLANNER del intake (mismo paquete): traducir ids/
+    títulos nativos → texto ANTES de llamar al LLM."""
     return _traducir_id(raw)
 
 
@@ -347,8 +321,8 @@ def traducir_input_interactivo(raw: str) -> str:
 # ===========================================================================
 
 def _detecta_salto(raw: str) -> bool:
-    """v20: "paso/pasar/pasa" solo cuenta como salto si abre el mensaje o el
-    mensaje es de ≤2 palabras — "eso ya pasó hace tiempo" es RESPUESTA."""
+    """"paso/pasar/pasa" solo cuenta si abre el mensaje o es ≤2 palabras:
+    "eso ya pasó hace tiempo" es RESPUESTA, no salto."""
     t = _norm(_traducir_id(raw))
     if not t:
         return False
@@ -368,7 +342,7 @@ def _detecta_salto(raw: str) -> bool:
     if any(p in claves_fuertes for p in palabras):
         return True
 
-    claves_debiles = {"paso", "pasar", "pasa"}  # ambiguas: verbo "pasar"
+    claves_debiles = {"paso", "pasar", "pasa"}
     if any(p in claves_debiles for p in palabras):
         return palabras[0] in claves_debiles or len(palabras) <= 2
 
@@ -380,8 +354,6 @@ def _detecta_salto(raw: str) -> bool:
 
 
 def _detecta_humano(raw: str) -> bool:
-    """Pedido explícito de hablar con una persona (texto o botón "humano").
-    P0: antes RESPUESTAS_HUMANO era código muerto en este archivo."""
     t = _norm(_traducir_id(raw))
     if not t:
         return False
@@ -408,8 +380,6 @@ _URGENTE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Sobre medidas_apremio (texto libre) solo formulaciones AFIRMATIVAS y
-# vigentes; se descartan negaciones e hipótesis.
 _ORDEN_ARRESTO_AFIRMA_RE = re.compile(
     r"(tengo|me\s+(dictaron|pusieron|llego)|hay)\s+[^,.]{0,25}orden\s+de\s+arresto"
     r"|^orden\s+de\s+arresto$",
@@ -510,9 +480,7 @@ def _v_si_no(s):
 
 
 def _score_kw(t: str, catalogo: dict) -> list[tuple[str, int]]:
-    """Puntúa opciones por keywords contenidas EN el mensaje (frases valen
-    doble). Semántica v19+: kw ∈ mensaje; antes era mensaje ⊂ opción y solo
-    entendía respuestas telegráficas."""
+    """keywords contenidas EN el mensaje (frases valen doble)."""
     scores: dict[str, int] = {}
     for canon, kws in catalogo.items():
         for kw in kws:
@@ -523,9 +491,9 @@ def _score_kw(t: str, catalogo: dict) -> list[tuple[str, int]]:
 
 def _v_opciones_nl(catalogo_kw: dict, aliases: dict | None = None,
                    numeros: list[str] | None = None):
-    """Validador por keywords: tolera frases naturales, aliases, ids
-    interactivos y números. `numeros` permite fijar un orden numérico
-    distinto al del catálogo (área: orden legado del contrato, ver v20)."""
+    """Validador por keywords: tolera frases naturales, aliases, títulos e
+    ids de opciones, y números. `numeros` fija el orden numérico (área usa
+    el legado del contrato)."""
     alias_map = {_norm(k): v for k, v in (aliases or {}).items()}
     orden = numeros or list(catalogo_kw)
 
@@ -560,11 +528,8 @@ def _v_nombre(s):
 
 
 def _match_confirmacion(texto_raw: str, sugerida: str) -> str | None:
-    """'si' | 'no' | None (ambiguo → caer al validador por keywords).
-
-    Prioridad a las keywords: "no, en realidad es por las visitas" clasifica
-    a visitas (no re-pregunta). Tolerante a títulos de botón con emoji.
-    """
+    """'si' | 'no' | None. Keywords de OTRA área pesan más que el sí/no:
+    "no, en realidad es por las visitas" clasifica a visitas."""
     t = _norm(texto_raw)
     alfa = " ".join(
         "".join(c for c in t if c.isalpha() or c.isspace()).split())
@@ -587,7 +552,7 @@ def _match_confirmacion(texto_raw: str, sugerida: str) -> str | None:
 
 
 # ===========================================================================
-# INTERACTIVOS (generados desde las fuentes únicas)
+# INTERACTIVOS
 # ===========================================================================
 
 def _botones(*id_title) -> dict:
@@ -619,14 +584,8 @@ _INTERACTIVE_INGRESOS = _lista("ing", INGRESOS, "Ver opciones", "Tus ingresos")
 # ===========================================================================
 # RAMAS TEMÁTICAS
 # ===========================================================================
-# (1) señales duras ya capturadas (detenido / rol_penal) → penal
-# (2) category del padre ∈ cats familia → familia
-# (3) area_caso declarada/extraída → rama por fuente única
-# (4) "pendiente" → area_caso se pregunta (o se confirma)
-# ===========================================================================
 
 def _rama(state, respuestas=None) -> str:
-    """'familia' | 'penal' | 'general_otra' | 'pendiente'."""
     resp = respuestas if respuestas is not None \
         else (state.get("intake_respuestas") or {})
 
@@ -650,9 +609,6 @@ def _area_pendiente(s, r=None): return _rama(s, r) == "pendiente"
 
 
 def _es_urgencia(state, respuestas: dict) -> bool:
-    """Hecho de urgencia vigente: detención u orden de arresto.
-    v20: sobre texto libre de medidas_apremio solo cuentan formulaciones
-    afirmativas y vigentes (antes una hipótesis gatillaba handoff falso)."""
     if respuestas.get("detenido") is True:
         return True
     if _URGENTE_RE.search(state.get("query") or ""):
@@ -665,11 +621,8 @@ def _es_urgencia(state, respuestas: dict) -> bool:
 
 # ===========================================================================
 # QUESTIONS — tronco común + módulos por rama
-# Prompts SIN numeración IVR cuando hay lista nativa; el orden de la lista
-# define la secuencia y skip_if(state, respuestas) la recalcula cada turno.
 # ===========================================================================
 QUESTIONS: list[dict] = [
-    # ================= TRONCO COMÚN =================
     {"id": "consentimiento_datos", "requerida": True, "extractable": False,
      "label": "tu autorización",
      "prompt": ("Para poder revisar tu caso y que un abogado te contacte, "
@@ -714,10 +667,6 @@ QUESTIONS: list[dict] = [
      "ack": None,
      "validate": _v_text(8)},
 
-    # Clasificadora con degradado en 3 niveles:
-    #   1) rama clara por category/extracción → skip_if
-    #   2) hipótesis (relato o planner en banda media) → confirmación 1 toque
-    #   3) sin señal → lista nativa SIN numeración en el cuerpo
     {"id": "area_caso", "requerida": True,
      "label": "el tipo de caso",
      "skip_if": lambda s, r=None: not _area_pendiente(s, r),
@@ -732,7 +681,7 @@ QUESTIONS: list[dict] = [
      "label_map": _AREA_LABEL_MAP,
      "validate": _v_opciones_nl(
          _AREA_KEYWORDS,
-         numeros=_AREA_NUMEROS_LEGACY,  # v20: alineado al contrato del planner
+         numeros=_AREA_NUMEROS_LEGACY,
          aliases={"ver a mis hijos": "régimen de visitas",
                   "tema penal": "derecho penal",
                   "penal": "derecho penal",
@@ -747,7 +696,7 @@ QUESTIONS: list[dict] = [
 
     {"id": "etapa_proceso", "requerida": False,
      "label": "la etapa del caso",
-     "skip_if": lambda s, r=None: _es_penal(s, r),  # penal tiene etapa propia
+     "skip_if": lambda s, r=None: _es_penal(s, r),
      "prompt": ("¿Y cómo va tu caso hoy? 👇 Aún no partes, ya te demandaron "
                 "o notificaron, hay una causa en curso, o ya existe una "
                 "sentencia o acuerdo."),
@@ -759,7 +708,6 @@ QUESTIONS: list[dict] = [
      "validate": _v_opciones_nl(_ETAPA_KEYWORDS),
      "label_map": _ETAPA_LABEL_MAP},
 
-    # ================= MÓDULO FAMILIA =================
     {"id": "hijos_menores", "requerida": False,
      "label": "los hijos menores",
      "skip_if": lambda s, r=None: not _es_familia(s, r),
@@ -799,9 +747,6 @@ QUESTIONS: list[dict] = [
      "ack": "Anotado ✓",
      "validate": _v_text(2)},
 
-    # ================= MÓDULO PENAL =================
-    # Ficha deliberadamente CORTA: un imputado no debe autoincriminarse por
-    # WhatsApp. Lo relevante es rol + urgencia + audiencia, y derivar.
     {"id": "rol_penal", "requerida": True,
      "label": "tu rol en el caso",
      "skip_if": lambda s, r=None: not _es_penal(s, r),
@@ -836,7 +781,6 @@ QUESTIONS: list[dict] = [
      "ack": "Anotado ✓",
      "validate": _v_text(2)},
 
-    # ================= CIERRE (todas las ramas) =================
     {"id": "comuna", "requerida": False,
      "label": "tu comuna",
      "prompt": ("¿En qué *comuna o ciudad* estás? (para ubicar el tribunal "
@@ -858,30 +802,53 @@ def _aplicables(state: AgentState, respuestas: dict | None = None) -> list[dict]
 
 
 def _pendientes(state: AgentState, respuestas: dict) -> list[dict]:
-    aplicables = _aplicables(state, respuestas)  # v19+: una sola llamada
+    aplicables = _aplicables(state, respuestas)
     return [q for q in aplicables if q["id"] not in respuestas]
 
 
 # ===========================================================================
-# CLAVES INTERNAS (v20: hipótesis de área SIN tocar AgentState)
-# Viajan dentro de intake_respuestas con prefijo "_" y se excluyen de
-# upsert_lead. Cuando el PR de contracts declare intake_area_sugerida
-# top-level, migrar es cambiar estos accesos por la clave nueva.
+# CLAVES INTERNAS (sin tocar AgentState: viajan en intake_respuestas con
+# prefijo "_" y se excluyen de upsert_lead / ficha wa.me vía _publicas)
 # ===========================================================================
 
-_K_SUGERIDA = "_area_sugerida"    # hipótesis pendiente de confirmar
+_K_SUGERIDA = "_area_sugerida"    # hipótesis de área pendiente de confirmar
 _K_RECHAZADA = "_area_rechazada"  # hipótesis que el cliente descartó
+_K_EXTRAIDOS = "_extraidos"       # campos llenados por el planner (lista)
 
 
 def _publicas(respuestas: dict) -> dict:
-    """Copia sin claves internas (prefijo '_'): lo que va a upsert_lead y
-    a la ficha wa.me."""
     return {k: v for k, v in respuestas.items() if not k.startswith("_")}
 
 
+def _fijar_por_usuario(respuestas: dict, qid: str, val) -> None:
+    """El input explícito del usuario SIEMPRE manda: fija el valor y saca
+    el campo de la marca de extraídos (ya no es sobrescribible por nadie)."""
+    extraidos = [x for x in (respuestas.get(_K_EXTRAIDOS) or []) if x != qid]
+    if extraidos:
+        respuestas[_K_EXTRAIDOS] = extraidos
+    else:
+        respuestas.pop(_K_EXTRAIDOS, None)
+    respuestas[qid] = val
+
+
+def _rescue_pendiente(raw_eff: str, pend: list[dict]):
+    """v21 — Si el input calza con EXACTAMENTE UNA otra pendiente DE
+    OPCIONES, devolver (question, valor). Absorbe el descuadre entre la
+    pregunta mostrada y la que el sistema creía activa (ej: el usuario toca
+    la lista de área cuando el estado apuntaba a etapa)."""
+    hits = []
+    for q in pend[1:]:
+        if "label_map" not in q:  # solo preguntas de opciones cerradas
+            continue
+        val, err = q["validate"](raw_eff)
+        if err is None and val is not None:
+            hits.append((q, val))
+            if len(hits) > 1:
+                return None
+    return hits[0] if hits else None
+
+
 def _inferir_area_sugerida(respuestas: dict) -> str | None:
-    """Hipótesis de área desde el relato (0-LLM). Exige score ≥ 2 y sin
-    empate; jamás re-sugiere el área que el cliente ya descartó."""
     relato = _norm(respuestas.get("situacion_actual") or "")
     if len(relato) < 6:
         return None
@@ -891,7 +858,7 @@ def _inferir_area_sugerida(respuestas: dict) -> str | None:
     if len(ranked) > 1 and ranked[1][1] == ranked[0][1]:
         return None
     if ranked[0][0] == respuestas.get(_K_RECHAZADA):
-        return None
+        return None  # jamás re-sugerir la que el cliente descartó
     return ranked[0][0]
 
 
@@ -914,7 +881,7 @@ def _form_pregunta(state: AgentState, q: dict, respuestas: dict,
         head = (f"Ya casi{', ' + nombre if nombre else ''} 🙌 "
                 "solo me falta esto:\n")
     else:
-        head = ""  # sin contador "_1 de 7_": la ficha no es un formulario
+        head = ""
 
     if q["id"] == "area_caso" and area_sugerida:
         frase = _AREA_FRASE.get(area_sugerida, area_sugerida)
@@ -931,8 +898,7 @@ def _pack_pregunta(state: AgentState, respuestas: dict, skipped: set,
                    *, prefijo: list[str] | None = None,
                    nombre: str | None = None):
     """(pack, pregunta, area_sugerida) para la siguiente pendiente; siembra/
-    limpia la hipótesis interna en `respuestas`. Único punto donde se arma
-    "burbujas previas + pregunta". None si no quedan pendientes."""
+    limpia la hipótesis interna. None si no quedan pendientes."""
     pend = _pendientes(state, respuestas)
     if not pend:
         return None
@@ -977,9 +943,10 @@ def _ack_campo(qid: str, respuestas: dict) -> str:
     return tpl.format(nombre=nombre or "")
 
 
-def _extras_turno(q_actual: dict, antes: dict, despues: dict) -> list[str]:
+def _extras_turno(q_actual: dict, antes: dict, despues: dict,
+                  excluir: frozenset = frozenset()) -> list[str]:
     return [qid for qid in _BY_ID
-            if qid != q_actual["id"]
+            if qid != q_actual["id"] and qid not in excluir
             and despues.get(qid) is not None
             and despues.get(qid) != antes.get(qid)]
 
@@ -990,14 +957,17 @@ def _join_labels(labels: list[str]) -> str:
     return ", ".join(labels[:-1]) + " y " + labels[-1]
 
 
-def _acks_turno(q_actual: dict, antes: dict, respuestas: dict) -> list[str]:
+def _acks_turno(q_respondida: dict, antes: dict, respuestas: dict) -> list[str]:
+    """Acks del turno. q_respondida es la pregunta efectivamente respondida
+    (la activa, o la rescatada si el input calzó con otra pendiente)."""
     acks: list[str] = []
-    qid = q_actual["id"]
+    qid = q_respondida["id"]
     if respuestas.get(qid) is not None and respuestas.get(qid) != antes.get(qid):
         acks.append(_ack_campo(qid, respuestas))
     elif qid in respuestas and respuestas[qid] is None and qid not in antes:
         acks.append("Ningún problema, lo dejamos así ✓")
-    extras = _extras_turno(q_actual, antes, respuestas)
+    extras = _extras_turno(q_respondida, antes, respuestas,
+                           excluir=frozenset({qid}))
     if extras:
         acks.append("De paso ya tengo "
                     + _join_labels([_BY_ID[q]["label"] for q in extras])
@@ -1005,21 +975,59 @@ def _acks_turno(q_actual: dict, antes: dict, respuestas: dict) -> list[str]:
     return acks
 
 
+# Frases que SOLO puede decir el bot: si aparecen en un valor extraído, el
+# planner se autocontaminó con el historial (ej: el usuario cita/reenvía la
+# burbuja del asistente) y el valor se descarta.
+_FRASES_BOT = (
+    "si te entendi bien", "gracias por contarmelo",
+    "para llevarte con la abogada", "toca la lista", "elige la opcion",
+    "se me escapo algo", "me demandaron por la pension", "no lo ubique",
+    "aun no parto", "ya me notificaron", "se que no siempre es facil",
+    "cuentame brevemente", "a que correo te enviamos",
+)
+
+
+def _valor_contaminado(qid: str, raw_txt, respuestas: dict) -> bool:
+    t = _norm(str(raw_txt or ""))
+    if not t:
+        return True
+    if any(f in t for f in _FRASES_BOT):
+        return True
+    if qid == "situacion_actual":
+        compacto = t.replace(" ", "")
+        if EMAIL_RE.fullmatch(compacto):
+            return True
+        if t == _norm(respuestas.get("email") or ""):
+            return True
+    return False
+
+
 def _aplicar_extraccion(respuestas: dict, decision: dict,
                         skipped: set | None = None) -> None:
-    """v20: bandas de confianza SOLO si el planner la calibró (>0).
-    confianza=0.0 (default del contrato) → comportamiento de siempre."""
+    """v21 — Tres guardas sobre la extracción del planner:
+      (1) SOLO llena campos ausentes: jamás sobrescribe lo que ya está
+          (el planner re-lee el historial cada turno y puede degradar).
+      (2) Lo que llena queda marcado en "_extraidos": el input explícito
+          del usuario puede sobrescribirlo después (_fijar_por_usuario).
+      (3) Texto libre contaminado con frases del propio bot se descarta.
+      Bandas de confianza (v20): solo si confianza > 0.
+    """
     conf = decision.get("confianza") or 0.0
+    extraidos = list(respuestas.get(_K_EXTRAIDOS) or [])
     for qid, qdef in _BY_ID.items():
         if qid in (skipped or set()):
             continue
         if not qdef.get("extractable", True):
+            continue
+        if qid in respuestas:                       # guarda (1)
             continue
         raw = decision.get(qid)
         if raw is None:
             continue
         if isinstance(raw, bool):
             respuestas[qid] = raw
+            if qid not in extraidos:
+                extraidos.append(qid)
             continue
         if "label_map" in qdef:
             canon = qdef["label_map"].get(str(raw))
@@ -1028,7 +1036,10 @@ def _aplicar_extraccion(respuestas: dict, decision: dict,
                             "(agregar el id a la fuente única)", qid, raw)
                 continue
             raw = canon
-        # Banda de área: débil → ignorar; media → confirmar (no fijar)
+        elif _valor_contaminado(qid, raw, respuestas):   # guarda (3)
+            logger.info("[intake] extracción descartada (autocontaminación "
+                        "del historial): %s=%r", qid, str(raw)[:60])
+            continue
         if qid == "area_caso" and conf > 0:
             if conf < _UMBRAL_AREA_SUGERIDA:
                 logger.info("[intake] área extraída con confianza %.2f "
@@ -1040,9 +1051,13 @@ def _aplicar_extraccion(respuestas: dict, decision: dict,
         val, err = qdef["validate"](raw)
         if err is None and val is not None:
             respuestas[qid] = val
+            if qid not in extraidos:                # guarda (2)
+                extraidos.append(qid)
         else:
             logger.info("[intake] extracción rechazada por validador: "
                         "%s=%r (%s)", qid, raw, err)
+    if extraidos:
+        respuestas[_K_EXTRAIDOS] = extraidos
 
 
 def _lead_updates(respuestas: dict) -> dict:
@@ -1058,8 +1073,8 @@ def _persistir_parcial(state: AgentState, respuestas: dict) -> None:
     if respuestas.get("consentimiento_datos") is not True:
         return
     try:
-        # notificar_crm=False (v20): persistir por turno no spamea el CRM;
-        # handoff_humano sigue siendo el emisor único (FIX #10).
+        # notificar_crm=False: persistir por turno no spamea el CRM;
+        # handoff_humano es el emisor único (FIX #10).
         upsert_lead(
             thread_id=state.get("thread_id", ""),
             intake_respuestas=_publicas(respuestas),
@@ -1089,7 +1104,7 @@ def _texto_ficha_wa(respuestas: dict, thread_id: str,
         lineas.append("• ⚠️ Clasificar el área a mano "
                       "(el cliente no logró ubicarla)")
     if respuestas.get("urgencia_legal"):
-        lineas.append("• ⚠️ URGENTE: detención u orden vigente")
+        lineas.append("• URGENTE: detención u orden vigente")
     if respuestas.get("rol_penal"):
         lineas.append(f"• Rol (penal): {respuestas['rol_penal']}")
     if respuestas.get("audiencia_proxima"):
@@ -1130,7 +1145,7 @@ def _cta_humano_con_ficha(respuestas: dict, thread_id: str,
 
 
 # ===========================================================================
-# SALIDA ÚNICA (antes el mismo dict lo armaban 5 nodos a mano)
+# SALIDA ÚNICA
 # ===========================================================================
 
 def _salida_intake(pack: dict, *, respuestas: dict, skipped: set,
@@ -1152,6 +1167,40 @@ def _salida_intake(pack: dict, *, respuestas: dict, skipped: set,
     if closed:
         out["closed"] = True
     return out
+
+
+def _avance_normal(state: AgentState, respuestas: dict, skipped: set,
+                   q_respondida: dict | None, antes: dict) -> AgentState:
+    """Camino único de avance: éxito de validación, rescate cruzado o salto
+    opcional (lo usan procesar_respuesta y pausar_ficha v21)."""
+    if respuestas.get("consentimiento_datos") is False:
+        return sin_consentimiento(state, respuestas)
+    if _es_urgencia(state, respuestas):
+        return _derivar(state, respuestas, skipped=skipped, urgente=True)
+
+    pend = _pendientes(state, respuestas)
+    if not pend:
+        return _completar_ficha(state, respuestas, skipped=skipped)
+
+    _persistir_parcial(state, respuestas)
+    nombre = _primer_nombre(respuestas.get("nombre"))
+    acks = _acks_turno(q_respondida, antes, respuestas) if q_respondida else []
+    res = _pack_pregunta(state, respuestas, skipped, prefijo=acks,
+                         nombre=nombre)
+    if res is None:
+        return _completar_ficha(state, respuestas, skipped=skipped)
+    pack, siguiente, _sug = res
+    _guardar_ai(state, pack["response"])
+    return {
+        **pack,
+        "intake_idx": _idx_of(siguiente["id"]),  # DEPRECADO (compat)
+        "intake_respuestas": respuestas,
+        "intake_attempts": 0,
+        "intake_oferta_qid": None,
+        "intake_decision": None,
+        "intake_skipped": skipped,
+        "asistente_presentado": True,
+    }
 
 
 # ===========================================================================
@@ -1179,7 +1228,7 @@ def iniciar_ficha(state: AgentState) -> AgentState:
     prefijo.append(sec.get("apertura_expectativa") or DEFAULT_AP_EXP)
 
     res = _pack_pregunta(state, respuestas, skipped, prefijo=prefijo)
-    if res is None:  # borde: extracción cubrió toda la ficha
+    if res is None:
         return _completar_ficha(state, respuestas, skipped=skipped)
     pack, q0, _sug = res
 
@@ -1209,7 +1258,7 @@ def procesar_respuesta(state: AgentState) -> AgentState:
     decision = state.get("intake_decision") or {}
     attempts = int(state.get("intake_attempts") or 0)
     raw = (state.get("query") or "").strip()
-    raw_eff = _traducir_id(raw)  # P0: ids de botones/listas → texto
+    raw_eff = _traducir_id(raw)  # ids y títulos de opciones → texto
     skipped = set(state.get("intake_skipped") or ())
     nombre = _primer_nombre(respuestas.get("nombre"))
 
@@ -1235,36 +1284,51 @@ def procesar_respuesta(state: AgentState) -> AgentState:
             "asistente_presentado": True,
         }
 
-    # (b) Pedido de humano (texto o botón): deriva de inmediato — P0.
+    # (b) Pedido de humano (texto o botón): deriva de inmediato.
     if _detecta_humano(raw):
         logger.info("[intake] pedido de humano en '%s' → derivación",
                     q_actual["id"])
         return _derivar(state, respuestas, skipped=skipped, urgente=False)
 
-    # (c) Salto de pregunta opcional.
+    # (c) Interpretación del input.
+    campo_respondido: dict | None = None
     error_key = None
+
     if _detecta_salto(raw):
         if q_actual["requerida"]:
             error_key = "no_skip"
         else:
-            respuestas[q_actual["id"]] = None
+            _fijar_por_usuario(respuestas, q_actual["id"], None)
             skipped.add(q_actual["id"])
+            campo_respondido = q_actual
             logger.info("[intake] campo opcional saltado: %s",
                         q_actual["id"])
     else:
         _aplicar_extraccion(respuestas, decision, skipped=skipped)
-        if q_actual["id"] not in respuestas:
+
+        if q_actual["id"] in respuestas:
+            campo_respondido = q_actual
+            # v21: si el planner la llenó ESTE turno y el usuario respondió
+            # algo distinto y válido, el usuario corrige la extracción.
+            if q_actual["id"] in (respuestas.get(_K_EXTRAIDOS) or []):
+                val2, err2 = q_actual["validate"](raw_eff)
+                if (err2 is None and val2 is not None
+                        and val2 != respuestas[q_actual["id"]]):
+                    logger.info("[intake] el usuario corrige lo extraído en "
+                                "%s: %r → %r", q_actual["id"],
+                                respuestas[q_actual["id"]], val2)
+                    _fijar_por_usuario(respuestas, q_actual["id"], val2)
+        else:
             # (c.1) Confirmación de área: sí/no sobre la hipótesis activa.
             sugerida = respuestas.get(_K_SUGERIDA)
             if q_actual["id"] == "area_caso" and sugerida:
                 veredicto = _match_confirmacion(raw_eff, sugerida)
                 if veredicto == "si":
-                    respuestas["area_caso"] = sugerida
+                    _fijar_por_usuario(respuestas, "area_caso", sugerida)
                     respuestas.pop(_K_SUGERIDA, None)
                     respuestas.pop(_K_RECHAZADA, None)
+                    campo_respondido = q_actual
                 elif veredicto == "no":
-                    # Re-pregunta en modo lista SIN penalizar el intento y
-                    # sin volver a sugerir la misma hipótesis.
                     respuestas[_K_RECHAZADA] = sugerida
                     respuestas.pop(_K_SUGERIDA, None)
                     pack = _pack(
@@ -1275,137 +1339,124 @@ def procesar_respuesta(state: AgentState) -> AgentState:
                     return {
                         **pack,
                         "intake_respuestas": respuestas,
-                        "intake_attempts": attempts,
+                        "intake_attempts": attempts,  # no penaliza
                         "intake_decision": None,
                         "intake_skipped": skipped,
                         "asistente_presentado": True,
                     }
-                # Otro texto → cae al validador por keywords (c.2).
-            # (c.2) Validación normal del input.
-            if q_actual["id"] not in respuestas:
+                # Otro texto → validate / rescate (c.2).
+
+            # (c.2) Validación directa; si falla, RESCATE cruzado (v21):
+            # el input se adjudica a la pendiente con la que SÍ calza.
+            if campo_respondido is None and q_actual["id"] not in respuestas:
                 val, err = q_actual["validate"](raw_eff)
-                if err:
-                    logger.info("[intake] validador rechazó %s: %s",
-                                q_actual["id"], err)
-                    error_key = "retry"
-                else:
-                    respuestas[q_actual["id"]] = val
+                if err is None and val is not None:
+                    _fijar_por_usuario(respuestas, q_actual["id"], val)
                     if q_actual["id"] == "area_caso":
                         respuestas.pop(_K_SUGERIDA, None)
                         respuestas.pop(_K_RECHAZADA, None)
+                    campo_respondido = q_actual
+                else:
+                    hit = _rescue_pendiente(raw_eff, pend)
+                    if hit:
+                        q_resc, val_r = hit
+                        _fijar_por_usuario(respuestas, q_resc["id"], val_r)
+                        if q_resc["id"] == "area_caso":
+                            respuestas.pop(_K_SUGERIDA, None)
+                            respuestas.pop(_K_RECHAZADA, None)
+                        campo_respondido = q_resc
+                        logger.info(
+                            "[intake] rescate: input %r adjudicado a '%s' "
+                            "(la activa era '%s')", raw_eff[:50],
+                            q_resc["id"], q_actual["id"])
+                    else:
+                        logger.info("[intake] validador rechazó %s: %s",
+                                    q_actual["id"], err)
+                        error_key = "retry"
 
-    # Sin consentimiento: no persiste nada y cierra (Ley 21.719).
-    if respuestas.get("consentimiento_datos") is False:
-        return sin_consentimiento(state, respuestas)
-
-    # La urgencia corta la ficha ANTES de seguir preguntando.
-    if _es_urgencia(state, respuestas):
-        return _derivar(state, respuestas, skipped=skipped, urgente=True)
+    # ---------------- Éxito / salto / rescate → avance ----------------
+    if error_key is None:
+        return _avance_normal(state, respuestas, skipped,
+                              campo_respondido or q_actual, antes)
 
     pend = _pendientes(state, respuestas)
     if not pend:
         return _completar_ficha(state, respuestas, skipped=skipped)
 
     # ---------------- Rama de error ----------------
-    if error_key:
-        extras = _extras_turno(q_actual, antes, respuestas)
-        if not extras:
-            attempts += 1
+    extras = _extras_turno(q_actual, antes, respuestas)
+    if not extras:
+        attempts += 1
 
-        if not extras and attempts >= MAX_INTENTOS_CAMPO:
-            # P1: clasificar mal el área es barato para el estudio;
-            # atrapar al usuario es carísimo. Fallback, no bloqueo.
-            if q_actual["id"] == "area_caso":
-                respuestas["area_caso"] = "otro tema"
-                respuestas["area_revision_manual"] = True
-                respuestas.pop(_K_SUGERIDA, None)
-                respuestas.pop(_K_RECHAZADA, None)
-                logger.info("[intake] área sin clasificar tras %d intentos "
-                            "→ 'otro tema' + revisión manual", attempts)
-                _persistir_parcial(state, respuestas)
-                aviso = sec.get("area_fallback", DEFAULT_AREA_FALLBACK)
-                res = _pack_pregunta(state, respuestas, skipped,
-                                     prefijo=[aviso], nombre=nombre)
-                if res is None:
-                    return _completar_ficha(state, respuestas,
-                                            skipped=skipped)
-                pack, siguiente, _sug = res
-                _guardar_ai(state, pack["response"])
-                return {
-                    **pack,
-                    "intake_idx": _idx_of(siguiente["id"]),
-                    "intake_respuestas": respuestas,
-                    "intake_attempts": 0,
-                    "intake_oferta_qid": None,
-                    "intake_decision": None,
-                    "intake_skipped": skipped,
-                    "asistente_presentado": True,
-                }
+    if not extras and attempts >= MAX_INTENTOS_CAMPO:
+        # Anti-bucle (P1): clasificar mal el área es barato; atrapar al
+        # usuario es carísimo. Fallback + revisión manual, y se AVANZA.
+        if q_actual["id"] == "area_caso":
+            _fijar_por_usuario(respuestas, "area_caso", "otro tema")
+            respuestas["area_revision_manual"] = True
+            respuestas.pop(_K_SUGERIDA, None)
+            respuestas.pop(_K_RECHAZADA, None)
+            logger.info("[intake] área sin clasificar tras %d intentos "
+                        "→ 'otro tema' + revisión manual", attempts)
+            _persistir_parcial(state, respuestas)
+            aviso = sec.get("area_fallback", DEFAULT_AREA_FALLBACK)
+            res = _pack_pregunta(state, respuestas, skipped,
+                                 prefijo=[aviso], nombre=nombre)
+            if res is None:
+                return _completar_ficha(state, respuestas, skipped=skipped)
+            pack, siguiente, _sug = res
+            _guardar_ai(state, pack["response"])
+            return {
+                **pack,
+                "intake_idx": _idx_of(siguiente["id"]),
+                "intake_respuestas": respuestas,
+                "intake_attempts": 0,
+                "intake_oferta_qid": None,
+                "intake_decision": None,
+                "intake_skipped": skipped,
+                "asistente_presentado": True,
+            }
 
-            # Resto de requeridas: oferta humano / reintento (sin cambios).
-            if q_actual["requerida"]:
-                if ya_ofrecido:
-                    logger.info("[intake] reintento agotado en '%s' → "
-                                "derivación parcial", q_actual["id"])
-                    return _derivar(state, respuestas, skipped=skipped,
-                                    urgente=False)
-                msg_oferta = sec.get("oferta_salida", DEFAULT_OFERTA).format(
-                    nombre=f"{nombre}, " if nombre else "")
-                pack = _pack([msg_oferta], interactive=_BOTONES_OFERTA)
-                _guardar_ai(state, pack["response"])
-                return {
-                    **pack,
-                    "intake_respuestas": respuestas,
-                    "intake_attempts": attempts,
-                    "intake_decision": None,
-                    "intake_oferta_qid": q_actual["id"],
-                    "intake_skipped": skipped,
-                    "asistente_presentado": True,
-                }
+        if q_actual["requerida"]:
+            if ya_ofrecido:
+                logger.info("[intake] reintento agotado en '%s' → "
+                            "derivación parcial", q_actual["id"])
+                return _derivar(state, respuestas, skipped=skipped,
+                                urgente=False)
+            msg_oferta = sec.get("oferta_salida", DEFAULT_OFERTA).format(
+                nombre=f"{nombre}, " if nombre else "")
+            pack = _pack([msg_oferta], interactive=_BOTONES_OFERTA)
+            _guardar_ai(state, pack["response"])
+            return {
+                **pack,
+                "intake_respuestas": respuestas,
+                "intake_attempts": attempts,
+                "intake_decision": None,
+                "intake_oferta_qid": q_actual["id"],
+                "intake_skipped": skipped,
+                "asistente_presentado": True,
+            }
 
-        burbujas = []
-        if extras:
-            burbujas.append("De paso ya tengo " + _join_labels(
-                [_BY_ID[q]["label"] for q in extras]) + " 👌")
-        sugerida = respuestas.get(_K_SUGERIDA)
-        if error_key == "no_skip":
-            burbujas.append(sec.get("error_no_saltar",
-                                    DEFAULT_ERROR_NO_SALTAR))
-        elif q_actual["id"] == "area_caso" and sugerida:
-            burbujas.append(
-                sec.get("area_confirmacion_retry",
-                        DEFAULT_AREA_CONFIRMA_RETRY).format(
-                    area=_AREA_FRASE.get(sugerida, sugerida)))
-        else:
-            burbujas.append(q_actual.get("retry_prompt")
-                            or q_actual["prompt"])
-        pack = _pack(burbujas,
-                     interactive=_interactive_para(q_actual, sugerida))
-        _guardar_ai(state, pack["response"])
-        return {
-            **pack,
-            "intake_respuestas": respuestas,
-            "intake_attempts": attempts,
-            "intake_decision": None,
-            "intake_skipped": skipped,
-            "asistente_presentado": True,
-        }
-
-    # ---------------- Avance normal ----------------
-    _persistir_parcial(state, respuestas)
-    acks = _acks_turno(q_actual, antes, respuestas)
-    res = _pack_pregunta(state, respuestas, skipped, prefijo=acks,
-                         nombre=nombre)
-    if res is None:
-        return _completar_ficha(state, respuestas, skipped=skipped)
-    pack, siguiente, _sug = res
+    burbujas = []
+    if extras:
+        burbujas.append("De paso ya tengo " + _join_labels(
+            [_BY_ID[q]["label"] for q in extras]) + " 👌")
+    sugerida = respuestas.get(_K_SUGERIDA)
+    if error_key == "no_skip":
+        burbujas.append(sec.get("error_no_saltar", DEFAULT_ERROR_NO_SALTAR))
+    elif q_actual["id"] == "area_caso" and sugerida:
+        burbujas.append(
+            sec.get("area_confirmacion_retry",
+                    DEFAULT_AREA_CONFIRMA_RETRY).format(
+                area=_AREA_FRASE.get(sugerida, sugerida)))
+    else:
+        burbujas.append(q_actual.get("retry_prompt") or q_actual["prompt"])
+    pack = _pack(burbujas, interactive=_interactive_para(q_actual, sugerida))
     _guardar_ai(state, pack["response"])
     return {
         **pack,
-        "intake_idx": _idx_of(siguiente["id"]),  # DEPRECADO (compat)
         "intake_respuestas": respuestas,
-        "intake_attempts": 0,
-        "intake_oferta_qid": None,
+        "intake_attempts": attempts,
         "intake_decision": None,
         "intake_skipped": skipped,
         "asistente_presentado": True,
@@ -1446,7 +1497,6 @@ def _completar_ficha(state: AgentState, respuestas: dict,
                    respuestas_keys=list(_publicas(respuestas).keys()),
                    rama=_rama(state, respuestas),
                    tiene_email=bool(respuestas.get("email")))
-    # El estado final viaja SIN claves internas: la ficha terminó.
     return _salida_intake(pack, respuestas=_publicas(respuestas),
                           skipped=skipped or set(),
                           exit_="cta_cierre", stage="completado",
@@ -1454,8 +1504,53 @@ def _completar_ficha(state: AgentState, respuestas: dict,
 
 
 def pausar_ficha(state: AgentState) -> AgentState:
+    """v21 — GUARDA anti-bug: el planner a veces clasifica "saltar" como
+    'pausar'. Si el input es un salto válido para la pregunta activa, NO se
+    pausa: la opcional queda en None (skipped) y se avanza; la requerida se
+    explica y se repregunta. La pausa genuina queda intacta.
+    """
+    sec = _cfg()["intake"]
     respuestas = dict(state.get("intake_respuestas") or {})
     skipped = set(state.get("intake_skipped") or ())
+    raw = (state.get("query") or "").strip()
+
+    pend = _pendientes(state, respuestas)
+    q = pend[0] if pend else None
+
+    if q and _detecta_salto(raw):
+        if q["requerida"]:
+            nombre = _primer_nombre(respuestas.get("nombre"))
+            pack = _pack(
+                [sec.get("error_no_saltar", DEFAULT_ERROR_NO_SALTAR),
+                 _form_pregunta(state, q, respuestas, nombre=nombre,
+                                area_sugerida=respuestas.get(_K_SUGERIDA))],
+                interactive=_interactive_para(
+                    q, respuestas.get(_K_SUGERIDA)))
+            _guardar_ai(state, pack["response"])
+            logger.info("[intake] 'pausar' del planner era salto en "
+                        "requerida '%s' → repregunta", q["id"])
+            return {
+                **pack,
+                "intake_activo": True,
+                "intake_respuestas": respuestas,
+                "intake_attempts": int(state.get("intake_attempts") or 0),
+                "intake_exit": None,
+                "intake_stage": "preguntando",
+                "intake_decision": None,
+                "intake_oferta_qid": None,
+                "intake_skipped": skipped,
+                "asistente_presentado": True,
+            }
+
+        # Salto legítimo de opcional: registrar como None y AVANZAR.
+        antes = dict(respuestas)
+        _fijar_por_usuario(respuestas, q["id"], None)
+        skipped.add(q["id"])
+        logger.info("[intake] 'pausar' del planner era un salto de campo "
+                    "opcional: %s → avanza", q["id"])
+        return _avance_normal(state, respuestas, skipped, q, antes)
+
+    # Pausa genuina.
     pack = _pack(["Perfecto, quedo aquí esperando. Cuando quieras retomar, "
                   "solo escríbeme 🤙"])
     _guardar_ai(state, pack["response"])
@@ -1516,8 +1611,7 @@ def reanudar(state: AgentState) -> AgentState:
     puente = (sec.get("reanudar_duda", DEFAULT_REANUDA_DUDA).format(duda=duda)
               if duda else sec.get("reanudar", DEFAULT_REANUDA))
 
-    # FIX #3 (se mantiene): preservar la respuesta del FAQ del MISMO turno
-    # en round-trips laterales (intake → FAQ → intake).
+    # FIX #3 (se mantiene): preservar la respuesta del FAQ del MISMO turno.
     msgs = state.get("messages") or []
     viene_de_faq = bool(msgs and getattr(msgs[-1], "type", "") == "ai")
     previas = (list(state.get("response_bubbles") or [])
@@ -1543,18 +1637,16 @@ def reanudar(state: AgentState) -> AgentState:
 
 
 # ===========================================================================
-# DERIVACIONES (wrappers públicos conservan el contrato del planner)
+# DERIVACIONES
 # ===========================================================================
 
 def derivar_parcial(state: AgentState) -> AgentState:
-    """Reintento agotado o pedido de humano → handoff con ficha parcial."""
     respuestas = dict(state.get("intake_respuestas") or {})
     skipped = set(state.get("intake_skipped") or ())
     return _derivar(state, respuestas, skipped=skipped, urgente=False)
 
 
 def derivar_urgente(state: AgentState) -> AgentState:
-    """Invocable por el planner (detenido=True detectado por LLM)."""
     respuestas = dict(state.get("intake_respuestas") or {})
     skipped = set(state.get("intake_skipped") or ())
     _aplicar_extraccion(respuestas, state.get("intake_decision") or {},
@@ -1564,11 +1656,6 @@ def derivar_urgente(state: AgentState) -> AgentState:
 
 def _derivar(state: AgentState, respuestas: dict, *, skipped: set | None,
              urgente: bool) -> AgentState:
-    """Handoff con ficha parcial. urgente=True marca urgencia_legal en las
-    respuestas (la ve el equipo en el lead y handoff_humano la notifica).
-    intake_exit="handoff" en ambos casos (IntakeExitLabel no admite valores
-    nuevos y el handoff es el emisor único — FIX #10).
-    """
     sec = _cfg()["intake"]
     if urgente:
         respuestas = {**respuestas, "urgencia_legal": True}
@@ -1607,7 +1694,7 @@ def _derivar(state: AgentState, respuestas: dict, *, skipped: set | None,
 
 
 # ===========================================================================
-# CIERRES CON STATUS (abandonar/sin consentimiento eran gemelos)
+# CIERRES CON STATUS
 # ===========================================================================
 
 def abandonar_ficha(state: AgentState) -> AgentState:
@@ -1637,9 +1724,6 @@ def sin_consentimiento(state: AgentState,
 def _cerrar_con_status(state: AgentState, respuestas: dict, skipped: set,
                        *, status: str, cfg_key: str, default_msg: str,
                        evento: str, ev_kw: dict | None = None) -> AgentState:
-    """Cierra la conversación en BD ANTES de retornar closed=True (FIX #4).
-    v20: mensajes con fallback — ya no hay KeyError si falta la config.
-    """
     msg = _cfg()["intake"].get(cfg_key, default_msg).format(
         wa_link=_wa_link_display(display="Hablar con un humano"))
     pack = _pack([msg])
