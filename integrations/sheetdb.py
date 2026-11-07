@@ -1,344 +1,47 @@
-"""integrations/sheetdb.py — Guarda/actualiza leads en Google Sheets vía SheetDB.
+"""integrations/sheetdb.py — Stub temporal: inserciones a Google Sheets desactivadas.
 
-Endpoint configurado: https://sheetdb.io/api/v1/oxl3h0nanwlhh
+La persistencia oficial de leads ahora es Supabase.  Este módulo mantiene las
+funciones públicas anteriores como no-ops para no romper los importadores
+existentes (graph/nodes.py, tools/booking, etc.) hasta que se migren las llamadas
+directamente al cliente de Supabase.
 
-SheetDB expone la hoja de Google Sheets como una API REST:
-  - POST  /api/v1/{id}              → crear fila(s). Body: {"data": [{...}]}
-  - GET   /api/v1/{id}/search       → buscar por columna
-  - PATCH /api/v1/{id}/{col}/{val}  → actualizar fila(s) por columna
-
-Las columnas deben llamarse EXACTAMENTE como en la hoja de Google Sheets
-(incluyendo espacios y caracteres especiales), porque SheetDB usa los headers
-como keys del JSON.
-
-Nota importante: SheetDB rechaza payloads donde falte alguna columna de la hoja
-o donde los valores superen el límite de celda (~50.000 caracteres).
+CUANDO MIGRES:
+- Reemplaza las llamadas a crear_lead / actualizar_lead_por_thread_id /
+  sync_lead / actualizar_booking por inserciones/updates en Supabase.
+- Una vez ningún otro archivo importe desde integrations.sheetdb, elimina este
+  archivo por completo.
 """
-import json
 import logging
-from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import quote
-
-import requests
 
 logger = logging.getLogger(__name__)
 
-SHEETDB_BASE_URL = "https://sheetdb.io/api/v1/4tg2dne6m1miv"
-MAX_JSON_BACKUP_CHARS = 30_000  # margen seguro bajo límite de Google Sheets
 
-# Nombres EXACTOS de tus columnas en Google Sheets
-COL = {
-    "id_lead": "ID Lead",
-    "created_at": "Fecha creación",
-    "closed_at": "Fecha cierre",
-    "source": "Canal origen",
-    "lead_status": "Estado lead",
-    "nombre": "Nombre completo",
-    "email": "Correo electrónico",
-    "telefono": "Teléfono",
-    "situacion": "Situación / Caso",
-    "category": "Categoría legal",
-    "etapa": "Etapa del proceso",
-    "urgency": "Urgencia",
-    "sentiment": "Sentimiento",
-    "hijos": "Hijos menores",
-    "comuna": "Comuna",
-    "horario": "Horario contacto",
-    "como_nos_conocio": "Cómo nos conoció",
-    "consentimiento": "Consentimiento datos",
-    "summary": "Resumen ejecutiva",
-    "agenda_link": "Link agendamiento",
-    "booking_fecha": "Fecha cita agendada",
-    "modalidad": "Modalidad asesoría",
-    "asignado_a": "Asignado a",
-    "notas": "Notas ejecutiva",
-    "thread_id": "Thread ID",
-    "intent": "Intent detectado",
-    "route": "Route",
-    "clf_reason": "Razón clasificación",
-    "json_backup": "JSON backup",
-}
+def _log_noop(fn_name: str, thread_id: str | None = None) -> None:
+    logger.debug(
+        "[sheetdb:%s] no-op: persistencia en Google Sheets desactivada (%s)",
+        fn_name,
+        thread_id or "<sin thread_id>",
+    )
 
 
-# ---------------------------------------------------------------------------
-# HELPERS
-# ---------------------------------------------------------------------------
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def _noop_state(state: dict | None = None, canal: str | None = None, **kwargs: Any) -> dict:
+    thread_id = (state or {}).get("thread_id")
+    _log_noop("crear/sync", thread_id)
+    return {"ok": True, "action": "noop", "storage": "supabase_pending"}
 
 
-def _telefono_cliente(thread_id: str | None) -> str | None:
-    import re
-    tid = thread_id or ""
-    return tid if re.fullmatch(r"\+\d{8,15}", tid) else None
+def _noop_thread(
+    thread_id: str | None = None,
+    data: dict | None = None,
+    **kwargs: Any,
+) -> dict:
+    _log_noop("actualizar", thread_id)
+    return {"ok": True, "action": "noop", "storage": "supabase_pending"}
 
 
-def _format_booking(booking: dict | None) -> str:
-    if not booking:
-        return ""
-    fecha = booking.get("fecha") or ""
-    hora = booking.get("hora_inicio") or ""
-    return f"{fecha} {hora}".strip()
-
-
-def _si_no(val: Any) -> str:
-    if val is True:
-        return "SÍ"
-    if val is False:
-        return "NO"
-    return ""
-
-
-def _detectar_canal(thread_id: str | None) -> str:
-    tid = thread_id or ""
-    if tid.startswith("cli-"):
-        return "cli"
-    if tid.startswith("web-"):
-        return "web"
-    if _telefono_cliente(tid):
-        return "whatsapp"
-    return "desconocido"
-
-
-def _build_payload(state: dict, canal: str | None = None,
-                   modo: str = "completo") -> dict:
-    """Mapea el estado del grafo al payload de SheetDB.
-
-    modo='completo' → ficha completa (requiere consentimiento previo).
-    modo='minimo'   → solo datos operacionales; NUNCA situación, resumen ni PII sensible.
-    """
-    r = state.get("intake_respuestas") or {}
-    booking = state.get("booking") or {}
-
-    if canal is None:
-        canal = _detectar_canal(state.get("thread_id"))
-
-    created = state.get("intake_started_en") or _now_iso()
-    closed = _now_iso()
-
-    consent = r.get("consentimiento_datos") is True
-
-    # FIX #3: payload mínimo cuando no hay consentimiento
-    if modo == "minimo" or not consent:
-        return {
-            COL["id_lead"]: state.get("thread_id", ""),
-            COL["thread_id"]: state.get("thread_id", ""),
-            COL["created_at"]: created,
-            COL["closed_at"]: closed,
-            COL["source"]: canal,
-            COL["lead_status"]: "pendiente_consentimiento",
-            COL["nombre"]: "",
-            COL["email"]: "",
-            COL["telefono"]: "",
-            COL["situacion"]: "",
-            COL["category"]: state.get("category", ""),
-            COL["urgency"]: state.get("urgency", ""),
-            COL["sentiment"]: state.get("sentiment", ""),
-            COL["consentimiento"]: "NO",
-            COL["summary"]: "Pendiente consentimiento datos — no contactar hasta autorización",
-            COL["agenda_link"]: state.get("agenda_link", ""),
-            COL["booking_fecha"]: _format_booking(booking),
-            COL["modalidad"]: state.get("lead_modalidad", ""),
-            COL["asignado_a"]: "",
-            COL["notas"]: "Lead generado sin autorización de datos. "
-                          "Solicitar consentimiento antes de contactar.",
-            COL["intent"]: state.get("intent", ""),
-            COL["route"]: state.get("route", ""),
-            COL["clf_reason"]: state.get("clf_reason", ""),
-            COL["json_backup"]: "",
-        }
-
-    # modo completo (consentimiento == True)
-    payload = {
-        COL["id_lead"]: state.get("thread_id", ""),
-        COL["created_at"]: created,
-        COL["closed_at"]: closed,
-        COL["source"]: canal,
-        COL["lead_status"]: "nuevo",
-        COL["nombre"]: r.get("nombre", ""),
-        COL["email"]: r.get("email", ""),
-        COL["telefono"]: r.get("telefono") or _telefono_cliente(state.get("thread_id")) or "",
-        COL["situacion"]: r.get("situacion_actual", ""),
-        COL["category"]: state.get("category", ""),
-        COL["etapa"]: r.get("etapa_proceso", ""),
-        COL["urgency"]: state.get("urgency", ""),
-        COL["sentiment"]: state.get("sentiment", ""),
-        COL["hijos"]: _si_no(r.get("hijos_menores")),
-        COL["comuna"]: r.get("comuna", ""),
-        COL["horario"]: r.get("horario_contacto", ""),
-        COL["como_nos_conocio"]: r.get("como_nos_conocio", ""),
-        COL["consentimiento"]: _si_no(r.get("consentimiento_datos")),
-        COL["summary"]: state.get("summary", ""),
-        COL["agenda_link"]: state.get("agenda_link", ""),
-        COL["booking_fecha"]: _format_booking(booking),
-        COL["modalidad"]: state.get("lead_modalidad", ""),
-        COL["asignado_a"]: "",
-        COL["notas"]: "",
-        COL["thread_id"]: state.get("thread_id", ""),
-        COL["intent"]: state.get("intent", ""),
-        COL["route"]: state.get("route", ""),
-        COL["clf_reason"]: state.get("clf_reason", ""),
-    }
-
-    backup = {
-        "thread_id": state.get("thread_id"),
-        "clasificacion": {
-            "sentiment": state.get("sentiment"),
-            "urgency": state.get("urgency"),
-            "intent": state.get("intent"),
-            "category": state.get("category"),
-            "clf_reason": state.get("clf_reason"),
-        },
-        "intake": r,
-        "lead": {
-            "nombre": state.get("lead_nombre"),
-            "email": state.get("lead_email"),
-            "modalidad": state.get("lead_modalidad"),
-        },
-        "booking": booking,
-    }
-    json_str = json.dumps(backup, ensure_ascii=False, default=str)
-    payload[COL["json_backup"]] = json_str[:MAX_JSON_BACKUP_CHARS]
-
-    return payload
-
-
-
-def _safe_url(value: str) -> str:
-    return quote(str(value), safe="")
-
-
-def _buscar_por_thread_id(thread_id: str | None) -> dict | None:
-    """Busca si ya existe una fila con ese Thread ID. Array vacío = no existe."""
-    if not thread_id:
-        return None
-    url = f"{SHEETDB_BASE_URL}/search"
-    try:
-        r = requests.get(url, params={COL["thread_id"]: thread_id}, timeout=10)
-        if r.status_code == 404:
-            return None
-        r.raise_for_status()
-        rows = r.json()
-        if rows and isinstance(rows, list) and len(rows) > 0:
-            return rows[0]
-    except Exception as e:
-        logger.warning("Error buscando lead en SheetDB: %s", e)
-    return None
-
-
-# ---------------------------------------------------------------------------
-# OPERACIONES CRUD
-# ---------------------------------------------------------------------------
-def crear_lead(state: dict, canal: str | None = None) -> dict:
-    """Crea una nueva fila en la hoja. SheetDB espera {"data": [payload]}."""
-    payload = _build_payload(state, canal)
-    body = {"data": [payload]}
-
-    try:
-        r = requests.post(SHEETDB_BASE_URL, json=body, timeout=15)
-        if r.status_code >= 400:
-            logger.error("SheetDB POST error %s: %s", r.status_code, r.text)
-        r.raise_for_status()
-        logger.info("Lead creado en SheetDB: %s", state.get("thread_id"))
-        return {"ok": True, "action": "created", "response": r.json()}
-    except Exception as e:
-        logger.exception("Error creando lead en SheetDB: %s", e)
-        raise
-
-
-def actualizar_lead_por_thread_id(thread_id: str | None, data: dict) -> dict:
-    """Actualiza campos parciales de la fila cuyo 'Thread ID' coincida.
-    
-    v2 — Upsert: si la fila no existe, se CREA con los datos parciales + campos
-    mínimos obligatorios. Esto arregla el caso de un lead que agenda directo
-    (booking) sin haber pasado primero por handoff/sync_lead.
-    """
-    if not thread_id:
-        raise ValueError("thread_id requerido para actualizar lead")
-
-    existing = _buscar_por_thread_id(thread_id)
-
-    # La fila no existe → la creamos con los datos que traemos.
-    if existing is None:
-        logger.info("SheetDB: lead '%s' no existe → se crea fila con update_data", thread_id)
-        fila = {
-            COL["id_lead"]: thread_id,
-            COL["thread_id"]: thread_id,
-            COL["created_at"]: _now_iso(),
-            COL["closed_at"]: _now_iso(),
-            COL["source"]: _detectar_canal(thread_id),
-            COL["lead_status"]: data.get(COL["lead_status"], "nuevo"),
-            **data,
-        }
-        body = {"data": [fila]}
-        try:
-            r = requests.post(SHEETDB_BASE_URL, json=body, timeout=15)
-            if r.status_code >= 400:
-                logger.error("SheetDB POST (upsert) error %s: %s", r.status_code, r.text)
-            r.raise_for_status()
-            logger.info("Lead creado en SheetDB (upsert): %s", thread_id)
-            return {"ok": True, "action": "created_upsert", "response": r.json()}
-        except Exception as e:
-            logger.exception("Error creando lead en SheetDB (upsert): %s", e)
-            raise
-
-    # La fila existe → PATCH normal.
-    url = f"{SHEETDB_BASE_URL}/{_safe_url(COL['thread_id'])}/{_safe_url(thread_id)}"
-    body = {"data": data}
-    try:
-        r = requests.patch(url, json=body, timeout=15)
-        if r.status_code >= 400:
-            logger.error("SheetDB PATCH error %s: %s", r.status_code, r.text)
-        r.raise_for_status()
-        logger.info("Lead actualizado en SheetDB: %s", thread_id)
-        return {"ok": True, "action": "updated", "response": r.json()}
-    except Exception as e:
-        logger.exception("Error actualizando lead en SheetDB: %s", e)
-        raise
-
-
-def sync_lead(state: dict, canal: str | None = None) -> dict:
-    """Si existe (por Thread ID) actualiza; si no, crea."""
-    thread_id = state.get("thread_id")
-    if not thread_id:
-        raise ValueError("state sin thread_id: no se puede guardar lead")
-
-    existing = _buscar_por_thread_id(thread_id)
-    payload = _build_payload(state, canal)
-
-    if existing:
-        update_data = {k: v for k, v in payload.items()
-                       if k not in (COL["id_lead"], COL["thread_id"])}
-        return actualizar_lead_por_thread_id(thread_id, update_data)
-
-    return crear_lead(state, canal)
-
-
-# ---------------------------------------------------------------------------
-# ACTUALIZACIONES PARCIALES
-# ---------------------------------------------------------------------------
-def actualizar_booking(state: dict) -> dict:
-    """Llamar cuando se confirma una cita en Google Calendar."""
-    thread_id = state.get("thread_id")
-    if not thread_id:
-        return {"ok": False, "error": "sin thread_id"}
-
-    booking = state.get("booking") or {}
-    r = state.get("intake_respuestas") or {}
-
-    data = {
-        COL["agenda_link"]: state.get("agenda_link", ""),
-        COL["booking_fecha"]: _format_booking(booking),
-        COL["modalidad"]: state.get("lead_modalidad", ""),
-        COL["lead_status"]: "agendado",
-        COL["closed_at"]: _now_iso(),
-        # Campos mínimos del lead, por si la fila no existe aún:
-        COL["nombre"]: state.get("lead_nombre") or r.get("nombre", ""),
-        COL["email"]: state.get("lead_email") or r.get("email", ""),
-        COL["telefono"]: r.get("telefono") or _telefono_cliente(thread_id) or "",
-        COL["category"]: state.get("case_category") or state.get("category", ""),
-
-        COL["intent"]: state.get("intent", ""),
-    }
-    return actualizar_lead_por_thread_id(thread_id, data)
+# API pública anterior.  Ahora solo logea y devuelve éxito.
+crear_lead = _noop_state
+actualizar_lead_por_thread_id = _noop_thread
+sync_lead = _noop_state
+actualizar_booking = _noop_state
