@@ -156,6 +156,16 @@ app = FastAPI(
     description="API del agente de soporte Manzzo y Cía (LangGraph + HITL + SSE streaming + WhatsApp)",
 )
 
+# Health check raíz: responde 200 a los pings de Railway/monitores en vez de 404.
+@app.get("/")
+async def health_check():
+    return {
+        "status": "ok",
+        "service": "leyia-api",
+        "version": "1.0.0",
+        "agent_available": AGENT_AVAILABLE,
+    }
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -167,9 +177,12 @@ app.add_middleware(
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    logger.info(f"➡️ {request.method} {request.url.path} | Origin: {request.headers.get('origin')}")
+    path = request.url.path
+    if path != "/":
+        logger.info(f"➡️ {request.method} {path} | Origin: {request.headers.get('origin')}")
     response = await call_next(request)
-    logger.info(f"⬅️ {response.status_code} {request.method} {request.url.path}")
+    if path != "/":
+        logger.info(f"⬅️ {response.status_code} {request.method} {path}")
     return response
 
 
