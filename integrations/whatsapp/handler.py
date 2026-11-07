@@ -19,18 +19,15 @@ from .db.connection import async_session
 from .db.models import MessageRecord
 from .db.repository import mark_processed, register_message
 from .normalizer import WhatsAppMessage, _normalize_phone
-from .stt import transcribe_whatsapp_audio
 
 logger = logging.getLogger("leyia-whatsapp")
 
 MSG_HITL = ("⏸️ Tu solicitud está pendiente de revisión por un abogado del estudio. "
             "Te escribiremos apenas sea resuelta.")
-MSG_ONLY_TEXT = "Por ahora solo puedo procesar mensajes de texto y notas de voz 🙏"
-MSG_AUDIO_ERROR = "😔 No pude escuchar tu audio. ¿Puedes escribirlo como texto, por favor?"
+MSG_ONLY_TEXT = "Por ahora solo puedo procesar mensajes de texto 🙏"
 MSG_ERROR = "Tuvimos un problema técnico. Inténtalo en unos minutos."
 
-PROCESSABLE_TYPES = ("text", "interactive", "audio", "voice")
-AUDIO_TYPES = ("audio", "voice")
+PROCESSABLE_TYPES = ("text", "interactive")
 
 _locks: dict[str, asyncio.Lock] = {}
 
@@ -108,57 +105,17 @@ async def _bump_failure_attempt(message_id: str) -> None:
 async def process_message(msg: WhatsAppMessage) -> None:
     """
     Responde al cliente y, solo si todo sale bien, marca el mensaje como leído.
-
-    Audios/notas de voz: se transcriben antes de invocar al agente y la
-    transcripción se persiste en el registro, de modo que el Reaper reintenta
-    con el texto sin depender de la URL de Meta. La salida nunca cambia:
-    _deliver solo usa send_text/send_interactive (jamás audio de respuesta).
+    Esto evita POSTs a Facebook en cada reintento fallido.
     """
     wa_id = _normalize_phone(msg.customer_phone)
 
-    if msg.message_type not in PROCESSABLE_TYPES:
-        await send_text(wa_id, MSG_ONLY_TEXT)
-        await mark_as_read(msg.message_id)
-        return
-
-    text = msg.text  # audio recién llegado: None; Reaper: transcripción ya guardada
-
-    if msg.message_type in AUDIO_TYPES and not text:
-        if not msg.media_id:
-            await send_text(wa_id, MSG_AUDIO_ERROR)
-            await mark_as_read(msg.message_id)
-            return
-        try:
-            text = await transcribe_whatsapp_audio(msg.media_id)
-        except Exception:
-            logger.exception("Falló la transcripción del audio %s", msg.media_id)
-            await send_text(wa_id, MSG_AUDIO_ERROR)
-            await mark_as_read(msg.message_id)
-            return  # se marca processed: fail rápido al usuario en vez de reintentos ciegos
-        if text:
-            await _persist_content(msg.message_id, text)
-
-    if not text:
+    if msg.message_type not in PROCESSABLE_TYPES or not msg.text:
         await send_text(wa_id, MSG_ONLY_TEXT)
     else:
-        reply = await run_agent(wa_id, text, msg.customer_name)
+        reply = await run_agent(wa_id, msg.text, msg.customer_name)
         await _deliver(wa_id, reply)
 
     await mark_as_read(msg.message_id)
-
-
-async def _persist_content(message_id: str, content: str) -> None:
-    """Guarda la transcripción como `content` del registro (Reaper + analítica)."""
-    try:
-        async with async_session() as session:
-            await session.execute(
-                update(MessageRecord)
-                .where(MessageRecord.whatsapp_message_id == message_id)
-                .values(content=content)
-            )
-            await session.commit()
-    except Exception:
-        logger.exception("No se pudo persistir la transcripción de %s", message_id)
 
 
 async def run_agent(wa_id: str, text: str, name: str | None) -> dict:

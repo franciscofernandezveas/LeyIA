@@ -9,8 +9,7 @@ class WhatsAppMessage(BaseModel):
     customer_phone: str
     customer_name: str | None = None
     message_type: str
-    text: str | None = None        # texto del usuario o transcripción persistida (Reaper)
-    media_id: str | None = None    # id del adjunto en Meta (audios / notas de voz)
+    text: str | None = None
     interactive_id: str | None = None  # id del botón/lista tocado (analítica/logs)
     timestamp: str
 
