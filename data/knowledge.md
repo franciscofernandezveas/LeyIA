@@ -5,7 +5,7 @@ Tipo de documento: Base de conocimiento para sistema RAG
 Fuente: https://manzzoycia.cl/
 Nombre de la firma: Manzzo y Cía (MANZZOYCIA.CL)
 País: Chile
-Última actualización del contenido: 2026
+Última actualización del contenido: 2025
 ================================================================================
 
 
@@ -13,7 +13,7 @@ País: Chile
 SECCIÓN 1: INFORMACIÓN GENERAL DE LA FIRMA
 --------------------------------------------------------------------------------
 
-¿Que es Manzzo y Cía?
+¿Qué es Manzzo y Cía?
 Manzzo y Cía es una firma de abogados chilena especializada en Derecho de 
 Familia, con un enfoque estratégico que prioriza los derechos de sus clientes 
 y el bienestar de sus familias. Además, ofrecen asesoría y representación 
@@ -52,7 +52,6 @@ SECCIÓN 2: DATOS DE CONTACTO
 
 Correo electrónico: contacto@manzzoycia.cl
 Teléfono principal: +56 9 4231 3989
-Teléfono secundario: +56 9 3240 2134 (aparece en páginas legales del sitio)
 Dirección física: Pasaje Doctor Sotero del Río #508, Oficina 420, Santiago 
 Centro, Chile
 Cobertura: Atención en todo Chile
@@ -118,38 +117,38 @@ Cada caso es único. La firma ofrece soluciones adaptadas a cada situación
 para proteger los derechos y la estabilidad del cliente, buscando siempre 
 una solución justa y equilibrada.
 
+Cotización de la causa:
+La tramitación de una causa de familia no tiene un valor fijo. El precio 
+depende de la materia, la cuantía y la complejidad del caso, por lo que se 
+informa de forma personalizada en la misma reunión de asesoría, una vez que 
+el abogado evalúa los antecedentes.
+
 
 --------------------------------------------------------------------------------
-SECCIÓN 4: PRECIOS Y PROMOCIONES (IMPORTANTE: DOS PRECIOS DISTINTOS)
+SECCIÓN 4: PRECIOS Y PROMOCIONES
 --------------------------------------------------------------------------------
 
-ACLARACIÓN CLAVE SOBRE PRECIOS:
-Existen DOS precios completamente distintos. NO confundirlos:
+PROMOCIÓN VIGENTE:
+Durante todo noviembre, desde el 1° al 30, la asesoría inicial de 30 minutos 
+es GRATUITA.
 
-1. ASESORÍA / CONSULTA INICIAL / CITA: $30.000 (pesos chilenos)
-   - Es el valor de una reunión o asesoría con un abogado (30-45 minutos).
-   - Es el precio que corresponde cuando alguien pregunta "¿cuánto vale una
-     asesoría?", "¿cuánto cuesta la consulta?" o "¿cuánto vale la cita?".
-   - Si luego el cliente contrata un servicio, estos $30.000 se DESCUENTAN
-     del total a pagar.
+Precio de asesoría / consulta / cita:
+- En noviembre: GRATIS (30 minutos con un abogado).
+- Fuera de noviembre: valor regular de la asesoría; consultar en el momento 
+  con la firma.
 
-2. TRAMITACIÓN DE CAUSA DE FAMILIA COMPLETA (PROMOCIÓN): $500.000 (pesos chilenos)
-   - Es el valor de contratar el SERVICIO COMPLETO de representación legal.
-   - Incluye: divorcio, pensión de alimentos, relación directa y regular, 
-     y más, con defensa profesional y acompañamiento en todo el proceso.
-   - Solo corresponde cuando alguien pregunta "¿cuánto cuesta llevar mi 
-     caso completo?", "¿cuánto cuesta contratarlos?" o "¿qué incluye la 
-     promoción?".
-   - NUNCA es el precio de una asesoría ni de una consulta.
+Cotización de la causa completa:
+- La tramitación de la causa NO tiene valor fijo.
+- El valor depende de la materia, la cuantía y la complejidad del caso.
+- Se informa de forma personalizada en la misma reunión de asesoría, tras la 
+  evaluación del abogado.
 
 REGLA DE RESPUESTA (resumen para el asistente):
-- Pregunta por precio de asesoría/consulta/cita → responder $30.000.
-- Pregunta por precio de la causa completa/contratación → responder $500.000 
-  (precio promocional).
-
-FACILIDADES DE PAGO (aplican a la causa completa de $500.000):
-- Hasta 12 cuotas sin interés con tarjeta de crédito.
-- Permite cubrir los honorarios sin afectar el presupuesto mensual del cliente.
+- Pregunta por precio de asesoría, consulta o cita → responder que en 
+  noviembre es GRATIS.
+- Pregunta por el valor de llevar el caso completo o contratar el servicio → 
+  responder que no tiene precio fijo y que se cotiza en la asesoría.
+- NUNCA entregar montos, rangos ni estimaciones para la causa completa.
 
 
 --------------------------------------------------------------------------------
@@ -172,7 +171,10 @@ SECCIÓN 5: LA CONSULTA INICIAL - QUÉ INCLUYE
 La consulta personalizada permite descubrir cómo negociar un monto justo, 
 evitar medidas de apremio y proteger la estabilidad financiera y familiar.
 
-- Precio de la asesoría/consulta/cita: $30.000 (pesos chilenos)
+- Duración de la asesoría: 30 a 45 minutos.
+- Precio de la asesoría/consulta/cita: GRATIS durante noviembre.
+- En la asesoría se informa el valor de la tramitación de la causa, si el 
+  cliente decide avanzar.
 
 
 --------------------------------------------------------------------------------
@@ -251,8 +253,8 @@ seguir. Si decides avanzar, la firma puede entregarte representación legal
 y acompañarte en todo el proceso.
 
 PREGUNTA 5: ¿La consulta inicial tiene costo?
-RESPUESTA: Sí, la consulta inicial cuesta $30.000. Sin embargo, si luego 
-contratas los servicios, ese valor se descuenta del total a pagar.
+RESPUESTA: Durante noviembre, la asesoría inicial de 30 minutos es 
+GRATUITA. Fuera de noviembre, consulta el valor vigente con la firma.
 
 PREGUNTA 6: ¿Qué pasa si no puedo pagar el monto de la pensión de 
 alimentos que se me exige?
@@ -301,15 +303,15 @@ detener medidas como el embargo o la retención judicial. En la consulta
 inicial te explicarán cómo trabajar para solucionar esta situación.
 
 PREGUNTA 14: ¿Cuánto cuesta una asesoría o consulta?
-RESPUESTA: La asesoría o consulta inicial cuesta $30.000 (pesos chilenos). 
-Si luego contratas el servicio, ese valor se descuenta del total. OJO: 
-$30.000 es el precio de la asesoría; la tramitación completa de una causa 
-tiene otro valor.
+RESPUESTA: Durante noviembre, la asesoría inicial de 30 minutos es 
+GRATUITA. Es el precio correcto cuando alguien pregunta por la asesoría, 
+consulta o cita.
 
 PREGUNTA 15: ¿Cuánto cuesta contratar todo el servicio / llevar mi causa completa?
-RESPUESTA: La tramitación de la causa de familia completa tiene un precio 
-promocional de $500.000, pagadero en hasta 12 cuotas sin interés. OJO: 
-este valor NO corresponde a una asesoría (la asesoría cuesta $30.000).
+RESPUESTA: La tramitación de una causa de familia no tiene un valor fijo. 
+El precio depende de la materia, la cuantía y la complejidad del caso, y se 
+informa de forma personalizada en la misma reunión de asesoría. No se 
+pueden entregar montos, rangos ni estimaciones por este canal.
 
 
 --------------------------------------------------------------------------------
@@ -411,12 +413,11 @@ SECCIÓN 11: RESUMEN EJECUTIVO (PARA RESPUESTAS RÁPIDAS)
 - Teléfono: +56 9 4231 3989
 - Dirección: Psje. Doctor Sotero del Río #508, Of. 420, Santiago Centro
 - Cobertura: Todo Chile
-- Precio de asesoría/consulta/cita: $30.000 (NUNCA es $500.000)
-- Promoción causa de familia completa (divorcio, pensión de alimentos, 
-  relación directa y regular): $500.000 (NUNCA es el precio de una asesoría)
-- Pago: Hasta 12 cuotas sin interés con tarjeta de crédito
-- Consulta inicial: $30.000 (descontable al contratar), dura 30-45 
-  minutos, incluye revisión de caso, respuestas y plan preliminar
+- Asesoría/consulta/cita inicial: GRATIS durante noviembre (30 a 45 minutos).
+- Causa completa: no tiene precio fijo; se cotiza en la asesoría según 
+  materia, cuantía y complejidad del caso.
+- Consulta inicial: gratuita en noviembre; incluye revisión de caso, 
+  respuestas legales y plan preliminar.
 - Diferenciadores: Experiencia, estrategias personalizadas, trato humano 
   y cercano, resultados comprobados
 - Servicios clave: Defensa en demandas de alimentos, rebaja de pensión, 
