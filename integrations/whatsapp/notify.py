@@ -10,6 +10,10 @@ from .config import ACCESS_TOKEN, API_VERSION, PHONE_NUMBER_ID
 logger = logging.getLogger("leyia-notify")
 API_BASE = "https://graph.facebook.com"
 MAX_LEN = 3500
+# >>> NUEVO: destinatarios del correo interno (soporta varios por coma) <<<
+STUDIO_NOTIFY_EMAILS = [
+    e.strip() for e in os.getenv("STUDIO_NOTIFY_EMAIL", "").split(",") if e.strip()
+]
 
 _TEMPLATE_FALLBACK_CODES = {131047, 131026, 131030}
 
@@ -168,11 +172,43 @@ def notify_escalation(thread_id, summary, telefono=None, motivo="hablar_abogada"
     )
     return _send_alert(titulo, body)
 
+def _send_booking_email(b: dict) -> bool:
+    """Alerta de booking por correo (Gmail API).
+    Best-effort: nunca lanza, nunca bloquea el WhatsApp."""
+    if not STUDIO_NOTIFY_EMAILS:
+        logger.debug("[notify] email skip: STUDIO_NOTIFY_EMAIL no configurada")
+        return False
+    try:
+        # Import lazy: evita acoplar notify con tools en tiempo de import.
+        from tools.google_mail import enviar_correo, plantilla_cita_studio
+
+        asunto, cuerpo_html = plantilla_cita_studio(
+            lead_nombre=b.get("cliente_nombre") or "(sin nombre)",
+            lead_email=b.get("cliente_email"),
+            lead_telefono=b.get("cliente_telefono"),
+            modalidad_label=b.get("modalidad_label") or b.get("modalidad") or "",
+            fecha=b.get("fecha") or "",
+            hora_inicio=b.get("hora_inicio") or "",
+            hora_fin=b.get("hora_fin") or "",
+            meet_link=b.get("meet_link"),
+            motivo=b.get("motivo"),
+            html_link=b.get("html_link"),
+        )
+        ok = enviar_correo(to=STUDIO_NOTIFY_EMAILS, asunto=asunto,
+                           cuerpo_html=cuerpo_html)
+        logger.info("[notify] email booking → %s | ok=%s",
+                    STUDIO_NOTIFY_EMAILS, ok)
+        return ok
+    except Exception:
+        logger.exception("[notify] email booking falló (se ignora; WA va igual)")
+        return False
+
 
 def notify_booking(booking: dict) -> bool:
     b = booking or {}
     logger.info("[notify] evento: booking | %s | %s %s",
                 b.get("cliente_nombre"), b.get("fecha"), b.get("hora_inicio"))
+
     link = b.get("html_link") or b.get("meet_link") or ""
     body = (
         "📅 *Nueva cita agendada*\n"
@@ -182,4 +218,9 @@ def notify_booking(booking: dict) -> bool:
         f"📍 Modalidad: {_clip(b.get('modalidad_label') or b.get('modalidad'), 60)}"
         + (f"\n🔗 {_clip(link, 200)}" if link else "")
     )
-    return _send_alert("Nueva cita agendada", body)
+    ok_wa = _send_alert("Nueva cita agendada", body)
+
+    ok_email = _send_booking_email(b)
+
+    # Éxito si AL MENOS un canal entregó.
+    return ok_wa or ok_email

@@ -48,7 +48,11 @@ TOKEN_FILE = os.getenv("GOOGLE_CALENDAR_TOKEN_FILE", "token.json")
 CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
 TZ = ZoneInfo(os.getenv("GOOGLE_CALENDAR_TIMEZONE", "America/Santiago"))
 
-SCOPES = ["https://www.googleapis.com/auth/calendar"]
+SCOPES = [
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/gmail.compose",   # era gmail.send
+]
+
 
 # Datos del estudio
 DIRECCION_OFICINA = os.getenv("DIRECCION_OFICINA", "Oficina Manzzo y Cía")
