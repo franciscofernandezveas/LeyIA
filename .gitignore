@@ -50,3 +50,5 @@ escalations/
 
 # Scripts temporales de dev
 generar_token.py
+
+token.json.old
